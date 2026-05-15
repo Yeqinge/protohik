@@ -1,0 +1,289 @@
+"""
+多原型学习 Loss（Multi-Prototype Loss）
+
+=== 问题分析 ===
+单原型假设每个类的特征分布是单峰的，但实际场景中：
+1. 类内多模态：同一类别存在多个子分布（如同一酒瓶的不同拍摄角度、光照、遮挡）
+2. 强制聚合损害结构：proto1/protoenhanced 的紧凑性约束把多个子簇硬压成一个，
+   破坏了类内有效的多样性
+3. 单中心偏移：类中心偏离所有子簇，导致分类边界不准确
+
+=== 修改方案 ===
+
+【1】每类多个原型（Multi-Prototype per Class）
+    - 每个类维护 K 个原型，覆盖类内不同子分布
+    - 分类时取样本与该类所有原型中最近的一个作为类得分
+    - 保留类内结构，不强制单峰
+
+【2】软分配（Soft Assignment）
+    - 样本到类的得分 = 与该类所有原型相似度的 softmax 加权和
+    - 比 hard max 更平滑，梯度更稳定
+    - 让每个原型都能收到梯度，避免"死原型"
+
+【3】原型多样性约束（Intra-class Diversity）
+    - 同类原型之间要足够分散，保证每个原型覆盖不同子区域
+    - 防止同类原型坍缩成一个点（退化为单原型）
+
+【4】类间分离约束（Inter-class Separation）
+    - 不同类的原型之间要足够远
+    - 对象：所有跨类原型对，而非类中心对
+
+【5】EMA 分原型更新
+    - 每个原型独立做 EMA，保证每个原型都能稳定收敛
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class PrototypeLossMulti(TopVirtualLoss):
+    """
+    多原型学习 Loss
+
+    新增参数：
+    - num_prototypes_per_class: 每类原型数量 K
+    - intra_diversity_weight: 类内原型多样性权重
+    - inter_separation_weight: 类间原型分离权重
+    - soft_assignment: 是否用 softmax 软分配（否则用 max）
+    - assignment_temperature: 类内 softmax 分配的温度
+
+    原有接口不变，init() / forward() / step() 签名兼容
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def init(self, input_dim, num_targets, temperature=0.07,
+             momentum=0.999, smoothing=0.1,
+             # ====== 多原型核心参数 ======
+             num_prototypes_per_class=4,      # 【1】每类原型数量
+             soft_assignment=True,            # 【2】是否软分配
+             assignment_temperature=0.1,      # 【2】类内分配温度
+             intra_diversity_weight=0.1,      # 【3】类内多样性权重
+             inter_separation_weight=0.1,     # 【4】类间分离权重
+             separation_margin=0.5,           # 【4】类间分离 margin
+             ):
+
+        self.num_targets = num_targets
+        self.input_dim = input_dim
+        self.K = num_prototypes_per_class
+        self.momentum = momentum
+        self.temperature = temperature
+        self.soft_assignment = soft_assignment
+        self.assignment_temperature = assignment_temperature
+        self.intra_diversity_weight = intra_diversity_weight
+        self.inter_separation_weight = inter_separation_weight
+        self.separation_margin = separation_margin
+
+        # ---------- 原型参数：shape (num_targets, K, input_dim) ----------
+        # 【1】每类 K 个原型
+        self.prototypes = nn.Parameter(
+            torch.empty(num_targets, num_prototypes_per_class, input_dim)
+        )
+        nn.init.xavier_uniform_(
+            self.prototypes.view(num_targets * num_prototypes_per_class, input_dim)
+        )
+
+        # 【5】EMA 原型，与 prototypes 同形状
+        self.register_buffer('ema_prototypes', self.prototypes.data.clone())
+        self.register_buffer('cluster_counts',
+                             torch.zeros(num_targets, num_prototypes_per_class))
+
+        self.loss_function = nn.CrossEntropyLoss(label_smoothing=smoothing)
+
+    def _get_class_scores(self, features_norm, prototypes_norm):
+        """
+        【2】计算每个样本对每个类的得分
+
+        features_norm:   (B, D)
+        prototypes_norm: (C, K, D)
+
+        流程：
+        1. 计算样本与所有 C*K 个原型的相似度 → (B, C, K)
+        2. 类内做 softmax 加权（软）或取 max（硬）→ (B, C)
+
+        软分配的好处：
+        - 每个原型都有梯度，不会出现某些原型永远不更新的"死原型"问题
+        - 当样本处于两个子簇之间时，两个原型都能收到信号
+        """
+        B = features_norm.shape[0]
+        C, K, D = prototypes_norm.shape
+
+        # (B, D) x (D, C*K) -> (B, C*K) -> (B, C, K)
+        all_proto = prototypes_norm.view(C * K, D)
+        sim = torch.mm(features_norm, all_proto.t()).view(B, C, K)
+
+        if self.soft_assignment:
+            # 类内 softmax 加权：温度越低越接近 max
+            weights = F.softmax(sim / self.assignment_temperature, dim=2)
+            class_scores = (weights * sim).sum(dim=2)  # (B, C)
+        else:
+            # 硬分配：取与该类最近的原型
+            class_scores = sim.max(dim=2).values  # (B, C)
+
+        return class_scores, sim  # sim 供 loss 计算使用
+
+    def _intra_diversity_loss(self, prototypes_norm):
+        """
+        【3】类内原型多样性约束
+
+        原理：同类的 K 个原型应该尽量分散，覆盖不同子区域。
+        如果同类原型互相很像，就退化成了单原型，浪费容量。
+
+        做法：
+        - 对每个类，计算其 K 个原型两两余弦相似度
+        - 惩罚相似度过高的原型对（hinge loss）
+        - 只惩罚同类内部，不跨类
+
+        与类间分离的区别：
+        - 类内多样性：同类原型要"分开"，覆盖子分布
+        - 类间分离：不同类原型要"远离"，避免跨类混淆
+        """
+        C, K, D = prototypes_norm.shape
+        loss = torch.tensor(0.0, device=prototypes_norm.device)
+
+        for c in range(C):
+            proto_c = prototypes_norm[c]          # (K, D)
+            sim_matrix = torch.mm(proto_c, proto_c.t())  # (K, K)
+            mask = ~torch.eye(K, dtype=torch.bool, device=sim_matrix.device)
+            intra_sim = sim_matrix[mask]          # K*(K-1) 个值
+            # 相似度越高惩罚越大，目标是让同类原型彼此不像
+            loss = loss + intra_sim.clamp(min=0).pow(2).mean()
+
+        return loss / C
+
+    def _inter_separation_loss(self, prototypes_norm):
+        """
+        【4】类间原型分离约束
+
+        原理：不同类的原型之间要保持足够距离。
+        与之前 proto1 的类间分离不同，这里作用在所有跨类原型对上，
+        而非类中心对，约束更细粒度。
+
+        做法：
+        - 把所有 C*K 个原型展平
+        - 计算所有原型对的余弦相似度
+        - 对跨类的原型对，若相似度超过 (1 - margin)，施加惩罚
+
+        为什么用 margin：
+        - 不要求跨类原型完全正交（无法保证）
+        - 只要求相似度不超过阈值，超过才惩罚
+        """
+        C, K, D = prototypes_norm.shape
+        all_proto = prototypes_norm.view(C * K, D)      # (C*K, D)
+        sim_matrix = torch.mm(all_proto, all_proto.t())  # (C*K, C*K)
+
+        # 构建跨类 mask：同类原型不参与类间分离
+        class_ids = torch.arange(C, device=all_proto.device).repeat_interleave(K)
+        inter_mask = class_ids.unsqueeze(0) != class_ids.unsqueeze(1)  # (C*K, C*K)
+
+        inter_sim = sim_matrix[inter_mask]
+        # hinge：只惩罚超过 (1 - margin) 的跨类原型对
+        threshold = 1.0 - self.separation_margin
+        violations = F.relu(inter_sim - threshold)
+        return violations.pow(2).mean()
+
+    def forward(self, inputs, targets=None):
+        assert len(inputs.shape) == 3 and inputs.shape[2] == 1
+        features = torch.squeeze(inputs, dim=2)      # (B, D)
+
+        features_norm = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=2)  # (C, K, D)
+
+        # 【2】计算类得分
+        class_scores, sim_bck = self._get_class_scores(
+            features_norm, prototypes_norm
+        )  # (B, C)
+
+        # logits 缩放
+        logits = class_scores / self.temperature
+
+        # 存储 posterior 供外部使用
+        self.posterior = logits.unsqueeze(2).detach()
+
+        if targets is None:
+            return None
+
+        # ==================== Loss 计算 ====================
+
+        # (A) 分类损失 — 权重 1.0
+        ce_loss = self.loss_function(logits, targets)
+
+        # (B) 类内多样性约束 — 权重 intra_diversity_weight
+        # 【3】同类原型要分散，覆盖不同子分布
+        intra_loss = self._intra_diversity_loss(prototypes_norm)
+
+        # (C) 类间分离约束 — 权重 inter_separation_weight
+        # 【4】跨类原型要保持 margin
+        inter_loss = self._inter_separation_loss(prototypes_norm)
+
+        # ==================== 总 Loss ====================
+        total_loss = (ce_loss
+                      + self.intra_diversity_weight * intra_loss
+                      + self.inter_separation_weight * inter_loss)
+
+        # 更新统计：记录每个原型被"负责"的次数
+        # 【5】用 argmax 确定每个样本归属哪个原型
+        with torch.no_grad():
+            B, C, K = sim_bck.shape
+            # 找到每个样本在其正确类中最近的原型
+            correct_sim = sim_bck[
+                torch.arange(B, device=targets.device), targets
+            ]  # (B, K)
+            nearest_proto = correct_sim.argmax(dim=1)  # (B,)
+            self.cluster_counts.zero_()
+            for k in range(K):
+                mask = nearest_proto == k
+                self.cluster_counts[targets[mask], k] += mask.sum()
+
+        return total_loss
+
+    @torch.no_grad()
+    def step(self, *args, **kwargs):
+        """【5】EMA 分原型独立更新"""
+        self.ema_prototypes.mul_(self.momentum).add_(
+            self.prototypes.data, alpha=1.0 - self.momentum
+        )
+        self.prototypes.data.copy_(self.ema_prototypes)
+
+
+# =============================================================
+# 使用示例
+# =============================================================
+#
+# loss_module = PrototypeLossMulti()
+# loss_module.init(
+#     input_dim=128,
+#     num_targets=10,
+#     temperature=0.07,
+#     num_prototypes_per_class=4,   # 每类4个原型，可根据类内复杂度调整
+#     soft_assignment=True,         # 软分配，梯度更稳定
+#     assignment_temperature=0.1,   # 类内分配温度，越小越接近 hard max
+#     intra_diversity_weight=0.1,   # 类内多样性，防止同类原型坍缩
+#     inter_separation_weight=0.1,  # 类间分离，防止跨类原型混淆
+#     separation_margin=0.5,        # 类间 margin，建议 0.3~0.7
+#     smoothing=0.1,
+# )
+#
+# # 训练
+# loss_module.train()
+# loss = loss_module(inputs, targets)
+# loss.backward()
+# optimizer.step()
+# loss_module.step()   # EMA 更新所有原型
+#
+# # 测试
+# loss_module.eval()
+# loss_module(inputs)
+# posterior = loss_module.posterior
+#
+# =============================================================
+# model2enroll.py 兼容修改
+# =============================================================
+#
+# for component in model:
+#     if component.split('.')[0] in ("loss", "loss1"):
+#         if "ema_prototypes" in component or "cluster_counts" in component:
+#             continue
+#         params = model[component].squeeze().cpu().numpy()
