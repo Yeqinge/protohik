@@ -1,0 +1,198 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import csv
+import os
+
+
+class PrototypeLoss(TopVirtualLoss):
+
+    def __init__(self):
+        super().__init__()
+
+    def init(self, input_dim, num_targets, temperature=0.1,
+             momentum=0.999, contrastive_weight=0.1, smoothing=0.1):
+
+        self.prototypes = nn.Parameter(torch.empty(num_targets, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        self.register_buffer('ema_prototypes', self.prototypes.data.clone())
+        self.temperature = temperature
+        self.momentum = momentum
+        self.contrastive_weight = contrastive_weight
+        self.num_targets = num_targets
+        self.loss_function = nn.CrossEntropyLoss(label_smoothing=smoothing)
+
+        self.uncertainty_info = None
+
+        # ------------------------------------------------------------------ #
+        # 【新增】不确定性记录缓冲区                                           #
+        # 每次 forward() 把当前 batch 的结果 append 进来                      #
+        # 调用 save_uncertainty_csv() 时统一写出，然后清空                    #
+        # ------------------------------------------------------------------ #
+        self._unc_buffer = []   # list of dict，每个元素对应一个样本
+
+    @torch.no_grad()
+    def _compute_uncertainty(self, logits):
+        probs = F.softmax(logits, dim=1)
+
+        pred_confidence    = probs.max(dim=1).values
+        entropy            = -(probs * (probs + 1e-8).log()).sum(dim=1)
+        top2               = probs.topk(2, dim=1).values
+        margin_unc         = 1.0 - (top2[:, 0] - top2[:, 1]) / (top2[:, 0] + 1e-8)
+
+        self.uncertainty_info = {
+            "pred_confidence":     pred_confidence,
+            "entropy_uncertainty": entropy,
+            "margin_uncertainty":  margin_unc,
+        }
+
+    # ====================================================================== #
+    # 【新增】_collect_uncertainty()                                          #
+    #                                                                        #
+    # 在每次 forward() 末尾调用，把当前 batch 的不确定性结果                 #
+    # 逐样本 append 到 self._unc_buffer。                                    #
+    #                                                                        #
+    # 参数：                                                                  #
+    #   targets : Tensor (B,) 或 None                                        #
+    #     训练时传入真实标签，推理时传 None，csv 里对应列留空                 #
+    #   sample_ids : list[str] 或 None                                       #
+    #     可选，传入样本 ID / 文件名等标识符                                  #
+    #     不传则自动用全局计数器生成 sample_0, sample_1, ...                  #
+    # ====================================================================== #
+    @torch.no_grad()
+    def _collect_uncertainty(self, targets=None, sample_ids=None):
+        if self.uncertainty_info is None:
+            return
+
+        B = self.uncertainty_info["pred_confidence"].shape[0]
+        base_idx = len(self._unc_buffer)   # 当前已收集的样本总数，用于自动编号
+
+        conf   = self.uncertainty_info["pred_confidence"].cpu().tolist()
+        ent    = self.uncertainty_info["entropy_uncertainty"].cpu().tolist()
+        margin = self.uncertainty_info["margin_uncertainty"].cpu().tolist()
+
+        for i in range(B):
+            row = {
+                "sample_id":           sample_ids[i] if sample_ids else f"sample_{base_idx + i}",
+                "pred_confidence":     round(conf[i],   6),
+                "entropy_uncertainty": round(ent[i],    6),
+                "margin_uncertainty":  round(margin[i], 6),
+                "target":              targets[i].item() if targets is not None else "",
+            }
+            self._unc_buffer.append(row)
+
+    # ====================================================================== #
+    # 【新增】save_uncertainty_csv()                                          #
+    #                                                                        #
+    # 将 _unc_buffer 中所有样本写入 CSV，然后清空 buffer。                   #
+    # 典型调用时机：                                                          #
+    #   - 训练：每个 epoch 结束后调用一次                                     #
+    #   - 推理：整个推理循环结束后调用一次                                    #
+    #                                                                        #
+    # 参数：                                                                  #
+    #   path : str，输出路径，如 "uncertainty_epoch1.csv"                    #
+    #   append : bool，True = 追加到已有文件；False = 覆盖（默认）            #
+    #     append=True 适合把多个 epoch 写到同一个文件，                       #
+    #     但需要自己在 row 里加 epoch 字段以便区分（见使用示例）              #
+    # ====================================================================== #
+    def save_uncertainty_csv(self, path, append=False):
+        if not self._unc_buffer:
+            return
+
+        mode      = "a" if append else "w"
+        fieldnames = ["sample_id", "pred_confidence",
+                      "entropy_uncertainty", "margin_uncertainty", "target"]
+        write_header = (not append) or (not os.path.exists(path))
+
+        with open(path, mode, newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(self._unc_buffer)
+
+        self._unc_buffer.clear()
+
+    def get_uncertainty(self):
+        if self.uncertainty_info is None:
+            raise RuntimeError("请先调用 forward() 再获取不确定性。")
+        return self.uncertainty_info
+
+    def forward(self, inputs, targets=None, sample_ids=None):
+        assert len(inputs.shape) == 3 and inputs.shape[2] == 1
+        features = torch.squeeze(inputs, dim=2)
+        features_norm  = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+        logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
+        self.posterior = logits.unsqueeze(2).detach()
+
+        self._compute_uncertainty(logits.detach())
+
+        # ------------------------------------------------------------------ #
+        # 【新增】每次 forward() 末尾收集当前 batch                           #
+        # sample_ids 可选，从 forward 参数透传进来                            #
+        # ------------------------------------------------------------------ #
+        self._collect_uncertainty(targets=targets, sample_ids=sample_ids)
+
+        if targets is None:
+            return None
+
+        ce_loss = self.loss_function(logits, targets)
+        positive_sim = logits[torch.arange(len(targets), device=targets.device), targets]
+        contrastive_loss = (-positive_sim + torch.logsumexp(logits, dim=1)).mean()
+        total_loss = ce_loss + self.contrastive_weight * contrastive_loss
+        return total_loss
+
+    @torch.no_grad()
+    def step(self, *args, **kwargs):
+        self.ema_prototypes.mul_(self.momentum).add_(
+            self.prototypes.data, alpha=1.0 - self.momentum)
+        self.prototypes.data.copy_(self.ema_prototypes)
+
+
+# =============================================================
+# 训练使用示例
+# =============================================================
+#
+# for epoch in range(num_epochs):
+#     model.train()
+#     for inputs, targets in train_loader:
+#         loss = loss_module(inputs, targets)   # 自动收集
+#         loss.backward()
+#         optimizer.step()
+#         loss_module.step()
+#
+#     # epoch 结束，写出 CSV
+#     loss_module.save_uncertainty_csv(f"unc_train_epoch{epoch}.csv")
+#
+#
+# =============================================================
+# 推理使用示例
+# =============================================================
+#
+# model.eval()
+# with torch.no_grad():
+#     for inputs in test_loader:
+#         loss_module(inputs)                   # 自动收集，targets=None
+#
+# loss_module.save_uncertainty_csv("unc_test.csv")
+#
+#
+# =============================================================
+# 带 sample_id 的示例（知道文件名时）
+# =============================================================
+#
+# for inputs, targets, utt_ids in train_loader:
+#     loss_module(inputs, targets, sample_ids=utt_ids)
+#
+# loss_module.save_uncertainty_csv("unc_train.csv")
+#
+#
+# =============================================================
+# 输出 CSV 格式
+# =============================================================
+#
+# sample_id,pred_confidence,entropy_uncertainty,margin_uncertainty,target
+# sample_0,0.923,0.124,0.043,3
+# sample_1,0.511,1.872,0.891,7
+# sample_2,0.998,0.021,0.003,1
+# ...
