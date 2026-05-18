@@ -1,0 +1,216 @@
+"""
+单原型对比学习 Loss —— 加入不确定性估计版本
+
+=== 不确定性修改说明（仅在 loss 模块内，零额外参数）===
+
+单原型结构只有一个类得分向量 logits (B, C)，
+不确定性来源只有一个层次：跨类分类的把握程度。
+
+【改动 1】init() 末尾：初始化 self.uncertainty_info = None
+    - 为后续 get_uncertainty() 提供初始值，避免未调用 forward 时报错
+
+【改动 2】forward() 中新增三行：调用 _compute_uncertainty()
+    - 位置：logits 计算完、self.posterior 赋值后立刻调用
+    - targets=None（推理）和 targets 不为 None（训练）都执行
+    - 传入 logits.detach()，完全不影响梯度和 loss 计算
+
+【改动 3】新增 _compute_uncertainty() 方法
+    计算三个指标，全部存入 self.uncertainty_info：
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ pred_confidence (B,)                                            │
+    │   含义：预测类的 softmax 概率值，最直接的置信度                  │
+    │   计算：softmax(logits)[b, argmax(logits)[b]]                   │
+    │   值域：(1/C, 1]，越接近 1 越确定，越接近 1/C 越不确定          │
+    ├─────────────────────────────────────────────────────────────────┤
+    │ entropy_uncertainty (B,)                                        │
+    │   含义：分类分布的 Shannon 熵，衡量概率分散程度                  │
+    │   计算：-Σ p * log(p)，p = softmax(logits)                      │
+    │   值域：[0, log(C)]，越大越不确定（均匀分布时最大）              │
+    ├─────────────────────────────────────────────────────────────────┤
+    │ margin_uncertainty (B,)                                         │
+    │   含义：top-1 和 top-2 得分之差，衡量决策边界的清晰程度         │
+    │   计算：1 - (score_1st - score_2nd) / (score_1st + ε)          │
+    │   值域：[0, 1]，越接近 1 越不确定（两个类得分几乎相同）          │
+    │   优势：对边界样本（介于两类之间）更敏感，比熵更尖锐             │
+    └─────────────────────────────────────────────────────────────────┘
+
+【改动 4】新增公开接口 get_uncertainty()
+    - 外部调用：unc = loss_module.get_uncertainty()
+    - 返回 self.uncertainty_info 字典
+
+=== 原有功能完全不变 ===
+- init() / forward() / step() 签名不变
+- ce_loss + contrastive_loss 计算逻辑不变
+- EMA 更新不变
+- posterior 存储不变
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class PrototypeLoss(TopVirtualLoss):
+
+    def __init__(self):
+        super().__init__()
+
+    def init(self, input_dim, num_targets, temperature=0.1,
+             momentum=0.999, contrastive_weight=0.1, smoothing=0.1):
+
+        self.prototypes = nn.Parameter(torch.empty(num_targets, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        self.register_buffer('ema_prototypes', self.prototypes.data.clone())
+        self.temperature = temperature
+        self.momentum = momentum
+        self.contrastive_weight = contrastive_weight
+        self.num_targets = num_targets
+        self.loss_function = nn.CrossEntropyLoss(label_smoothing=smoothing)
+
+        # ------------------------------------------------------------------ #
+        # 【改动 1】初始化 uncertainty_info                                   #
+        # 确保未调用 forward() 时 get_uncertainty() 能给出明确报错            #
+        # ------------------------------------------------------------------ #
+        self.uncertainty_info = None
+
+    # ====================================================================== #
+    # 【改动 3】新增 _compute_uncertainty()                                   #
+    #                                                                        #
+    # @torch.no_grad() 装饰：完全不参与反向传播，不影响任何梯度              #
+    #                                                                        #
+    # 输入：                                                                  #
+    #   logits (B, C) —— 已除以 temperature 的原始 logits                   #
+    #                                                                        #
+    # 三个指标各有侧重，互补使用：                                            #
+    #   pred_confidence  → 直接看"我有多确定"                                #
+    #   entropy          → 看"概率分布有多散"                                #
+    #   margin           → 看"第一名和第二名差多远"                           #
+    # ====================================================================== #
+    @torch.no_grad()
+    def _compute_uncertainty(self, logits):
+        """
+        根据 logits 计算三种不确定性指标，存入 self.uncertainty_info。
+
+        Parameters
+        ----------
+        logits : Tensor (B, C)，已 detach，不参与梯度计算
+        """
+        probs = F.softmax(logits, dim=1)          # (B, C) 归一化概率
+
+        # ── 指标 1：预测置信度 ──────────────────────────────────────────── #
+        # 取每个样本预测类的 softmax 概率
+        # 值越高 → 模型越确定；值越低（趋近 1/C）→ 模型越不确定
+        pred_confidence = probs.max(dim=1).values  # (B,)
+
+        # ── 指标 2：Shannon 熵 ───────────────────────────────────────────── #
+        # H = -Σ p * log(p)
+        # 均匀分布时熵最大（log C），one-hot 时熵为 0
+        # clamp 避免 log(0) 数值问题
+        entropy = -(probs * (probs + 1e-8).log()).sum(dim=1)   # (B,)
+
+        # ── 指标 3：margin 不确定性 ──────────────────────────────────────── #
+        # 取 top-2 得分，计算归一化差值
+        # 差值大 → 第一名遥遥领先 → 确定；差值小 → 两类难分 → 不确定
+        top2 = probs.topk(2, dim=1).values         # (B, 2)
+        score_1st = top2[:, 0]                     # (B,)
+        score_2nd = top2[:, 1]                     # (B,)
+        # 用 1 减去归一化差值：差值越大 margin_unc 越小（越确定）
+        margin_unc = 1.0 - (score_1st - score_2nd) / (score_1st + 1e-8)  # (B,)
+
+        self.uncertainty_info = {
+            "pred_confidence":    pred_confidence,   # 越大越确定
+            "entropy_uncertainty": entropy,          # 越大越不确定
+            "margin_uncertainty": margin_unc,        # 越大越不确定
+        }
+
+    # ====================================================================== #
+    # 【改动 4】新增公开接口 get_uncertainty()                                #
+    # ====================================================================== #
+    def get_uncertainty(self):
+        """
+        返回最近一次 forward() 的不确定性信息。
+
+        Returns
+        -------
+        dict
+            {
+              'pred_confidence':     Tensor (B,),  预测类置信度，越大越确定
+              'entropy_uncertainty': Tensor (B,),  Shannon 熵，越大越不确定
+              'margin_uncertainty':  Tensor (B,),  top2 差值，越大越不确定
+            }
+
+        注意：每次 forward() 后立即调用，否则返回的是上一次 batch 的结果。
+        """
+        if self.uncertainty_info is None:
+            raise RuntimeError("请先调用 forward() 再获取不确定性。")
+        return self.uncertainty_info
+
+    def forward(self, inputs, targets=None):
+        assert len(inputs.shape) == 3 and inputs.shape[2] == 1
+        features = torch.squeeze(inputs, dim=2)
+        features_norm = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+        logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
+        self.posterior = logits.unsqueeze(2).detach()
+
+        # ------------------------------------------------------------------ #
+        # 【改动 2】调用不确定性计算                                           #
+        # 紧跟在 logits 算完之后，targets 判断之前                            #
+        # 传入 logits.detach()，与计算图完全隔离                              #
+        # 训练（targets 不为 None）和推理（targets=None）都会执行             #
+        # ------------------------------------------------------------------ #
+        self._compute_uncertainty(logits.detach())
+
+        if targets is None:
+            return None
+
+        # CE loss（主损失）—— 与原版完全相同
+        ce_loss = self.loss_function(logits, targets)
+
+        # 对比学习 —— 与原版完全相同
+        positive_sim = logits[torch.arange(len(targets), device=targets.device), targets]
+        contrastive_loss = -positive_sim + torch.logsumexp(logits, dim=1)
+        contrastive_loss = contrastive_loss.mean()
+
+        total_loss = ce_loss + self.contrastive_weight * contrastive_loss
+        return total_loss
+
+    @torch.no_grad()
+    def step(self, *args, **kwargs):
+        self.ema_prototypes.mul_(self.momentum).add_(
+            self.prototypes.data, alpha=1.0 - self.momentum)
+        self.prototypes.data.copy_(self.ema_prototypes)
+
+
+# =============================================================
+# 使用示例
+# =============================================================
+#
+# loss_module = PrototypeLoss()
+# loss_module.init(input_dim=128, num_targets=10)
+#
+# # ---------- 训练 ----------
+# loss_module.train()
+# loss = loss_module(inputs, targets)
+# loss.backward()
+# optimizer.step()
+# loss_module.step()
+#
+# unc = loss_module.get_uncertainty()
+# # 找当前 batch 里最难的样本（entropy 最高）
+# hard_idx = unc['entropy_uncertainty'].topk(5).indices
+#
+# # ---------- 推理 ----------
+# loss_module.eval()
+# with torch.no_grad():
+#     loss_module(inputs)
+#
+# unc = loss_module.get_uncertainty()
+# print(unc['pred_confidence'])      # (B,) 越高越确定，用于过滤低置信度预测
+# print(unc['entropy_uncertainty'])  # (B,) 越高越不确定，用于 OOD 检测
+# print(unc['margin_uncertainty'])   # (B,) 越高越不确定，对边界样本更敏感
+#
+# # 拒绝预测示例（阈值需在验证集上标定）
+# reliable_mask = unc['pred_confidence'] > 0.8
+# reliable_posterior = loss_module.posterior[reliable_mask]
