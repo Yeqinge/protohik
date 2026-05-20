@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
 Kaldi 训练集特征多维可视化脚本
-支持 normal / abnormal 两类样本的分布对比，并自动标注异常点
+- 从 utt2spk 的 spk_id 自动推断 normal / abnormal 标签
+- 支持多分片 ark（.1.ark .2.ark ...），通过 feats.scp 统一读取
+- 自动标注统计异常点（IQR / Z-score / 双维）
+- 输出两页高清 PNG
 
 用法:
     python visualize_dataset.py \
-        --data-dir /path/to/kaldi/data/conf/train_data \
-        --feat-scp feats.scp \               # 可选，若不提供则仅统计元数据
+        --data-dir  /path/to/kaldi/data/conf/train_name \
+        --feats-dir /feats_exp/feats/fbank_20k_test5/fiber_train_s10_fix105_20k \
         --output-dir ./vis_output \
-        --label-file utt2label               # 每行: utt_id normal|abnormal
-
-数据目录需包含（Kaldi 标准格式）:
-    utt2spk, spk2utt, wav.scp,
-    utt2dur (可选), feats.scp (可选)
+        [--scp-name feats.scp]          # 默认 feats.scp
+        [--max-feats 3000]              # 最多读取特征条数
+        [--normal-keyword normal]       # spk_id 中 normal 的关键词
+        [--abnormal-keyword abnormal]   # spk_id 中 abnormal 的关键词
 """
 
 import os
 import sys
+import glob
 import argparse
 import warnings
 import numpy as np
@@ -31,107 +34,109 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
-# ─── 颜色主题 ─────────────────────────────────────────────────────────────────
-C_NORMAL   = "#2ecc71"   # 绿
-C_ABNORMAL = "#e74c3c"   # 红
-C_ANOMALY  = "#f39c12"   # 橙（统计异常点）
+# ─── 配色 ──────────────────────────────────────────────────────────────────────
+C_NORMAL   = "#2ecc71"
+C_ABNORMAL = "#e74c3c"
+C_ANOMALY  = "#f39c12"
 C_BG       = "#0d1117"
+C_PANEL    = "#161b22"
 C_GRID     = "#21262d"
 C_TEXT     = "#c9d1d9"
 C_TITLE    = "#58a6ff"
+C_SUB      = "#8b949e"
 
 plt.rcParams.update({
-    "figure.facecolor": C_BG,
-    "axes.facecolor":   C_BG,
-    "axes.edgecolor":   C_GRID,
-    "axes.labelcolor":  C_TEXT,
-    "axes.titlecolor":  C_TEXT,
-    "xtick.color":      C_TEXT,
-    "ytick.color":      C_TEXT,
-    "text.color":       C_TEXT,
-    "grid.color":       C_GRID,
-    "grid.linewidth":   0.6,
-    "legend.facecolor": "#161b22",
-    "legend.edgecolor": C_GRID,
-    "font.family":      "DejaVu Sans",
-    "font.size":        9,
+    "figure.facecolor":  C_BG,
+    "axes.facecolor":    C_PANEL,
+    "axes.edgecolor":    C_GRID,
+    "axes.labelcolor":   C_TEXT,
+    "axes.titlecolor":   C_TEXT,
+    "xtick.color":       C_TEXT,
+    "ytick.color":       C_TEXT,
+    "text.color":        C_TEXT,
+    "grid.color":        C_GRID,
+    "grid.linewidth":    0.5,
+    "legend.facecolor":  "#0d1117",
+    "legend.edgecolor":  C_GRID,
+    "legend.fontsize":   8,
+    "font.family":       "DejaVu Sans",
+    "font.size":         9,
 })
+
+LABEL_COLOR = {"normal": C_NORMAL, "abnormal": C_ABNORMAL}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 数据读取
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def read_kv(path):
-    """读取 key value 文件，返回 dict"""
+def read_utt2spk(path):
+    """返回 {utt_id: spk_id}"""
     d = {}
-    if not os.path.exists(path):
-        return d
     with open(path) as f:
         for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split()
-            if len(parts) >= 2:
-                d[parts[0]] = parts[1]
-            elif len(parts) == 1:
-                d[parts[0]] = ""
+            p = line.strip().split()
+            if len(p) >= 2:
+                d[p[0]] = p[1]
     return d
 
 def read_utt2dur(path):
-    """返回 {utt_id: duration_sec}"""
+    """返回 {utt_id: float(sec)}"""
     d = {}
     if not os.path.exists(path):
         return d
     with open(path) as f:
         for line in f:
-            parts = line.strip().split()
-            if len(parts) == 2:
-                d[parts[0]] = float(parts[1])
+            p = line.strip().split()
+            if len(p) == 2:
+                try:
+                    d[p[0]] = float(p[1])
+                except ValueError:
+                    pass
     return d
 
 def read_spk2utt(path):
-    """返回 {spk: [utt1, utt2, ...]}"""
     d = {}
     if not os.path.exists(path):
         return d
     with open(path) as f:
         for line in f:
-            parts = line.strip().split()
-            if parts:
-                d[parts[0]] = parts[1:]
+            p = line.strip().split()
+            if p:
+                d[p[0]] = p[1:]
     return d
 
-def read_label_file(path):
-    """返回 {utt_id: 'normal'|'abnormal'}"""
-    d = {}
-    if not os.path.exists(path):
-        return d
-    with open(path) as f:
-        for line in f:
-            parts = line.strip().split()
-            if len(parts) >= 2:
-                d[parts[0]] = parts[1].lower()
-    return d
+def infer_label(spk_id, normal_kw, abnormal_kw):
+    """从 spk_id 推断标签，不区分大小写"""
+    s = spk_id.lower()
+    if abnormal_kw.lower() in s:
+        return "abnormal"
+    if normal_kw.lower() in s:
+        return "normal"
+    return "normal"   # 无法判断时默认 normal
 
-def try_read_feats_ark(scp_path, max_utts=2000):
+def build_utt2label(utt2spk, normal_kw, abnormal_kw):
+    return {u: infer_label(spk, normal_kw, abnormal_kw)
+            for u, spk in utt2spk.items()}
+
+def read_feats_scp(scp_path, max_utts=3000):
     """
-    尝试用 kaldiio 读取 fbank 特征，返回 {utt_id: np.ndarray (T, D)}
-    若 kaldiio 不可用则返回空 dict
+    用 kaldiio 读取 feats.scp（自动解析多分片 ark 路径）
+    返回 {utt_id: np.ndarray(T, D)}
     """
-    feats = {}
     try:
         import kaldiio
-        count = 0
-        for utt_id, mat in kaldiio.load_scp_sequential(scp_path):
-            feats[utt_id] = mat
-            count += 1
-            if count >= max_utts:
-                break
-        print(f"  [kaldiio] 读取 {len(feats)} 条特征")
     except ImportError:
-        print("  [提示] 未安装 kaldiio，跳过特征读取。pip install kaldiio")
+        print("  [错误] 未安装 kaldiio，请执行: pip install kaldiio")
+        return {}
+
+    feats = {}
+    try:
+        for utt_id, mat in kaldiio.load_scp_sequential(scp_path):
+            feats[utt_id] = mat.astype(np.float32)
+            if len(feats) >= max_utts:
+                break
+        print(f"  [kaldiio] 读取 {len(feats)} 条特征 (上限={max_utts})")
     except Exception as e:
         print(f"  [警告] 特征读取失败: {e}")
     return feats
@@ -141,511 +146,584 @@ def try_read_feats_ark(scp_path, max_utts=2000):
 # 异常检测
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def detect_outliers_iqr(values, k=2.0):
-    """IQR 方法，返回异常点的索引"""
-    arr = np.array(values)
+def iqr_bounds(values, k=2.0):
+    arr = np.asarray(values, dtype=float)
     q1, q3 = np.percentile(arr, 25), np.percentile(arr, 75)
     iqr = q3 - q1
-    lo, hi = q1 - k * iqr, q3 + k * iqr
-    return np.where((arr < lo) | (arr > hi))[0], lo, hi
+    return q1 - k * iqr, q3 + k * iqr
 
-def detect_outliers_zscore(values, threshold=3.0):
-    arr = np.array(values)
+def iqr_outlier_mask(values, k=2.0):
+    arr = np.asarray(values, dtype=float)
+    lo, hi = iqr_bounds(arr, k)
+    return (arr < lo) | (arr > hi), lo, hi
+
+def zscore_outlier_mask(values, thr=2.8):
+    arr = np.asarray(values, dtype=float)
     z = np.abs((arr - arr.mean()) / (arr.std() + 1e-9))
-    return np.where(z > threshold)[0]
+    return z > thr
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 绘图函数
+# 工具
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _ax_style(ax, title, xlabel="", ylabel=""):
-    ax.set_title(title, fontsize=10, pad=8, color=C_TITLE)
-    ax.set_xlabel(xlabel, fontsize=8)
-    ax.set_ylabel(ylabel, fontsize=8)
-    ax.grid(True, alpha=0.4)
-    ax.tick_params(labelsize=8)
+def _ax_style(ax, title, xlabel="", ylabel="", grid=True):
+    ax.set_title(title, fontsize=10, pad=7, color=C_TITLE, fontweight="bold")
+    if xlabel: ax.set_xlabel(xlabel, fontsize=8, color=C_SUB)
+    if ylabel: ax.set_ylabel(ylabel, fontsize=8, color=C_SUB)
+    if grid:   ax.grid(True, alpha=0.35, linestyle="--")
+    ax.tick_params(labelsize=7.5)
+
+def legend_patches(*pairs):
+    """pairs: (label, color)"""
+    return [mpatches.Patch(color=c, label=l) for l, c in pairs]
+
+def split_by_label(utt_ids, utt2label, values):
+    """将 values 按 normal/abnormal 分组，返回 (list_normal, list_abnormal)"""
+    n, a = [], []
+    for u, v in zip(utt_ids, values):
+        if utt2label.get(u, "normal") == "abnormal":
+            a.append(v)
+        else:
+            n.append(v)
+    return n, a
 
 
-def plot_duration_distribution(ax, dur_normal, dur_abnormal):
-    """时长分布对比直方图 + 异常点标注"""
-    bins = np.histogram_range = None
-    all_dur = dur_normal + dur_abnormal
-    bins = np.linspace(0, min(np.percentile(all_dur, 99), 60), 50) if all_dur else 30
-
-    ax.hist(dur_normal,   bins=bins, alpha=0.65, color=C_NORMAL,   label=f"Normal  (n={len(dur_normal)})",   density=True)
-    ax.hist(dur_abnormal, bins=bins, alpha=0.65, color=C_ABNORMAL, label=f"Abnormal (n={len(dur_abnormal)})", density=True)
-
-    # 标注 normal 集合中的时长异常点
-    if dur_normal:
-        idx, lo, hi = detect_outliers_iqr(dur_normal)
-        for i in idx:
-            ax.axvline(dur_normal[i], color=C_ANOMALY, alpha=0.5, linewidth=0.8, linestyle=":")
-        if len(idx):
-            ax.axvline(lo, color=C_ANOMALY, linewidth=1.2, linestyle="--", label=f"Outlier bounds (IQR)")
-            ax.axvline(hi, color=C_ANOMALY, linewidth=1.2, linestyle="--")
-
-    _ax_style(ax, "语音时长分布 (秒)", "时长 (s)", "密度")
-    ax.legend(fontsize=8)
-
-
-def plot_duration_boxplot(ax, dur_normal, dur_abnormal):
-    """箱线图对比 + 散点"""
-    data  = [dur_normal, dur_abnormal]
-    labels = ["Normal", "Abnormal"]
-    colors = [C_NORMAL, C_ABNORMAL]
-
-    bp = ax.boxplot(data, patch_artist=True, notch=False,
-                    whiskerprops=dict(color=C_TEXT, linewidth=1),
-                    capprops=dict(color=C_TEXT, linewidth=1.5),
-                    medianprops=dict(color="#f1c40f", linewidth=2),
-                    flierprops=dict(marker="o", markersize=3, linestyle="none",
-                                    markerfacecolor=C_ANOMALY, alpha=0.6))
-    for patch, color in zip(bp["boxes"], colors):
-        patch.set_facecolor(color + "55")
-        patch.set_edgecolor(color)
-
-    # 抖动散点
-    for i, (d, c) in enumerate(zip(data, colors), 1):
-        if len(d) > 500:
-            d = np.random.choice(d, 500, replace=False).tolist()
-        jitter = np.random.uniform(-0.15, 0.15, len(d))
-        ax.scatter([i + j for j in jitter], d, alpha=0.25, s=4, color=c, zorder=3)
-
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels(labels)
-    _ax_style(ax, "时长箱线图对比", "", "时长 (s)")
-
-
-def plot_utterance_count_per_speaker(ax, spk2utt, utt2label):
-    """每说话人 utterance 数量，按 normal/abnormal 着色"""
-    spk_normal_cnt  = defaultdict(int)
-    spk_abnormal_cnt = defaultdict(int)
-
-    for spk, utts in spk2utt.items():
-        for u in utts:
-            lbl = utt2label.get(u, "normal")
-            if lbl == "abnormal":
-                spk_abnormal_cnt[spk] += 1
-            else:
-                spk_normal_cnt[spk] += 1
-
-    spks = sorted(spk2utt.keys(), key=lambda s: -len(spk2utt[s]))[:40]
-    x = np.arange(len(spks))
-    n_vals = [spk_normal_cnt[s] for s in spks]
-    a_vals = [spk_abnormal_cnt[s] for s in spks]
-
-    ax.bar(x, n_vals, color=C_NORMAL,   alpha=0.8, label="Normal",   width=0.7)
-    ax.bar(x, a_vals, color=C_ABNORMAL, alpha=0.8, label="Abnormal", width=0.7,
-           bottom=n_vals)
-
-    # 标出 total 异常的说话人
-    totals = [n + a for n, a in zip(n_vals, a_vals)]
-    ratios = [a / t if t > 0 else 0 for a, t in zip(a_vals, totals)]
-    outlier_idx = [i for i, r in enumerate(ratios) if r > np.mean(ratios) + 2 * np.std(ratios)]
-    for i in outlier_idx:
-        ax.annotate("!", (x[i], totals[i] + 0.5), ha="center", color=C_ANOMALY,
-                    fontsize=10, fontweight="bold")
-
-    ax.set_xticks(x[::max(1, len(spks)//10)])
-    ax.set_xticklabels([spks[i] for i in range(0, len(spks), max(1, len(spks)//10))],
-                        rotation=30, ha="right", fontsize=7)
-    _ax_style(ax, "Top 40 说话人语句分布", "说话人", "utterance 数")
-    ax.legend(fontsize=8)
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# 绘图：第一页（元数据）
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def plot_label_pie(ax, utt2label):
-    """正常/异常比例饼图"""
     cnt = defaultdict(int)
     for v in utt2label.values():
         cnt[v] += 1
-    if not cnt:
-        ax.text(0.5, 0.5, "无标签数据", ha="center", va="center", transform=ax.transAxes)
-        return
-
-    labels_list = list(cnt.keys())
-    sizes = [cnt[k] for k in labels_list]
-    colors = [C_NORMAL if k == "normal" else C_ABNORMAL for k in labels_list]
-
+    labels = sorted(cnt.keys())
+    sizes  = [cnt[k] for k in labels]
+    colors = [LABEL_COLOR.get(k, "#aaaaaa") for k in labels]
+    explode = [0.04] * len(labels)
     wedges, texts, autotexts = ax.pie(
-        sizes, labels=labels_list, autopct="%1.1f%%",
-        colors=colors, startangle=90,
+        sizes, labels=labels, autopct="%1.1f%%", colors=colors,
+        explode=explode, startangle=90,
         wedgeprops=dict(edgecolor=C_BG, linewidth=2),
         textprops=dict(color=C_TEXT, fontsize=9),
     )
     for at in autotexts:
-        at.set_color("#f1f1f1")
-        at.set_fontsize(9)
-    _ax_style(ax, "样本类别比例")
+        at.set_fontsize(9); at.set_color("#ffffff")
+    total = sum(sizes)
+    ax.text(0, -1.35, f"共 {total:,} 条 utterances",
+            ha="center", fontsize=8.5, color=C_SUB)
+    _ax_style(ax, "样本类别比例", grid=False)
 
 
-def plot_duration_scatter_with_outliers(ax, utt_ids, durations, utt2label):
-    """时序散点图，标出持续时长异常点"""
-    colors_arr = [C_NORMAL if utt2label.get(u, "normal") == "normal" else C_ABNORMAL
+def plot_dur_hist(ax, dur_n, dur_a):
+    all_dur = dur_n + dur_a
+    if not all_dur:
+        ax.text(0.5, 0.5, "utt2dur 不存在", ha="center", va="center",
+                transform=ax.transAxes, color=C_SUB)
+        _ax_style(ax, "时长分布"); return
+
+    p99 = np.percentile(all_dur, 99)
+    bins = np.linspace(0, p99, 55)
+    ax.hist(dur_n, bins=bins, alpha=0.65, color=C_NORMAL,
+            label=f"Normal  n={len(dur_n)}", density=True)
+    ax.hist(dur_a, bins=bins, alpha=0.65, color=C_ABNORMAL,
+            label=f"Abnormal n={len(dur_a)}", density=True)
+
+    if dur_n:
+        mask, lo, hi = iqr_outlier_mask(dur_n, k=2.0)
+        ax.axvline(lo, color=C_ANOMALY, lw=1.2, ls="--", alpha=0.85, label=f"IQR 边界 [{lo:.1f},{hi:.1f}]s")
+        ax.axvline(hi, color=C_ANOMALY, lw=1.2, ls="--", alpha=0.85)
+
+    for v, label, c in [(np.mean(dur_n), "μ_normal", C_NORMAL),
+                         (np.mean(dur_a), "μ_abnormal", C_ABNORMAL)]:
+        ax.axvline(v, color=c, lw=1.5, ls=":", alpha=0.9)
+    ax.legend(fontsize=7.5)
+    _ax_style(ax, "语音时长分布 (秒)", "时长 (s)", "密度")
+
+
+def plot_dur_boxplot(ax, dur_n, dur_a):
+    data   = [x for x in [dur_n, dur_a] if x]
+    labels = [l for l, x in [("Normal", dur_n), ("Abnormal", dur_a)] if x]
+    colors = [LABEL_COLOR[l.lower()] for l in labels]
+
+    bp = ax.boxplot(data, patch_artist=True, notch=False,
+                    whiskerprops=dict(color=C_TEXT, lw=1),
+                    capprops=dict(color=C_TEXT, lw=1.5),
+                    medianprops=dict(color="#f1c40f", lw=2),
+                    flierprops=dict(marker="o", ms=3, linestyle="none",
+                                    markerfacecolor=C_ANOMALY, alpha=0.5))
+    for patch, c in zip(bp["boxes"], colors):
+        patch.set_facecolor(c + "44"); patch.set_edgecolor(c)
+
+    for i, (d, c) in enumerate(zip(data, colors), 1):
+        sample = np.random.choice(d, min(400, len(d)), replace=False)
+        jitter = np.random.uniform(-0.18, 0.18, len(sample))
+        ax.scatter(i + jitter, sample, alpha=0.2, s=5, color=c, zorder=3)
+
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels(labels, fontsize=9)
+    _ax_style(ax, "时长箱线图对比", "", "时长 (s)")
+
+
+def plot_dur_timeline(ax, utt_ids, durations, utt2label):
+    """时序散点 + IQR 异常标注"""
+    if not any(durations):
+        ax.text(0.5, 0.5, "无时长数据", ha="center", va="center",
+                transform=ax.transAxes, color=C_SUB)
+        _ax_style(ax, "时长时序"); return
+
+    colors_arr = [LABEL_COLOR.get(utt2label.get(u, "normal"), C_NORMAL)
                   for u in utt_ids]
-    ax.scatter(range(len(durations)), durations, c=colors_arr, s=3, alpha=0.4)
+    xs = np.arange(len(durations))
+    ax.scatter(xs, durations, c=colors_arr, s=3, alpha=0.45, linewidths=0)
 
-    # IQR 异常点
-    out_idx, lo, hi = detect_outliers_iqr(durations, k=2.5)
-    if len(out_idx):
-        ax.scatter(out_idx, [durations[i] for i in out_idx],
-                   c=C_ANOMALY, s=20, alpha=0.9, zorder=5, marker="^",
-                   label=f"统计异常点 (IQR, n={len(out_idx)})")
-    ax.axhline(lo, color=C_ANOMALY, linewidth=1, linestyle="--", alpha=0.7)
-    ax.axhline(hi, color=C_ANOMALY, linewidth=1, linestyle="--", alpha=0.7)
+    mask, lo, hi = iqr_outlier_mask(durations, k=2.5)
+    out_xs = xs[mask]
+    out_ys = np.array(durations)[mask]
+    if len(out_xs):
+        ax.scatter(out_xs, out_ys, c=C_ANOMALY, s=28, marker="^",
+                   zorder=6, label=f"IQR 异常 (n={mask.sum()})", linewidths=0)
+    ax.axhline(lo, color=C_ANOMALY, lw=1, ls="--", alpha=0.6)
+    ax.axhline(hi, color=C_ANOMALY, lw=1, ls="--", alpha=0.6)
 
-    n_patch = mpatches.Patch(color=C_NORMAL,   label="Normal")
-    a_patch = mpatches.Patch(color=C_ABNORMAL, label="Abnormal")
-    handles = [n_patch, a_patch]
-    if len(out_idx):
-        handles.append(mpatches.Patch(color=C_ANOMALY, label=f"异常点 (n={len(out_idx)})"))
-    ax.legend(handles=handles, fontsize=8)
-    _ax_style(ax, "语句时长时序图（含异常标注）", "utterance index", "时长 (s)")
-
-
-def plot_feat_stats(ax_mean, ax_std, feats, utt2label):
-    """FBank 特征均值和标准差分布（按类别）"""
-    mean_normal, mean_abnormal = [], []
-    std_normal,  std_abnormal  = [], []
-
-    for utt_id, mat in feats.items():
-        lbl = utt2label.get(utt_id, "normal")
-        m = mat.mean(axis=0)  # (D,)
-        s = mat.std(axis=0)   # (D,)
-        if lbl == "abnormal":
-            mean_abnormal.append(m)
-            std_abnormal.append(s)
-        else:
-            mean_normal.append(m)
-            std_normal.append(s)
-
-    dim = None
-    for arr, color, label in [
-        (mean_normal,   C_NORMAL,   "Normal"),
-        (mean_abnormal, C_ABNORMAL, "Abnormal"),
-    ]:
-        if arr:
-            stack = np.array(arr)   # (N, D)
-            dim = stack.shape[1]
-            x = np.arange(dim)
-            mu = stack.mean(axis=0)
-            se = stack.std(axis=0)
-            ax_mean.plot(x, mu, color=color, linewidth=1.5, label=label)
-            ax_mean.fill_between(x, mu - se, mu + se, color=color, alpha=0.15)
-
-    for arr, color, label in [
-        (std_normal,   C_NORMAL,   "Normal"),
-        (std_abnormal, C_ABNORMAL, "Abnormal"),
-    ]:
-        if arr:
-            stack = np.array(arr)
-            x = np.arange(stack.shape[1])
-            mu = stack.mean(axis=0)
-            ax_std.plot(x, mu, color=color, linewidth=1.5, label=label)
-
-    _ax_style(ax_mean, "FBank 各维度均值对比", "滤波器组 index", "均值")
-    _ax_style(ax_std,  "FBank 各维度标准差对比", "滤波器组 index", "标准差")
-    ax_mean.legend(fontsize=8)
-    ax_std.legend(fontsize=8)
+    handles = legend_patches(("Normal", C_NORMAL), ("Abnormal", C_ABNORMAL))
+    if len(out_xs):
+        handles.append(mpatches.Patch(color=C_ANOMALY, label=f"异常点 n={mask.sum()}"))
+    ax.legend(handles=handles, fontsize=7.5)
+    _ax_style(ax, "语句时长时序（含异常标注）", "utterance index", "时长 (s)")
 
 
-def plot_fbank_heatmap(ax, feat_mat, title="FBank 热力图示例"):
-    """单条 utterance 的 FBank 热力图"""
-    cmap = LinearSegmentedColormap.from_list(
-        "heat", ["#0d1117", "#1a3a5c", "#2980b9", "#27ae60", "#f1c40f", "#e74c3c"]
-    )
-    im = ax.imshow(feat_mat.T, aspect="auto", origin="lower", cmap=cmap,
-                   interpolation="nearest")
-    plt.colorbar(im, ax=ax, fraction=0.03, pad=0.02)
-    _ax_style(ax, title, "时间帧", "滤波器组 index")
+def plot_spk_utt_dist(ax, spk2utt, utt2label):
+    if not spk2utt:
+        ax.text(0.5, 0.5, "无 spk2utt 数据", ha="center", va="center",
+                transform=ax.transAxes, color=C_SUB)
+        _ax_style(ax, "说话人分布"); return
 
+    spk_n = defaultdict(int); spk_a = defaultdict(int)
+    for spk, utts in spk2utt.items():
+        for u in utts:
+            if utt2label.get(u, "normal") == "abnormal":
+                spk_a[spk] += 1
+            else:
+                spk_n[spk] += 1
 
-def plot_energy_distribution(ax, feats, utt2label):
-    """每条 utterance 的平均帧能量分布"""
-    energy_normal, energy_abnormal = [], []
-    ids_n, ids_a = [], []
+    spks = sorted(spk2utt.keys(), key=lambda s: -len(spk2utt[s]))[:50]
+    x = np.arange(len(spks))
+    nv = np.array([spk_n[s] for s in spks])
+    av = np.array([spk_a[s] for s in spks])
 
-    for utt_id, mat in feats.items():
-        e = mat.mean()
-        lbl = utt2label.get(utt_id, "normal")
-        if lbl == "abnormal":
-            energy_abnormal.append(e)
-            ids_a.append(utt_id)
-        else:
-            energy_normal.append(e)
-            ids_n.append(utt_id)
+    ax.bar(x, nv, color=C_NORMAL,   alpha=0.85, width=0.72, label="Normal")
+    ax.bar(x, av, color=C_ABNORMAL, alpha=0.85, width=0.72, bottom=nv, label="Abnormal")
 
-    all_e = energy_normal + energy_abnormal
-    bins = np.linspace(np.percentile(all_e, 1), np.percentile(all_e, 99), 50) if all_e else 30
-    ax.hist(energy_normal,   bins=bins, alpha=0.65, color=C_NORMAL,   density=True,
-            label=f"Normal (n={len(energy_normal)})")
-    ax.hist(energy_abnormal, bins=bins, alpha=0.65, color=C_ABNORMAL, density=True,
-            label=f"Abnormal (n={len(energy_abnormal)})")
+    totals = nv + av
+    ratios = np.where(totals > 0, av / totals, 0)
+    thr = ratios.mean() + 2.0 * ratios.std()
+    for i, r in enumerate(ratios):
+        if r > thr:
+            ax.annotate("⚠", (x[i], totals[i] + 0.3), ha="center",
+                        color=C_ANOMALY, fontsize=9)
 
-    # 标注异常低能量点
-    if energy_normal:
-        idx_out = detect_outliers_zscore(energy_normal, threshold=2.5)
-        if len(idx_out):
-            outlier_vals = [energy_normal[i] for i in idx_out]
-            ax.scatter(outlier_vals, [0.01] * len(outlier_vals),
-                       c=C_ANOMALY, marker="^", s=40, zorder=5,
-                       label=f"低能量异常 (n={len(idx_out)})")
-
-    _ax_style(ax, "帧平均能量分布", "能量", "密度")
+    step = max(1, len(spks) // 12)
+    ax.set_xticks(x[::step])
+    ax.set_xticklabels([spks[i] for i in range(0, len(spks), step)],
+                        rotation=35, ha="right", fontsize=6.5)
     ax.legend(fontsize=8)
+    _ax_style(ax, "Top-50 说话人语句分布（⚠ 异常比例说话人）",
+              "说话人", "utterance 数")
 
 
-def plot_utt_length_vs_energy(ax, feats, utt2label):
-    """散点图：utterance 长度 vs 平均能量，颜色区分类别，标出双维异常"""
-    lengths, energies, colors_arr, ids = [], [], [], []
-
-    for utt_id, mat in feats.items():
-        lbl = utt2label.get(utt_id, "normal")
-        lengths.append(mat.shape[0])
-        energies.append(mat.mean())
-        colors_arr.append(C_NORMAL if lbl == "normal" else C_ABNORMAL)
-        ids.append(utt_id)
-
-    ax.scatter(lengths, energies, c=colors_arr, s=6, alpha=0.4)
-
-    # 双变量异常：z-score 在两个维度都偏离
-    z_l = np.abs((np.array(lengths) - np.mean(lengths)) / (np.std(lengths) + 1e-9))
-    z_e = np.abs((np.array(energies) - np.mean(energies)) / (np.std(energies) + 1e-9))
-    anomaly_mask = (z_l > 2.5) | (z_e > 2.5)
-    ax.scatter(np.array(lengths)[anomaly_mask], np.array(energies)[anomaly_mask],
-               c=C_ANOMALY, s=30, marker="*", zorder=5, alpha=0.9,
-               label=f"双维异常 (n={anomaly_mask.sum()})")
-
-    n_patch = mpatches.Patch(color=C_NORMAL,   label="Normal")
-    a_patch = mpatches.Patch(color=C_ABNORMAL, label="Abnormal")
-    ax.legend(handles=[n_patch, a_patch,
-                        mpatches.Patch(color=C_ANOMALY, label=f"异常 (n={anomaly_mask.sum()})")],
-              fontsize=8)
-    _ax_style(ax, "utterance 长度 vs 平均能量", "帧数", "平均能量")
+def plot_dur_cumulative(ax, dur_n, dur_a):
+    """累积分布曲线"""
+    for durs, label, c in [(dur_n, "Normal", C_NORMAL),
+                            (dur_a, "Abnormal", C_ABNORMAL)]:
+        if not durs:
+            continue
+        sorted_d = np.sort(durs)
+        cdf = np.arange(1, len(sorted_d) + 1) / len(sorted_d)
+        ax.plot(sorted_d, cdf, color=c, lw=1.8, label=f"{label} (n={len(durs)})")
+    ax.axvline(2,  color="#555", lw=0.8, ls=":")
+    ax.axvline(10, color="#555", lw=0.8, ls=":")
+    ax.axvline(20, color="#555", lw=0.8, ls=":")
+    ax.set_xlim(left=0)
+    ax.legend(fontsize=8)
+    _ax_style(ax, "时长累积分布 (CDF)", "时长 (s)", "累积比例")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 主函数
+# 绘图：第二页（特征分析）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_feat_mean_std(ax_m, ax_s, feats, utt2label):
+    buckets = {"normal": [], "abnormal": []}
+    for uid, mat in feats.items():
+        lbl = utt2label.get(uid, "normal")
+        if lbl in buckets:
+            buckets[lbl].append(mat)
+
+    for lbl, mats in buckets.items():
+        if not mats:
+            continue
+        c = LABEL_COLOR[lbl]
+        stack = np.stack([m.mean(axis=0) for m in mats])  # (N, D)
+        mu = stack.mean(0); se = stack.std(0)
+        x  = np.arange(stack.shape[1])
+        ax_m.plot(x, mu, color=c, lw=1.6, label=lbl)
+        ax_m.fill_between(x, mu - se, mu + se, color=c, alpha=0.15)
+
+        stack_s = np.stack([m.std(axis=0) for m in mats])
+        mu_s = stack_s.mean(0)
+        ax_s.plot(x, mu_s, color=c, lw=1.6, label=lbl)
+        ax_s.fill_between(x, mu_s - stack_s.std(0),
+                          mu_s + stack_s.std(0), color=c, alpha=0.12)
+
+    ax_m.legend(); ax_s.legend()
+    _ax_style(ax_m, "FBank 各维度均值对比 (±1σ)", "滤波器组 index", "均值")
+    _ax_style(ax_s, "FBank 各维度标准差对比 (±1σ)", "滤波器组 index", "标准差")
+
+
+def plot_energy_hist(ax, feats, utt2label):
+    en_n, en_a = [], []
+    for uid, mat in feats.items():
+        e = float(mat.mean())
+        if utt2label.get(uid, "normal") == "abnormal":
+            en_a.append(e)
+        else:
+            en_n.append(e)
+
+    all_e = en_n + en_a
+    if not all_e:
+        return
+    lo_b = np.percentile(all_e, 0.5); hi_b = np.percentile(all_e, 99.5)
+    bins = np.linspace(lo_b, hi_b, 55)
+
+    ax.hist(en_n, bins=bins, alpha=0.65, color=C_NORMAL,
+            density=True, label=f"Normal  n={len(en_n)}")
+    ax.hist(en_a, bins=bins, alpha=0.65, color=C_ABNORMAL,
+            density=True, label=f"Abnormal n={len(en_a)}")
+
+    # 标注低能量异常
+    if en_n:
+        mask_z = zscore_outlier_mask(en_n, thr=2.8)
+        outs = np.array(en_n)[mask_z]
+        if len(outs):
+            ax.scatter(outs, np.full(len(outs), ax.get_ylim()[1] * 0.02 if ax.get_ylim()[1] > 0 else 0.01),
+                       c=C_ANOMALY, marker="v", s=35, zorder=6,
+                       label=f"能量异常 n={len(outs)}")
+    ax.legend()
+    _ax_style(ax, "帧平均能量分布", "能量", "密度")
+
+
+def plot_len_vs_energy(ax, feats, utt2label):
+    lengths, energies, colors_arr = [], [], []
+    for uid, mat in feats.items():
+        lengths.append(mat.shape[0])
+        energies.append(float(mat.mean()))
+        colors_arr.append(LABEL_COLOR.get(utt2label.get(uid, "normal"), C_NORMAL))
+
+    ax.scatter(lengths, energies, c=colors_arr, s=6, alpha=0.4, linewidths=0)
+
+    arr_l = np.array(lengths); arr_e = np.array(energies)
+    z_l = np.abs((arr_l - arr_l.mean()) / (arr_l.std() + 1e-9))
+    z_e = np.abs((arr_e - arr_e.mean()) / (arr_e.std() + 1e-9))
+    anom = (z_l > 2.5) | (z_e > 2.5)
+    if anom.sum():
+        ax.scatter(arr_l[anom], arr_e[anom], c=C_ANOMALY, s=35,
+                   marker="*", zorder=6, label=f"双维异常 n={anom.sum()}")
+
+    handles = legend_patches(("Normal", C_NORMAL), ("Abnormal", C_ABNORMAL))
+    if anom.sum():
+        handles.append(mpatches.Patch(color=C_ANOMALY, label=f"双维异常 n={anom.sum()}"))
+    ax.legend(handles=handles)
+    _ax_style(ax, "utterance 长度 vs 平均能量", "帧数 (T)", "平均能量")
+
+
+def plot_heatmap(ax, mat, title):
+    cmap = LinearSegmentedColormap.from_list(
+        "fbank", ["#0d1117", "#1a3a5c", "#1f6f8b", "#27ae60", "#f1c40f", "#e74c3c"]
+    )
+    im = ax.imshow(mat.T, aspect="auto", origin="lower", cmap=cmap,
+                   interpolation="nearest")
+    plt.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+    _ax_style(ax, title, "时间帧", "滤波器组 index", grid=False)
+
+
+def plot_feat_variance_per_dim(ax, feats, utt2label):
+    """各维度方差对比（normal 和 abnormal）"""
+    vars_n, vars_a = [], []
+    for uid, mat in feats.items():
+        v = mat.var(axis=0)   # (D,)
+        if utt2label.get(uid, "normal") == "abnormal":
+            vars_a.append(v)
+        else:
+            vars_n.append(v)
+
+    x = np.arange(list(feats.values())[0].shape[1]) if feats else np.array([])
+    for vlist, lbl, c in [(vars_n, "Normal", C_NORMAL),
+                           (vars_a, "Abnormal", C_ABNORMAL)]:
+        if vlist:
+            stacked = np.stack(vlist)
+            mu = stacked.mean(0)
+            ax.plot(x, mu, color=c, lw=1.5, label=lbl)
+            ax.fill_between(x, mu - stacked.std(0), mu + stacked.std(0),
+                            color=c, alpha=0.13)
+
+    # 标出方差差异最大的维度
+    if vars_n and vars_a:
+        mu_n = np.stack(vars_n).mean(0)
+        mu_a = np.stack(vars_a).mean(0)
+        diff = np.abs(mu_n - mu_a)
+        top5 = np.argsort(diff)[-5:]
+        for d in top5:
+            ax.axvline(d, color=C_ANOMALY, lw=0.8, ls=":", alpha=0.7)
+        ax.text(top5[-1], ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else 1,
+                f"差异最大维度", fontsize=6.5, color=C_ANOMALY, va="top")
+
+    ax.legend()
+    _ax_style(ax, "各维度方差对比 (虚线=差异最大维度)", "滤波器组 index", "方差")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 组装页面
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_page1(utt_ids, utt2label, utt2dur, spk2utt, out_path):
-    """第一页：元数据统计"""
-    fig = plt.figure(figsize=(18, 14), facecolor=C_BG)
-    fig.suptitle("Kaldi 训练集可视化 · 元数据统计", fontsize=15, color=C_TITLE,
-                 fontweight="bold", y=0.98)
+    fig = plt.figure(figsize=(20, 15), facecolor=C_BG)
+    fig.suptitle("Kaldi 训练集可视化  ·  元数据统计 & 时长分析",
+                 fontsize=15, color=C_TITLE, fontweight="bold", y=0.985)
 
-    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.35,
-                            left=0.07, right=0.97, top=0.93, bottom=0.07)
+    gs = gridspec.GridSpec(3, 3, figure=fig,
+                            hspace=0.48, wspace=0.32,
+                            left=0.06, right=0.97, top=0.95, bottom=0.06)
 
-    # 1. 类别饼图
-    ax0 = fig.add_subplot(gs[0, 0])
-    plot_label_pie(ax0, utt2label)
+    dur_n, dur_a = split_by_label(
+        utt_ids, utt2label,
+        [utt2dur.get(u, 0) for u in utt_ids]
+    )
+    # 过滤掉没有 utt2dur 的情况（值全为 0）
+    if not any([utt2dur.get(u) for u in utt_ids]):
+        dur_n, dur_a = [], []
 
-    # 2. 时长分布直方图
-    ax1 = fig.add_subplot(gs[0, 1:])
-    dur_n = [utt2dur[u] for u in utt_ids if u in utt2dur and utt2label.get(u, "normal") == "normal"]
-    dur_a = [utt2dur[u] for u in utt_ids if u in utt2dur and utt2label.get(u, "normal") == "abnormal"]
-    if dur_n or dur_a:
-        plot_duration_distribution(ax1, dur_n, dur_a)
-    else:
-        ax1.text(0.5, 0.5, "utt2dur 不存在", ha="center", va="center", transform=ax1.transAxes)
-        _ax_style(ax1, "时长分布")
+    plot_label_pie(fig.add_subplot(gs[0, 0]), utt2label)
+    plot_dur_hist(fig.add_subplot(gs[0, 1]), dur_n, dur_a)
+    plot_dur_cumulative(fig.add_subplot(gs[0, 2]), dur_n, dur_a)
+    plot_dur_boxplot(fig.add_subplot(gs[1, 0]), dur_n, dur_a)
 
-    # 3. 箱线图
-    ax2 = fig.add_subplot(gs[1, 0])
-    if dur_n or dur_a:
-        plot_duration_boxplot(ax2, dur_n, dur_a)
-
-    # 4. 时序散点（含异常标注）
-    ax3 = fig.add_subplot(gs[1, 1:])
-    durs_all   = [utt2dur.get(u, 0) for u in utt_ids]
-    if any(durs_all):
-        plot_duration_scatter_with_outliers(ax3, utt_ids, durs_all, utt2label)
-
-    # 5. 说话人分布
-    ax4 = fig.add_subplot(gs[2, :])
-    if spk2utt:
-        plot_utterance_count_per_speaker(ax4, spk2utt, utt2label)
-    else:
-        ax4.text(0.5, 0.5, "spk2utt 不存在", ha="center", va="center", transform=ax4.transAxes)
-        _ax_style(ax4, "说话人分布")
+    durs_all = [utt2dur.get(u, 0) for u in utt_ids]
+    plot_dur_timeline(fig.add_subplot(gs[1, 1:]), utt_ids, durs_all, utt2label)
+    plot_spk_utt_dist(fig.add_subplot(gs[2, :]), spk2utt, utt2label)
 
     plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=C_BG)
     plt.close()
-    print(f"  [保存] {out_path}")
+    print(f"  ✔ {out_path}")
 
 
 def build_page2(feats, utt2label, out_path):
-    """第二页：FBank 特征统计"""
-    fig = plt.figure(figsize=(18, 16), facecolor=C_BG)
-    fig.suptitle("Kaldi 训练集可视化 · FBank 特征分析", fontsize=15, color=C_TITLE,
-                 fontweight="bold", y=0.98)
+    fig = plt.figure(figsize=(20, 16), facecolor=C_BG)
+    fig.suptitle("Kaldi 训练集可视化  ·  FBank 特征分析",
+                 fontsize=15, color=C_TITLE, fontweight="bold", y=0.985)
 
-    gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.3,
-                            left=0.07, right=0.97, top=0.93, bottom=0.07)
+    gs = gridspec.GridSpec(3, 2, figure=fig,
+                            hspace=0.45, wspace=0.28,
+                            left=0.07, right=0.97, top=0.95, bottom=0.06)
 
-    # 1. FBank 均值对比
-    ax0 = fig.add_subplot(gs[0, 0])
-    ax1 = fig.add_subplot(gs[0, 1])
-    plot_feat_stats(ax0, ax1, feats, utt2label)
+    ax_m = fig.add_subplot(gs[0, 0])
+    ax_s = fig.add_subplot(gs[0, 1])
+    plot_feat_mean_std(ax_m, ax_s, feats, utt2label)
 
-    # 2. 帧能量分布
-    ax2 = fig.add_subplot(gs[1, 0])
-    plot_energy_distribution(ax2, feats, utt2label)
+    plot_energy_hist(fig.add_subplot(gs[1, 0]), feats, utt2label)
+    plot_len_vs_energy(fig.add_subplot(gs[1, 1]), feats, utt2label)
+    plot_feat_variance_per_dim(fig.add_subplot(gs[2, 0]), feats, utt2label)
 
-    # 3. 长度 vs 能量散点
-    ax3 = fig.add_subplot(gs[1, 1])
-    plot_utt_length_vs_energy(ax3, feats, utt2label)
+    # 各随机一条 normal / abnormal 热力图
+    n_utts = [u for u in feats if utt2label.get(u, "normal") == "normal"]
+    a_utts = [u for u in feats if utt2label.get(u, "normal") == "abnormal"]
+    ax_hn = fig.add_subplot(gs[2, 1])
 
-    # 4 & 5. 随机各取一条 normal / abnormal 的热力图
-    normal_utts   = [u for u in feats if utt2label.get(u, "normal") == "normal"]
-    abnormal_utts = [u for u in feats if utt2label.get(u, "normal") == "abnormal"]
-
-    ax4 = fig.add_subplot(gs[2, 0])
-    ax5 = fig.add_subplot(gs[2, 1])
-
-    if normal_utts:
-        u = np.random.choice(normal_utts)
-        plot_fbank_heatmap(ax4, feats[u], f"Normal 示例: {u[:20]}")
-    else:
-        ax4.text(0.5, 0.5, "无 normal 特征", ha="center", va="center", transform=ax4.transAxes)
-
-    if abnormal_utts:
-        u = np.random.choice(abnormal_utts)
-        plot_fbank_heatmap(ax5, feats[u], f"Abnormal 示例: {u[:20]}")
-    else:
-        ax5.text(0.5, 0.5, "无 abnormal 特征", ha="center", va="center", transform=ax5.transAxes)
+    if n_utts and a_utts:
+        # 并排展示：分两行分 subplot
+        ax_hn.remove()
+        gs2 = gridspec.GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[2, 1],
+                                               hspace=0.45)
+        u_n = np.random.choice(n_utts)
+        u_a = np.random.choice(a_utts)
+        plot_heatmap(fig.add_subplot(gs2[0]), feats[u_n],
+                     f"Normal  示例: {u_n[:28]}")
+        plot_heatmap(fig.add_subplot(gs2[1]), feats[u_a],
+                     f"Abnormal 示例: {u_a[:28]}")
+    elif n_utts:
+        plot_heatmap(ax_hn, feats[np.random.choice(n_utts)], "Normal 示例")
+    elif a_utts:
+        plot_heatmap(ax_hn, feats[np.random.choice(a_utts)], "Abnormal 示例")
 
     plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=C_BG)
     plt.close()
-    print(f"  [保存] {out_path}")
+    print(f"  ✔ {out_path}")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 统计摘要 & 异常导出
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def print_summary(utt_ids, utt2label, utt2dur, spk2utt, feats):
-    """终端打印统计摘要"""
-    print("\n" + "=" * 60)
+    sep = "─" * 58
+    print(f"\n{sep}")
     print("  训练集统计摘要")
-    print("=" * 60)
+    print(sep)
+
     cnt = defaultdict(int)
     for u in utt_ids:
         cnt[utt2label.get(u, "normal")] += 1
-    print(f"  总 utterances: {len(utt_ids)}")
-    for k, v in sorted(cnt.items()):
-        print(f"    {k:12s}: {v:6d}  ({v/len(utt_ids)*100:.1f}%)")
+    print(f"  总 utterances : {len(utt_ids):,}")
+    for k in sorted(cnt):
+        print(f"    {k:12s}: {cnt[k]:6,}  ({cnt[k]/len(utt_ids)*100:.1f}%)")
 
     if utt2dur:
         durs = [utt2dur[u] for u in utt_ids if u in utt2dur]
-        print(f"\n  时长统计 (秒):")
-        print(f"    总时长: {sum(durs)/3600:.2f} 小时")
-        print(f"    均值:   {np.mean(durs):.2f}  中位数: {np.median(durs):.2f}")
-        print(f"    最短:   {min(durs):.2f}  最长:   {max(durs):.2f}")
-        out_idx, lo, hi = detect_outliers_iqr(durs)
-        print(f"    IQR 异常点 (k=2.0): {len(out_idx)} 条  (< {lo:.1f}s 或 > {hi:.1f}s)")
+        mask, lo, hi = iqr_outlier_mask(durs, k=2.0)
+        print(f"\n  时长统计:")
+        print(f"    总时长  : {sum(durs)/3600:.2f} 小时")
+        print(f"    均值    : {np.mean(durs):.2f}s  中位: {np.median(durs):.2f}s")
+        print(f"    [min,max]: [{min(durs):.2f}s, {max(durs):.2f}s]")
+        print(f"    IQR 异常: {mask.sum()} 条  (超出 [{lo:.1f}s, {hi:.1f}s])")
 
     if spk2utt:
-        print(f"\n  说话人数: {len(spk2utt)}")
         cnts = [len(v) for v in spk2utt.values()]
-        print(f"    每人平均 utterances: {np.mean(cnts):.1f}")
+        print(f"\n  说话人数 : {len(spk2utt):,}")
+        print(f"    均值 utts/spk : {np.mean(cnts):.1f}")
 
     if feats:
-        print(f"\n  已读取特征条数: {len(feats)}")
-        sample = list(feats.values())[0]
-        print(f"  FBank 维度: {sample.shape[1]}")
+        sample = next(iter(feats.values()))
+        print(f"\n  已读特征   : {len(feats):,} 条")
+        print(f"  FBank 维度 : {sample.shape[1]}")
 
-    print("=" * 60 + "\n")
+    print(f"{sep}\n")
 
 
-def export_outlier_list(utt_ids, utt2dur, utt2label, out_path):
-    """导出统计异常 utterance 列表"""
-    durs = [(u, utt2dur[u]) for u in utt_ids if u in utt2dur]
-    if not durs:
+def export_outliers(utt_ids, utt2dur, utt2label, feats, out_path):
+    rows = []
+
+    # 时长异常
+    if utt2dur:
+        durs = [(u, utt2dur[u]) for u in utt_ids if u in utt2dur]
+        if durs:
+            ids_, vals = zip(*durs)
+            mask, lo, hi = iqr_outlier_mask(vals, k=2.0)
+            for i, m in enumerate(mask):
+                if m:
+                    rows.append({
+                        "utt_id":   ids_[i],
+                        "label":    utt2label.get(ids_[i], "normal"),
+                        "duration": f"{vals[i]:.3f}",
+                        "energy":   "",
+                        "reason":   f"DUR_IQR  (lo={lo:.2f} hi={hi:.2f})",
+                    })
+
+    # 能量异常
+    if feats:
+        energies = [(uid, float(mat.mean())) for uid, mat in feats.items()]
+        ids_, vals = zip(*energies)
+        mask_z = zscore_outlier_mask(vals, thr=2.8)
+        for i, m in enumerate(mask_z):
+            if m:
+                rows.append({
+                    "utt_id":   ids_[i],
+                    "label":    utt2label.get(ids_[i], "normal"),
+                    "duration": f"{utt2dur.get(ids_[i], ''):.3f}" if ids_[i] in utt2dur else "",
+                    "energy":   f"{vals[i]:.4f}",
+                    "reason":   "ENERGY_ZSCORE",
+                })
+
+    if not rows:
+        print("  [导出] 未检测到异常点")
         return
-    ids_list, dur_list = zip(*durs)
-    out_idx, lo, hi = detect_outliers_iqr(dur_list, k=2.0)
-    out_lines = []
-    for i in out_idx:
-        u = ids_list[i]
-        out_lines.append(f"{u}\t{dur_list[i]:.3f}\t{utt2label.get(u, 'normal')}\tDUR_OUTLIER")
 
     with open(out_path, "w") as f:
-        f.write("utt_id\tduration\tlabel\treason\n")
-        f.write("\n".join(out_lines))
-    print(f"  [导出] 异常列表: {out_path}  ({len(out_lines)} 条)")
+        f.write("utt_id\tlabel\tduration\tenergy\treason\n")
+        for r in rows:
+            f.write(f"{r['utt_id']}\t{r['label']}\t{r['duration']}\t{r['energy']}\t{r['reason']}\n")
+    print(f"  ✔ {out_path}  ({len(rows)} 条异常)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CLI 入口
+# CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Kaldi 训练集多维可视化 (normal/abnormal)")
-    parser.add_argument("--data-dir",    required=True,  help="Kaldi data 目录")
-    parser.add_argument("--feat-scp",    default=None,   help="feats.scp 路径（可选）")
-    parser.add_argument("--label-file",  default=None,   help="utt2label 文件路径（可选，默认全视为 normal）")
-    parser.add_argument("--output-dir",  default="./vis_output", help="输出目录")
-    parser.add_argument("--max-feats",   type=int, default=2000, help="最多读取特征数量")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(
+        description="Kaldi 训练集多维可视化 (normal/abnormal 标签从 spk_id 推断)")
+    ap.add_argument("--data-dir",          required=True,
+                    help="Kaldi data 目录，含 utt2spk spk2utt utt2dur")
+    ap.add_argument("--feats-dir",         default=None,
+                    help="特征目录，含 feats.scp 和 *.ark")
+    ap.add_argument("--scp-name",          default="feats.scp",
+                    help="scp 文件名 (默认 feats.scp)")
+    ap.add_argument("--output-dir",        default="./vis_output")
+    ap.add_argument("--max-feats",         type=int, default=3000,
+                    help="最多读取特征条数 (默认 3000)")
+    ap.add_argument("--normal-keyword",    default="normal",
+                    help="spk_id 中代表 normal 的关键词 (默认 'normal')")
+    ap.add_argument("--abnormal-keyword",  default="abnormal",
+                    help="spk_id 中代表 abnormal 的关键词 (默认 'abnormal')")
+    args = ap.parse_args()
 
-    data_dir = Path(args.data_dir)
-    out_dir  = Path(args.output_dir)
+    data_dir  = Path(args.data_dir)
+    out_dir   = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[读取数据目录] {data_dir}")
+    print(f"\n[数据目录] {data_dir}")
 
-    # ── 读取元数据 ──────────────────────────────────
-    utt2spk = read_kv(data_dir / "utt2spk")
+    # ── 读取元数据 ──────────────────────────────────────────
+    utt2spk_path = data_dir / "utt2spk"
+    if not utt2spk_path.exists():
+        print(f"[错误] 找不到 {utt2spk_path}"); sys.exit(1)
+
+    utt2spk = read_utt2spk(utt2spk_path)
     utt2dur = read_utt2dur(data_dir / "utt2dur")
     spk2utt = read_spk2utt(data_dir / "spk2utt")
 
-    # 如果 utt2dur 不存在，尝试从 segments / wav.scp 推断（跳过）
+    utt_ids   = list(utt2spk.keys())
+    utt2label = build_utt2label(utt2spk, args.normal_keyword, args.abnormal_keyword)
+
+    n_norm = sum(1 for v in utt2label.values() if v == "normal")
+    n_abnm = sum(1 for v in utt2label.values() if v == "abnormal")
+    print(f"  utterances: {len(utt_ids)}  |  normal: {n_norm}  abnormal: {n_abnm}")
+
     if not utt2dur:
-        print("  [提示] utt2dur 不存在，时长相关图表将跳过。"
+        print("  [提示] utt2dur 不存在，时长图表将跳过。"
               "可用 utils/data/get_utt2dur.sh 生成。")
 
-    utt_ids = list(utt2spk.keys()) if utt2spk else []
-    if not utt_ids:
-        # fallback: 从 wav.scp 取 key
-        wav_scp = read_kv(data_dir / "wav.scp")
-        utt_ids = list(wav_scp.keys())
-
-    print(f"  utterances: {len(utt_ids)}, speakers: {len(spk2utt)}")
-
-    # ── 读取标签 ────────────────────────────────────
-    label_path = args.label_file or data_dir / "utt2label"
-    utt2label = read_label_file(label_path)
-    if not utt2label:
-        print("  [提示] 未找到 utt2label，所有样本默认为 normal。")
-        utt2label = {u: "normal" for u in utt_ids}
-
-    # ── 读取特征 ────────────────────────────────────
+    # ── 读取特征 ────────────────────────────────────────────
     feats = {}
-    scp_path = args.feat_scp or data_dir / "feats.scp"
-    if os.path.exists(scp_path):
-        print(f"  [读取特征] {scp_path}")
-        feats = try_read_feats_ark(str(scp_path), max_utts=args.max_feats)
+    feats_dir = Path(args.feats_dir) if args.feats_dir else data_dir
+    scp_path  = feats_dir / args.scp_name
+    if scp_path.exists():
+        print(f"[特征] {scp_path}")
+        feats = read_feats_scp(str(scp_path), max_utts=args.max_feats)
+    else:
+        print(f"  [提示] 找不到 {scp_path}，跳过特征分析。")
 
-    # ── 统计摘要 ────────────────────────────────────
+    # ── 摘要 ────────────────────────────────────────────────
     print_summary(utt_ids, utt2label, utt2dur, spk2utt, feats)
 
-    # ── 绘图 ────────────────────────────────────────
-    print("[绘图] 第一页：元数据统计 ...")
+    # ── 绘图 ────────────────────────────────────────────────
+    print("[绘图] page1: 元数据统计 ...")
     build_page1(utt_ids, utt2label, utt2dur, spk2utt,
                 out_dir / "page1_metadata.png")
 
     if feats:
-        print("[绘图] 第二页：FBank 特征分析 ...")
+        print("[绘图] page2: FBank 特征分析 ...")
         build_page2(feats, utt2label, out_dir / "page2_fbank.png")
     else:
-        print("[跳过] 第二页（无特征数据）")
+        print("[跳过] page2 (无特征数据)")
 
-    # ── 导出异常列表 ────────────────────────────────
-    export_outlier_list(utt_ids, utt2dur, utt2label, out_dir / "outliers.tsv")
+    # ── 异常导出 ────────────────────────────────────────────
+    export_outliers(utt_ids, utt2dur, utt2label, feats,
+                    out_dir / "outliers.tsv")
 
-    print(f"\n✅ 完成！结果保存在: {out_dir}/")
-    print("   page1_metadata.png  — 元数据统计")
-    print("   page2_fbank.png     — FBank 特征分析（需 feats.scp）")
-    print("   outliers.tsv        — 统计异常 utterance 列表\n")
+    print(f"\n✅ 完成！结果目录: {out_dir}")
+    print("   page1_metadata.png  元数据 / 时长分析")
+    print("   page2_fbank.png     FBank 特征分析")
+    print("   outliers.tsv        异常 utterance 列表\n")
 
 
 if __name__ == "__main__":
