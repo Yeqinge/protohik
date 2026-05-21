@@ -12,7 +12,7 @@ Usage:
         --feats-dir feats_exp/feats/fbank_20k_test5/fiber_train_s10_fix105_20k \
         --output-dir ./vis_output \
         [--scp-name feats.scp] \
-        [--max-feats 3000] \
+        [--sample-per-class 2000] \
         [--normal-keyword normal] \
         [--abnormal-keyword abnormal]
 """
@@ -98,22 +98,54 @@ def infer_label(spk_id, normal_kw, abnormal_kw):
 def build_utt2label(utt2spk, nkw, akw):
     return {u: infer_label(spk, nkw, akw) for u, spk in utt2spk.items()}
 
-def read_feats_scp(scp_path, max_utts=3000):
+def sample_scp_balanced(scp_path, utt2label, sample_per_class=2000):
+    """
+    Two-pass strategy:
+      Pass 1: scan scp (no ark I/O) to collect utt_ids per class
+      Pass 2: random-access load only the sampled subset
+    Returns {utt_id: np.ndarray}
+    """
     try:
         import kaldiio
     except ImportError:
         print("  [ERROR] kaldiio not installed: pip install kaldiio"); return {}
+
+    # Pass 1: collect ids per class from scp (fast, no ark read)
+    ids_by_class = defaultdict(list)
+    with open(scp_path) as f:
+        for line in f:
+            p = line.strip().split()
+            if len(p) >= 2:
+                ids_by_class[utt2label.get(p[0], "normal")].append(p[0])
+
+    sampled_ids = set()
+    for lbl, ids in ids_by_class.items():
+        n = min(sample_per_class, len(ids))
+        chosen = np.random.choice(ids, n, replace=False).tolist()
+        sampled_ids.update(chosen)
+        print(f"  [{lbl}] total={len(ids):,}  sampled={n}")
+
+    # Pass 2: random access
     feats = {}
     try:
-        for uid, mat in kaldiio.load_scp_sequential(scp_path):
-            feats[uid] = mat.astype(np.float32)
-            if len(feats) >= max_utts:
-                break
-        print(f"  [kaldiio] loaded {len(feats)} utterances (limit={max_utts})")
+        reader = kaldiio.load_scp(scp_path)
+        for uid in sampled_ids:
+            feats[uid] = reader[uid].astype(np.float32)
+        print(f"  [kaldiio] loaded {len(feats)} utterances total")
     except Exception as e:
-        print(f"  [WARNING] feature loading failed: {e}")
+        print(f"  [WARNING] random access failed, falling back to sequential: {e}")
+        feats = {}
+        for uid, mat in kaldiio.load_scp_sequential(scp_path):
+            if uid in sampled_ids:
+                feats[uid] = mat.astype(np.float32)
+            if len(feats) >= len(sampled_ids):
+                break
+        print(f"  [kaldiio] loaded {len(feats)} utterances (sequential fallback)")
     return feats
 
+
+def read_feats_scp(scp_path, utt2label, sample_per_class=2000):
+    return sample_scp_balanced(scp_path, utt2label, sample_per_class)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Outlier detection
@@ -501,7 +533,8 @@ def main():
                     help="Feature dir with feats.scp and *.ark shards")
     ap.add_argument("--scp-name",         default="feats.scp")
     ap.add_argument("--output-dir",       default="./vis_output")
-    ap.add_argument("--max-feats",        type=int, default=3000)
+    ap.add_argument("--sample-per-class", type=int, default=2000,
+                    help="Utterances to sample per class (default 2000)")
     ap.add_argument("--normal-keyword",   default="normal")
     ap.add_argument("--abnormal-keyword", default="abnormal")
     args = ap.parse_args()
@@ -530,7 +563,7 @@ def main():
     scp_path  = feats_dir / args.scp_name
     if scp_path.exists():
         print(f"[feats] {scp_path}")
-        feats = read_feats_scp(str(scp_path), max_utts=args.max_feats)
+        feats = read_feats_scp(str(scp_path), utt2label, sample_per_class=args.sample_per_class)
     else:
         print(f"  [note] {scp_path} not found — feature plots will be skipped")
 
