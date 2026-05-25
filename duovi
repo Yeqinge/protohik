@@ -1,0 +1,1228 @@
+#!/usr/bin/env python3
+"""
+Kaldi Multi-Dataset Visualization — single HTML SPA
+────────────────────────────────────────────────────
+• Landing page: side-by-side comparison cards for all datasets
+• Click any card → per-dataset detail view (speakers, features, outliers)
+• All rendered as one self-contained HTML file (base64 images embedded)
+
+Usage (single dataset):
+    python3 visualize_dataset.py \
+        --datasets "data/train_set1:feats_exp/train_set1" \
+        --output-dir ./vis_output
+
+Usage (multiple datasets, space-separated):
+    python3 visualize_dataset.py \
+        --datasets \
+            "data/train_A:feats_exp/train_A" \
+            "data/train_B:feats_exp/train_B" \
+            "data/train_C" \
+        --labels "Train-A" "Train-B" "Train-C" \
+        --output-dir ./vis_output
+
+Each --datasets entry is  data_dir:feats_dir  (feats_dir optional, omit colon too).
+--labels gives friendly display names (defaults to data-dir basename).
+"""
+
+import os, sys, argparse, warnings, json, base64, io, textwrap
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.colors import LinearSegmentedColormap
+
+warnings.filterwarnings("ignore")
+
+# ── palette ──────────────────────────────────────────────────────────────────
+C_NORMAL   = "#3b82f6"
+C_ABNORMAL = "#ef4444"
+C_ANOMALY  = "#f97316"
+C_GRID     = "#e5e7eb"
+C_TEXT     = "#1f2937"
+C_TITLE    = "#111827"
+C_SUB      = "#6b7280"
+C_FIG      = "#ffffff"
+C_AX       = "#f9fafb"
+LABEL_COLOR = {"normal": C_NORMAL, "abnormal": C_ABNORMAL}
+
+# palette for multi-dataset comparison lines
+DS_COLORS = ["#3b82f6","#ef4444","#10b981","#f59e0b","#8b5cf6",
+             "#06b6d4","#ec4899","#84cc16","#f97316","#6366f1"]
+
+plt.rcParams.update({
+    "figure.facecolor": C_FIG, "axes.facecolor": C_AX,
+    "axes.edgecolor": "#d1d5db", "axes.labelcolor": C_TEXT,
+    "axes.titlecolor": C_TITLE, "xtick.color": C_TEXT, "ytick.color": C_TEXT,
+    "text.color": C_TEXT, "grid.color": C_GRID, "grid.linewidth": 0.6,
+    "legend.facecolor": "#ffffff", "legend.edgecolor": "#e5e7eb",
+    "legend.fontsize": 8.5, "legend.framealpha": 0.95,
+    "font.family": "DejaVu Sans", "font.size": 9.5,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.titlesize": 11, "axes.labelsize": 9,
+})
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# I/O helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def read_utt2spk(path):
+    d = {}
+    with open(path) as f:
+        for line in f:
+            p = line.strip().split()
+            if len(p) >= 2: d[p[0]] = p[1]
+    return d
+
+def read_spk2utt(path):
+    d = {}
+    if not os.path.exists(path): return d
+    with open(path) as f:
+        for line in f:
+            p = line.strip().split()
+            if p: d[p[0]] = p[1:]
+    return d
+
+def infer_label(spk_id, nkw, akw):
+    s = spk_id.lower()
+    if akw.lower() in s: return "abnormal"
+    if nkw.lower() in s: return "normal"
+    return "normal"
+
+def build_utt2label(utt2spk, nkw, akw):
+    return {u: infer_label(spk, nkw, akw) for u, spk in utt2spk.items()}
+
+def sample_scp_balanced(scp_path, utt2label, sample_per_class=2000):
+    try:
+        import kaldiio
+    except ImportError:
+        print("  [ERROR] kaldiio not installed: pip install kaldiio"); return {}
+    ids_by_class = defaultdict(list)
+    with open(scp_path) as f:
+        for line in f:
+            p = line.strip().split()
+            if len(p) >= 2:
+                ids_by_class[utt2label.get(p[0], "normal")].append(p[0])
+    sampled_ids = set()
+    for lbl, ids in ids_by_class.items():
+        n = min(sample_per_class, len(ids))
+        chosen = np.random.choice(ids, n, replace=False).tolist()
+        sampled_ids.update(chosen)
+        print(f"    [{lbl}] total={len(ids):,}  sampled={n}")
+    feats = {}
+    try:
+        reader = kaldiio.load_scp(scp_path)
+        for uid in sampled_ids:
+            feats[uid] = reader[uid].astype(np.float32)
+        print(f"    [kaldiio] loaded {len(feats)} utterances")
+    except Exception as e:
+        print(f"    [WARNING] random-access failed, sequential fallback: {e}")
+        for uid, mat in kaldiio.load_scp_sequential(scp_path):
+            if uid in sampled_ids:
+                feats[uid] = mat.astype(np.float32)
+            if len(feats) >= len(sampled_ids): break
+    return feats
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Outlier helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def zscore_mask(values, thr=2.8):
+    arr = np.asarray(values, float)
+    return np.abs((arr - arr.mean()) / (arr.std() + 1e-9)) > thr
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Figure → base64
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fig_to_b64(fig, dpi=150):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", facecolor=C_FIG)
+    buf.seek(0)
+    b64 = base64.b64encode(buf.read()).decode()
+    plt.close(fig)
+    return b64
+
+def _ax(ax, title, xlabel="", ylabel="", grid=True):
+    ax.set_title(title, fontsize=11, pad=8, fontweight="bold", color=C_TITLE)
+    if xlabel: ax.set_xlabel(xlabel, fontsize=9, color=C_SUB, labelpad=4)
+    if ylabel: ax.set_ylabel(ylabel, fontsize=9, color=C_SUB, labelpad=4)
+    if grid:   ax.grid(True, alpha=0.45, linestyle="--", linewidth=0.5)
+    ax.tick_params(labelsize=8.5)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── COMPARISON charts  (all datasets on one figure) ──────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cmp_class_bar(all_stats):
+    """Grouped bar: normal vs abnormal count per dataset."""
+    labels = [s["label"] for s in all_stats]
+    n_norm = [s["n_normal"]   for s in all_stats]
+    n_abnm = [s["n_abnormal"] for s in all_stats]
+    x = np.arange(len(labels)); w = 0.38
+    fig, ax = plt.subplots(figsize=(max(7, len(labels)*1.4), 5), facecolor=C_FIG)
+    ax.bar(x - w/2, n_norm, w, color=C_NORMAL,   alpha=0.82, label="Normal")
+    ax.bar(x + w/2, n_abnm, w, color=C_ABNORMAL, alpha=0.82, label="Abnormal")
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8.5)
+    ax.legend()
+    _ax(ax, "Utterance Count by Class per Dataset", "", "# Utterances")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def cmp_abnormal_ratio(all_stats):
+    """Line + scatter: abnormal ratio across datasets."""
+    labels = [s["label"] for s in all_stats]
+    ratios = [s["n_abnormal"] / max(s["total_utts"], 1) * 100 for s in all_stats]
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(max(7, len(labels)*1.4), 5), facecolor=C_FIG)
+    ax.plot(x, ratios, "o-", color=C_ABNORMAL, lw=2, ms=8, zorder=4)
+    for xi, r in zip(x, ratios):
+        ax.text(xi, r + 0.8, f"{r:.1f}%", ha="center", fontsize=8, color=C_ABNORMAL)
+    ax.axhline(np.mean(ratios), color="#9ca3af", lw=1.2, ls="--", label="Mean")
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8.5)
+    ax.set_ylim(0, max(ratios)*1.25 + 5); ax.legend()
+    _ax(ax, "Abnormal Ratio (%) per Dataset", "", "Abnormal %")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def cmp_speaker_count(all_stats):
+    labels = [s["label"] for s in all_stats]
+    spks   = [s["n_speakers"] for s in all_stats]
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(max(7, len(labels)*1.4), 5), facecolor=C_FIG)
+    bars = ax.bar(x, spks, color=[DS_COLORS[i % len(DS_COLORS)] for i in range(len(labels))],
+                  alpha=0.82, width=0.55)
+    for bar, v in zip(bars, spks):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(spks)*0.01,
+                f"{v:,}", ha="center", fontsize=8, color=C_SUB)
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8.5)
+    _ax(ax, "Speaker Count per Dataset", "", "# Speakers")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def cmp_energy_box(all_stats):
+    """Side-by-side energy boxplots for datasets that have features."""
+    ds_with_feats = [s for s in all_stats if s.get("energy_samples")]
+    if not ds_with_feats:
+        return None
+    fig, ax = plt.subplots(figsize=(max(7, len(ds_with_feats)*1.6), 5), facecolor=C_FIG)
+    data   = [s["energy_samples"] for s in ds_with_feats]
+    labels = [s["label"]          for s in ds_with_feats]
+    colors = [DS_COLORS[i % len(DS_COLORS)] for i in range(len(ds_with_feats))]
+    bp = ax.boxplot(data, patch_artist=True,
+                    whiskerprops=dict(color="#9ca3af", lw=1.2),
+                    capprops=dict(color="#6b7280", lw=1.5),
+                    medianprops=dict(color="#374151", lw=2.2),
+                    flierprops=dict(marker="o", ms=3, linestyle="none",
+                                    markerfacecolor=C_ANOMALY, markeredgecolor="none", alpha=0.5))
+    for patch, c in zip(bp["boxes"], colors):
+        patch.set_facecolor(c + "33"); patch.set_edgecolor(c); patch.set_linewidth(1.8)
+    ax.set_xticks(range(1, len(labels)+1)); ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8.5)
+    _ax(ax, "Frame-Mean Energy Distribution across Datasets", "", "Mean energy")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def cmp_fbank_mean(all_stats):
+    """Overlay mean FBank curves for all datasets (normal only)."""
+    ds_with_feats = [s for s in all_stats if s.get("fbank_mean_normal") is not None]
+    if not ds_with_feats: return None
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5), facecolor=C_FIG)
+    for i, s in enumerate(ds_with_feats):
+        c = DS_COLORS[i % len(DS_COLORS)]
+        mn = s["fbank_mean_normal"]
+        ma = s.get("fbank_mean_abnormal")
+        x  = np.arange(len(mn))
+        ax1.plot(x, mn, color=c, lw=1.8, label=s["label"])
+        if ma is not None:
+            ax2.plot(x, ma, color=c, lw=1.8, label=s["label"])
+    ax1.legend(fontsize=7.5); ax2.legend(fontsize=7.5)
+    _ax(ax1, "FBank Mean (Normal) per Dataset",   "Filter index", "Mean")
+    _ax(ax2, "FBank Mean (Abnormal) per Dataset",  "Filter index", "Mean")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def cmp_utts_per_spk(all_stats):
+    """Overlaid density histograms of utts-per-speaker."""
+    fig, ax = plt.subplots(figsize=(9, 5), facecolor=C_FIG)
+    for i, s in enumerate(all_stats):
+        if not s.get("utts_per_spk"): continue
+        c = DS_COLORS[i % len(DS_COLORS)]
+        v = s["utts_per_spk"]
+        bins = np.linspace(0, np.percentile(v, 98), 35)
+        ax.hist(v, bins=bins, alpha=0.45, color=c, density=True, label=s["label"])
+    ax.legend(fontsize=8)
+    _ax(ax, "Utts-per-Speaker Density (all datasets)", "# Utterances", "Density")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ── PER-DATASET detail charts ─────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def make_pie(utt2label):
+    cnt = defaultdict(int)
+    for v in utt2label.values(): cnt[v] += 1
+    labels = sorted(cnt.keys()); sizes = [cnt[k] for k in labels]
+    colors = [LABEL_COLOR.get(k, "#888") for k in labels]
+    fig, ax = plt.subplots(figsize=(5.5, 4.8), facecolor=C_FIG)
+    _, _, autotexts = ax.pie(sizes, labels=labels, autopct="%1.1f%%", colors=colors,
+        explode=[0.05]*len(labels), startangle=90,
+        wedgeprops=dict(edgecolor="white", linewidth=2.5),
+        textprops=dict(color=C_TEXT, fontsize=10))
+    for at in autotexts: at.set_fontsize(10); at.set_fontweight("bold"); at.set_color("white")
+    ax.text(0, -1.38, f"Total: {sum(sizes):,} utterances", ha="center", fontsize=9, color=C_SUB)
+    _ax(ax, "Class Distribution", grid=False)
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def make_spk_bar(spk2utt, utt2label):
+    if not spk2utt:
+        fig, ax = plt.subplots(figsize=(10, 4), facecolor=C_FIG)
+        ax.text(0.5, 0.5, "No spk2utt data", ha="center", va="center",
+                transform=ax.transAxes, color=C_SUB, fontsize=13)
+        _ax(ax, "Speaker Distribution"); fig.tight_layout(); return fig_to_b64(fig)
+    spk_n = defaultdict(int); spk_a = defaultdict(int)
+    for spk, utts in spk2utt.items():
+        for u in utts:
+            (spk_a if utt2label.get(u, "normal") == "abnormal" else spk_n)[spk] += 1
+    spks = sorted(spk2utt.keys(), key=lambda s: -len(spk2utt[s]))[:50]
+    x = np.arange(len(spks))
+    nv = np.array([spk_n[s] for s in spks]); av = np.array([spk_a[s] for s in spks])
+    fig, ax = plt.subplots(figsize=(14, 5), facecolor=C_FIG)
+    ax.bar(x, nv, color=C_NORMAL,   alpha=0.80, width=0.72, label="Normal")
+    ax.bar(x, av, color=C_ABNORMAL, alpha=0.80, width=0.72, bottom=nv, label="Abnormal")
+    totals = nv + av; ratios = np.where(totals > 0, av/totals, 0)
+    thr = ratios.mean() + 2.0*ratios.std()
+    for i, r in enumerate(ratios):
+        if r > thr: ax.annotate("★", (x[i], totals[i]+.3), ha="center", color=C_ABNORMAL, fontsize=9)
+    step = max(1, len(spks)//16)
+    ax.set_xticks(x[::step]); ax.set_xticklabels([spks[i] for i in range(0,len(spks),step)],
+                                                   rotation=35, ha="right", fontsize=7)
+    ax.legend(); _ax(ax, "Top-50 Speakers (★ = high abnormal ratio)", "Speaker ID", "# Utterances")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def make_ratio_bar(spk2utt, utt2label):
+    ratios = {spk: sum(1 for u in utts if utt2label.get(u,"normal")=="abnormal")/len(utts)
+              for spk, utts in spk2utt.items() if utts}
+    spks = sorted(ratios, key=ratios.get, reverse=True)[:40]
+    x = np.arange(len(spks)); vals = [ratios[s] for s in spks]
+    fig, ax = plt.subplots(figsize=(12, 5), facecolor=C_FIG)
+    ax.bar(x, vals, color=[C_ABNORMAL if v>.5 else C_NORMAL for v in vals], alpha=0.80, width=0.75)
+    ax.axhline(0.5, color="#9ca3af", lw=1.2, ls="--", label="50% threshold")
+    step = max(1, len(spks)//10)
+    ax.set_xticks(x[::step]); ax.set_xticklabels([spks[i] for i in range(0,len(spks),step)],
+                                                   rotation=35, ha="right", fontsize=7)
+    ax.set_ylim(0, 1.08); ax.legend()
+    _ax(ax, "Abnormal Ratio per Speaker (top 40)", "Speaker ID", "Abnormal ratio")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def make_utts_hist(spk2utt, utt2label):
+    n_c, a_c = [], []
+    for spk, utts in spk2utt.items():
+        n = sum(1 for u in utts if utt2label.get(u,"normal")=="normal")
+        a = sum(1 for u in utts if utt2label.get(u,"normal")=="abnormal")
+        if n: n_c.append(n)
+        if a: a_c.append(a)
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=C_FIG)
+    all_c = n_c + a_c
+    if all_c:
+        bins = np.linspace(0, np.percentile(all_c, 99), 35)
+        ax.hist(n_c, bins=bins, alpha=0.65, color=C_NORMAL,   label=f"Normal spk (n={len(n_c)})",   density=True)
+        ax.hist(a_c, bins=bins, alpha=0.65, color=C_ABNORMAL, label=f"Abnormal spk (n={len(a_c)})", density=True)
+        ax.legend()
+    _ax(ax, "Utts-per-Speaker Distribution", "# Utterances", "Density")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def make_feat_mean_std(feats, utt2label):
+    buckets = {"normal": [], "abnormal": []}
+    for uid, mat in feats.items():
+        lbl = utt2label.get(uid, "normal")
+        if lbl in buckets: buckets[lbl].append(mat)
+    fig, (ax_m, ax_s) = plt.subplots(1, 2, figsize=(13, 5), facecolor=C_FIG)
+    for lbl, mats in buckets.items():
+        if not mats: continue
+        c = LABEL_COLOR[lbl]
+        stack = np.stack([m.mean(axis=0) for m in mats])
+        mu, se = stack.mean(0), stack.std(0); x = np.arange(stack.shape[1])
+        ax_m.plot(x, mu, color=c, lw=1.8, label=lbl)
+        ax_m.fill_between(x, mu-se, mu+se, color=c, alpha=0.15)
+        stack_s = np.stack([m.std(axis=0) for m in mats]); mu_s = stack_s.mean(0)
+        ax_s.plot(x, mu_s, color=c, lw=1.8, label=lbl)
+        ax_s.fill_between(x, mu_s-stack_s.std(0), mu_s+stack_s.std(0), color=c, alpha=0.12)
+    ax_m.legend(); ax_s.legend()
+    _ax(ax_m, "FBank Mean per Filter Bank (±1 SD)", "Filter index", "Mean")
+    _ax(ax_s, "FBank Std per Filter Bank (±1 SD)",  "Filter index", "Std")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def make_energy_hist(feats, utt2label):
+    en_n, en_a = [], []
+    for uid, mat in feats.items():
+        e = float(mat.mean())
+        (en_a if utt2label.get(uid,"normal")=="abnormal" else en_n).append(e)
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=C_FIG)
+    all_e = en_n + en_a
+    if all_e:
+        bins = np.linspace(np.percentile(all_e,.5), np.percentile(all_e,99.5), 55)
+        ax.hist(en_n, bins=bins, alpha=0.65, color=C_NORMAL,   density=True, label=f"Normal (n={len(en_n)})")
+        ax.hist(en_a, bins=bins, alpha=0.65, color=C_ABNORMAL, density=True, label=f"Abnormal (n={len(en_a)})")
+        if en_n:
+            outs = np.array(en_n)[zscore_mask(en_n, 2.8)]
+            if len(outs):
+                ylim = ax.get_ylim()
+                ax.scatter(outs, np.full(len(outs), (ylim[1]-ylim[0])*.03+ylim[0]),
+                           c=C_ANOMALY, marker="v", s=50, zorder=6, label=f"Outliers (n={len(outs)})")
+        ax.legend()
+    _ax(ax, "Frame-Mean Energy Distribution", "Energy", "Density")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def make_len_vs_energy(feats, utt2label):
+    lengths, energies, colors_arr = [], [], []
+    for uid, mat in feats.items():
+        lengths.append(mat.shape[0]); energies.append(float(mat.mean()))
+        colors_arr.append(LABEL_COLOR.get(utt2label.get(uid,"normal"), C_NORMAL))
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=C_FIG)
+    ax.scatter(lengths, energies, c=colors_arr, s=8, alpha=0.45, linewidths=0)
+    al = np.array(lengths); ae = np.array(energies)
+    anom = zscore_mask(al, 2.5) | zscore_mask(ae, 2.5)
+    if anom.sum():
+        ax.scatter(al[anom], ae[anom], c=C_ANOMALY, s=50, marker="*", zorder=6,
+                   linewidths=0, label=f"Bivariate outliers (n={anom.sum()})")
+    handles = [mpatches.Patch(color=C_NORMAL, label="Normal"),
+               mpatches.Patch(color=C_ABNORMAL, label="Abnormal")]
+    if anom.sum(): handles.append(mpatches.Patch(color=C_ANOMALY, label=f"Outliers (n={anom.sum()})"))
+    ax.legend(handles=handles)
+    _ax(ax, "Utterance Length vs. Mean Energy", "Frames (T)", "Mean energy")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def make_variance_dim(feats, utt2label):
+    buckets = {"normal": [], "abnormal": []}
+    for uid, mat in feats.items():
+        lbl = utt2label.get(uid, "normal")
+        if lbl in buckets: buckets[lbl].append(mat.var(axis=0))
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=C_FIG)
+    means_n = means_a = None
+    for lbl, vlist in buckets.items():
+        if not vlist: continue
+        stacked = np.stack(vlist); mu = stacked.mean(0); x = np.arange(stacked.shape[1])
+        c = LABEL_COLOR[lbl]
+        ax.plot(x, mu, color=c, lw=1.8, label=lbl)
+        ax.fill_between(x, mu-stacked.std(0), mu+stacked.std(0), color=c, alpha=0.12)
+        if lbl == "normal":   means_n = mu
+        if lbl == "abnormal": means_a = mu
+    if means_n is not None and means_a is not None:
+        for d in np.argsort(np.abs(means_n - means_a))[-5:]:
+            ax.axvline(d, color=C_ANOMALY, lw=1.0, ls=":", alpha=0.85)
+    ax.legend(); _ax(ax, "Variance per Filter Bank (dotted = top-5 diverging)", "Filter index", "Variance")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def make_energy_box(feats, utt2label):
+    en_n = [float(mat.mean()) for uid,mat in feats.items() if utt2label.get(uid,"normal")=="normal"]
+    en_a = [float(mat.mean()) for uid,mat in feats.items() if utt2label.get(uid,"normal")=="abnormal"]
+    data   = [x for x in [en_n, en_a] if x]
+    labels = [l for l,x in [("Normal",en_n),("Abnormal",en_a)] if x]
+    colors = [LABEL_COLOR[l.lower()] for l in labels]
+    fig, ax = plt.subplots(figsize=(6, 5), facecolor=C_FIG)
+    bp = ax.boxplot(data, patch_artist=True,
+                    whiskerprops=dict(color="#9ca3af",lw=1.2), capprops=dict(color="#6b7280",lw=1.5),
+                    medianprops=dict(color="#374151",lw=2.2),
+                    flierprops=dict(marker="o",ms=3.5,linestyle="none",
+                                    markerfacecolor=C_ANOMALY,markeredgecolor="none",alpha=0.6))
+    for patch, c in zip(bp["boxes"], colors):
+        patch.set_facecolor(c+"33"); patch.set_edgecolor(c); patch.set_linewidth(1.8)
+    for i,(d,c) in enumerate(zip(data,colors),1):
+        s = np.random.choice(d, min(400,len(d)), replace=False)
+        ax.scatter(np.full(len(s),i)+np.random.uniform(-.18,.18,len(s)),
+                   s, alpha=0.18, s=6, color=c, zorder=3, linewidths=0)
+    ax.set_xticks(range(1,len(labels)+1)); ax.set_xticklabels(labels)
+    _ax(ax, "Energy Boxplot by Class", "", "Mean energy")
+    fig.tight_layout(); return fig_to_b64(fig)
+
+def make_heatmap(mat, title):
+    cmap = LinearSegmentedColormap.from_list("acad",
+        ["#f0f9ff","#7dd3fc","#2563eb","#dc2626","#7f1d1d"])
+    fig, ax = plt.subplots(figsize=(10, 4.5), facecolor=C_FIG)
+    im = ax.imshow(mat.T, aspect="auto", origin="lower", cmap=cmap, interpolation="nearest")
+    plt.colorbar(im, ax=ax, fraction=0.028, pad=0.03)
+    _ax(ax, title, "Frame index", "Filter index", grid=False)
+    fig.tight_layout(); return fig_to_b64(fig)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Load one dataset → stats dict
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def load_dataset(data_dir, feats_dir, label, scp_name, sample_per_class, nkw, akw):
+    data_dir = Path(data_dir)
+    print(f"\n[dataset] {label}  ({data_dir})")
+
+    utt2spk_path = data_dir / "utt2spk"
+    if not utt2spk_path.exists():
+        print(f"  [ERROR] utt2spk not found, skipping"); return None
+
+    utt2spk   = read_utt2spk(utt2spk_path)
+    spk2utt   = read_spk2utt(data_dir / "spk2utt")
+    utt_ids   = list(utt2spk.keys())
+    utt2label = build_utt2label(utt2spk, nkw, akw)
+
+    n_norm = sum(1 for v in utt2label.values() if v == "normal")
+    n_abnm = sum(1 for v in utt2label.values() if v == "abnormal")
+    print(f"  utterances: {len(utt_ids):,}  normal: {n_norm:,}  abnormal: {n_abnm:,}")
+
+    feats = {}
+    if feats_dir:
+        scp = Path(feats_dir) / scp_name
+        if scp.exists():
+            print(f"  feats: {scp}")
+            feats = sample_scp_balanced(str(scp), utt2label, sample_per_class)
+        else:
+            print(f"  [note] {scp} not found, feature plots skipped")
+
+    # aggregate stats for comparison page
+    utts_per_spk = [len(v) for v in spk2utt.values()] if spk2utt else []
+    energy_samples = [float(mat.mean()) for mat in feats.values()] if feats else []
+
+    fbank_mean_normal   = None
+    fbank_mean_abnormal = None
+    fbank_dim           = None
+    if feats:
+        n_mats = [mat for uid,mat in feats.items() if utt2label.get(uid,"normal")=="normal"]
+        a_mats = [mat for uid,mat in feats.items() if utt2label.get(uid,"normal")=="abnormal"]
+        if n_mats:
+            fbank_mean_normal = np.stack([m.mean(0) for m in n_mats]).mean(0).tolist()
+        if a_mats:
+            fbank_mean_abnormal = np.stack([m.mean(0) for m in a_mats]).mean(0).tolist()
+        fbank_dim = next(iter(feats.values())).shape[1]
+
+    # outliers
+    outliers = []
+    if feats:
+        items = [(uid, float(mat.mean())) for uid,mat in feats.items()]
+        ids_, vals = zip(*items)
+        for i, m in enumerate(zscore_mask(vals, 2.8)):
+            if m:
+                outliers.append({"utt_id": ids_[i],
+                                 "label":  utt2label.get(ids_[i],"normal"),
+                                 "energy": round(vals[i], 4),
+                                 "reason": "ENERGY_ZSCORE"})
+
+    return dict(
+        label           = label,
+        data_dir        = str(data_dir),
+        total_utts      = len(utt_ids),
+        n_normal        = n_norm,
+        n_abnormal      = n_abnm,
+        n_speakers      = len(spk2utt),
+        feats_loaded    = len(feats),
+        fbank_dim       = fbank_dim,
+        mean_utts_per_spk = float(np.mean(utts_per_spk)) if utts_per_spk else None,
+        energy_samples  = energy_samples,
+        utts_per_spk    = utts_per_spk,
+        fbank_mean_normal   = fbank_mean_normal,
+        fbank_mean_abnormal = fbank_mean_abnormal,
+        outliers        = outliers,
+        # raw objects for chart rendering
+        _utt2label      = utt2label,
+        _spk2utt        = spk2utt,
+        _feats          = feats,
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Render per-dataset detail block (returns HTML string)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def render_detail(ds, idx):
+    utt2label = ds["_utt2label"]
+    spk2utt   = ds["_spk2utt"]
+    feats     = ds["_feats"]
+
+    def card(title, b64, badge=""):
+        b = f'<span class="chart-badge">{badge}</span>' if badge else ""
+        return f"""<div class="chart-card">
+  <div class="chart-card-header"><span class="chart-title">{title}</span>{b}</div>
+  <div class="chart-body"><img src="data:image/png;base64,{b64}" loading="lazy"/></div>
+</div>"""
+
+    print(f"  [{ds['label']}] pie chart …")
+    pie = card("Class Distribution", make_pie(utt2label), "utterances")
+
+    print(f"  [{ds['label']}] utts/spk histogram …")
+    if spk2utt:
+        hist = card("Utts-per-Speaker", make_utts_hist(spk2utt, utt2label), "density")
+    else:
+        hist = ""
+
+    print(f"  [{ds['label']}] speaker bar …")
+    spk_bar  = card("Top-50 Speakers", make_spk_bar(spk2utt, utt2label), "stacked bar")
+
+    print(f"  [{ds['label']}] ratio bar …")
+    if spk2utt:
+        ratio    = card("Abnormal Ratio per Speaker", make_ratio_bar(spk2utt, utt2label), "top 40")
+    else:
+        ratio = ""
+
+    feat_html = ""
+    if feats:
+        print(f"  [{ds['label']}] fbank mean/std …")
+        ms  = card("FBank Mean & Std per Filter Bank", make_feat_mean_std(feats, utt2label), "±1 SD")
+        print(f"  [{ds['label']}] energy hist …")
+        eh  = card("Energy Distribution", make_energy_hist(feats, utt2label), "density")
+        print(f"  [{ds['label']}] len vs energy …")
+        lve = card("Length vs. Mean Energy", make_len_vs_energy(feats, utt2label), "scatter")
+        print(f"  [{ds['label']}] variance dim …")
+        vd  = card("Variance per Filter Bank", make_variance_dim(feats, utt2label), "top-5 dotted")
+        print(f"  [{ds['label']}] boxplot …")
+        bp  = card("Energy Boxplot", make_energy_box(feats, utt2label), "jitter")
+
+        n_utts = [u for u in feats if utt2label.get(u,"normal")=="normal"]
+        a_utts = [u for u in feats if utt2label.get(u,"normal")=="abnormal"]
+        hm = ""
+        if n_utts:
+            u = np.random.choice(n_utts)
+            print(f"  [{ds['label']}] heatmap normal …")
+            hm += card("FBank Heatmap · Normal Sample", make_heatmap(feats[u], f"Normal — {u[:50]}"), "example")
+        if a_utts:
+            u = np.random.choice(a_utts)
+            print(f"  [{ds['label']}] heatmap abnormal …")
+            hm += card("FBank Heatmap · Abnormal Sample", make_heatmap(feats[u], f"Abnormal — {u[:50]}"), "example")
+
+        feat_html = f"""
+<div class="detail-section-title">FBank Features</div>
+<div class="chart-grid full mb">{ms}</div>
+<div class="chart-grid mb">{eh}{lve}</div>
+<div class="chart-grid mb">{vd}{bp}</div>
+<div class="chart-grid mb">{hm}
+</div>"""
+    else:
+        feat_html = '<div class="empty"><strong>No feature data</strong>Run with feats-dir pointing to feats.scp.</div>'
+
+    # outlier table
+    outliers = ds["outliers"]
+    n_out    = len(outliers)
+    if n_out:
+        out_html = f"""<div class="table-wrap">
+  <div class="table-toolbar">
+    <span style="font-size:.78rem;color:var(--sub)"><strong style="color:var(--text)">{n_out:,}</strong> outliers</span>
+    <input type="text" placeholder="Filter…" oninput="filterTbl({idx},this.value)"/>
+  </div>
+  <div style="overflow-x:auto">
+  <table>
+    <thead><tr>
+      <th onclick="sortTbl({idx},'utt_id')">Utterance ID ↕</th>
+      <th onclick="sortTbl({idx},'label')">Label ↕</th>
+      <th onclick="sortTbl({idx},'energy')">Energy ↕</th>
+      <th onclick="sortTbl({idx},'reason')">Reason ↕</th>
+    </tr></thead>
+    <tbody id="otbody-{idx}"></tbody>
+  </table></div>
+  <div class="pager">
+    <span id="oinfo-{idx}"></span>
+    <div style="display:flex;gap:.5rem">
+      <button onclick="prevPage({idx})">← Prev</button>
+      <button onclick="nextPage({idx})">Next →</button>
+    </div>
+  </div>
+</div>"""
+    else:
+        out_html = '<div class="empty"><strong>No outliers detected</strong>No utterance exceeded Z-score 2.8 for frame-mean energy.</div>'
+
+    return f"""
+<div class="detail-section-title">Class &amp; Speaker Overview</div>
+<div class="chart-grid mb">{pie}{hist}</div>
+<div class="chart-grid full mb">{spk_bar}</div>
+<div class="chart-grid mb">{ratio}</div>
+{feat_html}
+<div class="detail-section-title">Outlier Utterances <span style="font-size:.75rem;font-weight:400;color:var(--sub)">Z-score &gt; 2.8</span></div>
+{out_html}
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HTML TEMPLATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>Kaldi Multi-Dataset Visualization</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,600;0,700;1,400&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f1f5f9;--surface:#ffffff;--border:#e2e8f0;--border2:#cbd5e1;
+  --text:#0f172a;--sub:#64748b;--muted:#94a3b8;
+  --accent-n:#2563eb;--accent-a:#dc2626;--accent-o:#ea580c;
+  --accent-nm:#dbeafe;--accent-am:#fee2e2;
+  --mono:'IBM Plex Mono',monospace;--sans:'IBM Plex Sans',sans-serif;
+  --r:10px;--sh:0 1px 3px rgba(0,0,0,.07),0 4px 16px rgba(0,0,0,.04);
+  --sh-lg:0 4px 24px rgba(0,0,0,.10),0 1px 4px rgba(0,0,0,.05);
+}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6}
+
+/* ── header ── */
+header{
+  background:var(--surface);border-bottom:1px solid var(--border);
+  padding:0 2rem;position:sticky;top:0;z-index:200;
+  display:flex;align-items:center;justify-content:space-between;height:56px;
+}
+.logo{font-family:var(--mono);font-size:.72rem;font-weight:600;letter-spacing:.12em;
+  text-transform:uppercase;color:var(--sub);display:flex;align-items:center;gap:.5rem}
+.logo-dot{width:7px;height:7px;border-radius:50%;background:var(--accent-n)}
+.back-btn{
+  display:none;align-items:center;gap:.5rem;
+  font-family:var(--mono);font-size:.72rem;font-weight:600;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--sub);cursor:pointer;
+  padding:.3rem .7rem;border-radius:6px;border:1px solid var(--border);
+  background:var(--bg);transition:all .15s;user-select:none;
+}
+.back-btn:hover{color:var(--text);border-color:var(--border2)}
+.back-btn svg{width:14px;height:14px}
+
+/* ── hero ── */
+.hero{
+  background:linear-gradient(135deg,#0f172a 0%,#1e3a5f 55%,#1e293b 100%);
+  color:#f1f5f9;padding:3.5rem 2rem 3rem;position:relative;overflow:hidden;
+}
+.hero::before{
+  content:'';position:absolute;inset:0;
+  background:repeating-linear-gradient(-45deg,transparent 0 24px,rgba(255,255,255,.015) 24px 25px);
+  pointer-events:none;
+}
+.hero-inner{max-width:860px;position:relative}
+.hero-tag{font-family:var(--mono);font-size:.68rem;letter-spacing:.16em;text-transform:uppercase;
+  color:#93c5fd;font-weight:600;margin-bottom:.9rem;display:flex;align-items:center;gap:.5rem}
+.hero-tag::before{content:'';display:inline-block;width:18px;height:1.5px;background:#93c5fd}
+.hero h1{font-size:clamp(1.7rem,3.5vw,2.6rem);font-weight:700;line-height:1.2;
+  letter-spacing:-.02em;margin-bottom:.9rem}
+.hero h1 span{color:#93c5fd}
+.hero-desc{font-size:.95rem;color:#94a3b8;max-width:560px}
+
+/* ── stats strip ── */
+.stats-strip{
+  background:var(--surface);border-bottom:1px solid var(--border);
+  padding:1.4rem 2rem;display:flex;gap:1.2rem;flex-wrap:wrap;
+}
+.stat-card{flex:1 1 140px;padding:1rem 1.2rem;background:var(--bg);
+  border:1px solid var(--border);border-radius:var(--r);position:relative;overflow:hidden}
+.stat-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:3px 0 0 3px}
+.stat-card.n::before{background:var(--accent-n)}.stat-card.a::before{background:var(--accent-a)}
+.stat-card.g::before{background:#10b981}.stat-card.s::before{background:#8b5cf6}
+.stat-card.f::before{background:var(--accent-o)}.stat-card.d::before{background:#06b6d4}
+.stat-label{font-family:var(--mono);font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--sub);font-weight:600;margin-bottom:.35rem}
+.stat-value{font-size:1.55rem;font-weight:700;letter-spacing:-.03em;line-height:1}
+.stat-sub{font-size:.7rem;color:var(--sub);margin-top:.28rem}
+
+/* ── page layout ── */
+#overview-page,#detail-page{max-width:1400px;margin:0 auto;padding:2rem 2rem 4rem}
+#detail-page{display:none}
+
+/* ── section title inside detail ── */
+.detail-section-title{
+  font-size:.8rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--sub);padding:.5rem 0 .7rem;margin:1.8rem 0 1rem;
+  border-bottom:1px solid var(--border);
+}
+
+/* ── comparison section ── */
+.section{margin-bottom:3rem}
+.section-header{display:flex;align-items:baseline;gap:.8rem;margin-bottom:1.2rem;
+  padding-bottom:.6rem;border-bottom:1px solid var(--border)}
+.section-title{font-size:1rem;font-weight:700;letter-spacing:-.01em}
+.section-tag{font-family:var(--mono);font-size:.62rem;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--sub)}
+
+/* ── dataset cards (comparison overview) ── */
+.ds-grid{display:grid;gap:1.2rem;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));margin-bottom:2rem}
+.ds-card{
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+  box-shadow:var(--sh);cursor:pointer;transition:box-shadow .2s,transform .2s,border-color .2s;
+  overflow:hidden;
+}
+.ds-card:hover{box-shadow:var(--sh-lg);transform:translateY(-3px);border-color:var(--accent-n)}
+.ds-card-accent{height:4px}
+.ds-card-body{padding:1.4rem 1.4rem 1rem}
+.ds-name{font-size:1rem;font-weight:700;letter-spacing:-.01em;margin-bottom:.25rem}
+.ds-path{font-family:var(--mono);font-size:.62rem;color:var(--muted);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:1rem}
+.ds-metrics{display:grid;grid-template-columns:1fr 1fr;gap:.6rem .8rem}
+.ds-metric{background:var(--bg);border-radius:7px;padding:.55rem .7rem}
+.ds-metric-label{font-family:var(--mono);font-size:.58rem;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--sub);font-weight:600;margin-bottom:.2rem}
+.ds-metric-val{font-size:1.05rem;font-weight:700;letter-spacing:-.02em}
+.ds-card-footer{
+  padding:.7rem 1.4rem;border-top:1px solid var(--border);
+  font-family:var(--mono);font-size:.65rem;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--sub);display:flex;align-items:center;justify-content:space-between;
+}
+.ds-card-footer span{color:var(--accent-n)}
+.ds-ratio-bar{height:5px;background:var(--border);border-radius:3px;margin:.8rem 0 .2rem;overflow:hidden}
+.ds-ratio-fill{height:100%;background:var(--accent-a);border-radius:3px;transition:width .4s}
+.ds-ratio-label{font-size:.68rem;color:var(--sub);display:flex;justify-content:space-between}
+
+/* ── chart grid ── */
+.chart-grid{display:grid;gap:1.2rem;grid-template-columns:repeat(auto-fit,minmax(380px,1fr))}
+.chart-grid.full{grid-template-columns:1fr}
+.mb{margin-bottom:1.2rem}
+
+.chart-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+  box-shadow:var(--sh);overflow:hidden;transition:box-shadow .2s,transform .2s}
+.chart-card:hover{box-shadow:var(--sh-lg);transform:translateY(-2px)}
+.chart-card-header{padding:.8rem 1.1rem .65rem;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between}
+.chart-title{font-size:.8rem;font-weight:700;color:var(--text)}
+.chart-badge{font-family:var(--mono);font-size:.58rem;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--sub);background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.14rem .4rem}
+.chart-body{padding:.7rem}
+.chart-body img{width:100%;height:auto;display:block;border-radius:5px}
+
+/* ── detail header band ── */
+.detail-hero{
+  background:linear-gradient(90deg,#0f172a,#1e3a5f);
+  color:#f1f5f9;padding:1.8rem 2rem 1.6rem;
+  border-bottom:1px solid #1e293b;
+}
+.detail-hero-tag{font-family:var(--mono);font-size:.65rem;letter-spacing:.14em;
+  text-transform:uppercase;color:#93c5fd;margin-bottom:.5rem}
+.detail-hero h2{font-size:1.6rem;font-weight:700;letter-spacing:-.02em}
+.detail-hero-sub{font-size:.82rem;color:#94a3b8;margin-top:.3rem;font-family:var(--mono)}
+
+/* ── outlier table ── */
+.table-wrap{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
+  box-shadow:var(--sh);overflow:hidden}
+.table-toolbar{padding:.75rem 1.1rem;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.table-toolbar input{font-family:var(--mono);font-size:.73rem;border:1px solid var(--border);
+  border-radius:6px;padding:.32rem .65rem;background:var(--bg);color:var(--text);
+  outline:none;width:220px;transition:border-color .15s}
+.table-toolbar input:focus{border-color:var(--accent-n)}
+table{width:100%;border-collapse:collapse;font-size:.77rem}
+thead{background:var(--bg)}
+thead th{padding:.55rem .9rem;text-align:left;font-family:var(--mono);font-size:.6rem;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--sub);font-weight:600;
+  border-bottom:1px solid var(--border2);cursor:pointer;user-select:none;white-space:nowrap}
+thead th:hover{color:var(--text)}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:var(--bg)}
+tbody td{padding:.5rem .9rem}
+.badge{display:inline-block;font-size:.62rem;font-weight:700;font-family:var(--mono);
+  letter-spacing:.06em;text-transform:uppercase;padding:.15rem .45rem;border-radius:4px}
+.badge-n{background:var(--accent-nm);color:var(--accent-n)}
+.badge-a{background:var(--accent-am);color:var(--accent-a)}
+.badge-o{background:#fff7ed;color:var(--accent-o)}
+.pager{padding:.6rem 1.1rem;border-top:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;font-size:.73rem;color:var(--sub)}
+.pager button{font-family:var(--mono);font-size:.68rem;background:var(--bg);
+  border:1px solid var(--border);color:var(--text);border-radius:5px;
+  padding:.26rem .6rem;cursor:pointer;transition:border-color .15s}
+.pager button:hover{border-color:var(--accent-n)}
+.pager button:disabled{opacity:.35;cursor:not-allowed}
+
+/* ── empty ── */
+.empty{background:var(--bg);border:1px dashed var(--border2);border-radius:var(--r);
+  padding:2.5rem 2rem;text-align:center;color:var(--sub);font-size:.87rem}
+.empty strong{display:block;font-size:1.05rem;color:var(--text);margin-bottom:.4rem}
+
+/* ── detail stats strip ── */
+.detail-stats{display:flex;gap:1rem;flex-wrap:wrap;padding:1.2rem 2rem;
+  background:var(--surface);border-bottom:1px solid var(--border)}
+
+/* ── footer ── */
+footer{background:#0f172a;color:#475569;text-align:center;padding:1.6rem;
+  font-family:var(--mono);font-size:.67rem;letter-spacing:.05em}
+footer span{color:#93c5fd}
+
+/* ── animation ── */
+@keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+.fade-up{animation:fadeUp .4s ease both}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo"><div class="logo-dot"></div>kaldi · vis</div>
+  <div class="back-btn" id="back-btn" onclick="showOverview()">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M10 3L5 8l5 5"/>
+    </svg>
+    All Datasets
+  </div>
+</header>
+
+<!-- ══════════════ OVERVIEW PAGE ══════════════ -->
+<div id="overview-page">
+
+  <div class="hero">
+    <div class="hero-inner">
+      <div class="hero-tag">Kaldi Multi-Dataset Report</div>
+      <h1>Dataset <span>Comparison</span><br>Dashboard</h1>
+      <p class="hero-desc">Click any dataset card below to explore its detailed feature analysis, speaker statistics, and outlier detection.</p>
+    </div>
+  </div>
+
+  <div class="stats-strip" id="global-stats-strip"><!-- filled by JS --></div>
+
+  <div id="overview-page-inner" style="max-width:1400px;margin:0 auto;padding:2rem 2rem 4rem">
+
+    <!-- Dataset cards -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-title">Datasets</div>
+        <div class="section-tag">click to explore</div>
+      </div>
+      <div class="ds-grid" id="ds-card-grid"><!-- filled by JS --></div>
+    </div>
+
+    <!-- Comparison charts -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-title">Cross-Dataset Comparison</div>
+        <div class="section-tag">aggregated metrics</div>
+      </div>
+      __CMP_CHARTS__
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════ DETAIL PAGE ══════════════ -->
+<div id="detail-page">
+  <div class="detail-hero" id="detail-hero">
+    <div class="detail-hero-tag">Dataset Detail</div>
+    <h2 id="detail-title">—</h2>
+    <div class="detail-hero-sub" id="detail-path">—</div>
+  </div>
+  <div class="detail-stats" id="detail-stats-strip"><!-- filled by JS --></div>
+  <div style="max-width:1400px;margin:0 auto;padding:2rem 2rem 4rem" id="detail-inner">
+    <!-- swapped by JS -->
+  </div>
+</div>
+
+<footer>Generated by <span>visualize_dataset.py</span> · Kaldi Multi-Dataset Visualization</footer>
+
+<script>
+// ── Data ─────────────────────────────────────────────────────────────────────
+const ALL_STATS   = __ALL_STATS_JSON__;
+const DETAIL_HTML = __DETAIL_HTML_JSON__;
+const DS_COLORS   = ["#3b82f6","#ef4444","#10b981","#f59e0b","#8b5cf6",
+                     "#06b6d4","#ec4899","#84cc16","#f97316","#6366f1"];
+
+// ── Outlier table state per dataset ──────────────────────────────────────────
+const tblState = ALL_STATS.map(s => ({
+  data: s.outliers || [], filtered: s.outliers || [],
+  sortCol: null, sortDir: 1, page: 0
+}));
+const PAGE_SIZE = 15;
+
+function fmt(n){ return (n==null)?'—':n.toLocaleString(); }
+function pct(a,b){ return b?((a/b)*100).toFixed(1)+'%':'—'; }
+
+// ── Overview stat strip ───────────────────────────────────────────────────────
+function buildGlobalStats(){
+  const strip = document.getElementById('global-stats-strip');
+  const totalUtts = ALL_STATS.reduce((s,d)=>s+d.total_utts,0);
+  const totalSpks = ALL_STATS.reduce((s,d)=>s+d.n_speakers,0);
+  const nDatasets = ALL_STATS.length;
+  strip.innerHTML = `
+    <div class="stat-card d"><div class="stat-label">Datasets</div>
+      <div class="stat-value">${nDatasets}</div></div>
+    <div class="stat-card g"><div class="stat-label">Total Utterances</div>
+      <div class="stat-value">${fmt(totalUtts)}</div></div>
+    <div class="stat-card n"><div class="stat-label">Total Normal</div>
+      <div class="stat-value">${fmt(ALL_STATS.reduce((s,d)=>s+d.n_normal,0))}</div></div>
+    <div class="stat-card a"><div class="stat-label">Total Abnormal</div>
+      <div class="stat-value">${fmt(ALL_STATS.reduce((s,d)=>s+d.n_abnormal,0))}</div></div>
+    <div class="stat-card s"><div class="stat-label">Total Speakers</div>
+      <div class="stat-value">${fmt(totalSpks)}</div></div>
+  `;
+}
+
+// ── Dataset cards ─────────────────────────────────────────────────────────────
+function buildDsCards(){
+  const grid = document.getElementById('ds-card-grid');
+  grid.innerHTML = ALL_STATS.map((s,i)=>{
+    const color  = DS_COLORS[i%DS_COLORS.length];
+    const ratio  = s.total_utts ? s.n_abnormal/s.total_utts : 0;
+    const ratioPct = (ratio*100).toFixed(1);
+    const hasFeats = s.feats_loaded > 0;
+    return `<div class="ds-card fade-up" style="animation-delay:${i*0.05}s"
+                 onclick="showDetail(${i})">
+  <div class="ds-card-accent" style="background:${color}"></div>
+  <div class="ds-card-body">
+    <div class="ds-name">${s.label}</div>
+    <div class="ds-path">${s.data_dir}</div>
+    <div class="ds-ratio-bar"><div class="ds-ratio-fill" style="width:${Math.min(ratio*100,100)}%;background:${color}"></div></div>
+    <div class="ds-ratio-label"><span>Normal ${pct(s.n_normal,s.total_utts)}</span><span>Abnormal ${ratioPct}%</span></div>
+    <div class="ds-metrics" style="margin-top:.9rem">
+      <div class="ds-metric">
+        <div class="ds-metric-label">Utterances</div>
+        <div class="ds-metric-val">${fmt(s.total_utts)}</div>
+      </div>
+      <div class="ds-metric">
+        <div class="ds-metric-label">Speakers</div>
+        <div class="ds-metric-val">${fmt(s.n_speakers)}</div>
+      </div>
+      <div class="ds-metric">
+        <div class="ds-metric-label">FBank Dim</div>
+        <div class="ds-metric-val">${s.fbank_dim ?? '—'}</div>
+      </div>
+      <div class="ds-metric">
+        <div class="ds-metric-label">Outliers</div>
+        <div class="ds-metric-val">${fmt(s.outliers.length)}</div>
+      </div>
+    </div>
+  </div>
+  <div class="ds-card-footer">
+    <span>${hasFeats ? 'Features available' : 'No features'}</span>
+    <span>Explore →</span>
+  </div>
+</div>`;
+  }).join('');
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+function showOverview(){
+  document.getElementById('overview-page').style.display = '';
+  document.getElementById('detail-page').style.display   = 'none';
+  document.getElementById('back-btn').style.display      = 'none';
+}
+
+function showDetail(idx){
+  const s = ALL_STATS[idx];
+  const color = DS_COLORS[idx % DS_COLORS.length];
+
+  document.getElementById('overview-page').style.display = 'none';
+  document.getElementById('detail-page').style.display   = '';
+  document.getElementById('back-btn').style.display      = 'flex';
+
+  document.getElementById('detail-hero').style.background =
+    `linear-gradient(90deg,#0f172a,${color}33,#1e293b)`;
+  document.getElementById('detail-title').textContent = s.label;
+  document.getElementById('detail-path').textContent  = s.data_dir;
+
+  // detail stat strip
+  const strip = document.getElementById('detail-stats-strip');
+  strip.innerHTML = `
+    <div class="stat-card g"><div class="stat-label">Total Utterances</div>
+      <div class="stat-value">${fmt(s.total_utts)}</div></div>
+    <div class="stat-card n"><div class="stat-label">Normal</div>
+      <div class="stat-value">${fmt(s.n_normal)}</div>
+      <div class="stat-sub">${pct(s.n_normal,s.total_utts)}</div></div>
+    <div class="stat-card a"><div class="stat-label">Abnormal</div>
+      <div class="stat-value">${fmt(s.n_abnormal)}</div>
+      <div class="stat-sub">${pct(s.n_abnormal,s.total_utts)}</div></div>
+    <div class="stat-card s"><div class="stat-label">Speakers</div>
+      <div class="stat-value">${fmt(s.n_speakers)}</div>
+      <div class="stat-sub">${s.mean_utts_per_spk ? 'avg '+s.mean_utts_per_spk.toFixed(1)+' utts/spk' : ''}</div></div>
+    <div class="stat-card f"><div class="stat-label">FBank Dim</div>
+      <div class="stat-value">${s.fbank_dim ?? '—'}</div>
+      <div class="stat-sub">${fmt(s.feats_loaded)} utts loaded</div></div>
+    <div class="stat-card d"><div class="stat-label">Outliers</div>
+      <div class="stat-value">${fmt(s.outliers.length)}</div>
+      <div class="stat-sub">Z-score &gt; 2.8</div></div>
+  `;
+
+  document.getElementById('detail-inner').innerHTML = DETAIL_HTML[idx];
+  renderTbl(idx);
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+// ── Outlier table logic ───────────────────────────────────────────────────────
+function renderTbl(idx){
+  const st = tblState[idx];
+  const tbody = document.getElementById(`otbody-${idx}`);
+  const info  = document.getElementById(`oinfo-${idx}`);
+  if(!tbody) return;
+  const start = st.page * PAGE_SIZE;
+  const slice = st.filtered.slice(start, start + PAGE_SIZE);
+  tbody.innerHTML = slice.map(r=>`<tr>
+    <td style="font-family:var(--mono);font-size:.71rem">${r.utt_id}</td>
+    <td><span class="badge ${r.label==='normal'?'badge-n':'badge-a'}">${r.label}</span></td>
+    <td style="font-family:var(--mono)">${r.energy.toFixed(4)}</td>
+    <td><span class="badge badge-o">${r.reason}</span></td>
+  </tr>`).join('');
+  info.textContent = st.filtered.length === 0 ? 'No results'
+    : `${start+1}–${Math.min(start+PAGE_SIZE,st.filtered.length)} of ${st.filtered.length}`;
+  document.querySelectorAll(`#otbody-${idx}`).forEach(()=>{});
+  // update button states
+  const prev = document.querySelector(`[onclick="prevPage(${idx})"]`);
+  const next = document.querySelector(`[onclick="nextPage(${idx})"]`);
+  if(prev) prev.disabled = st.page === 0;
+  if(next) next.disabled = start + PAGE_SIZE >= st.filtered.length;
+}
+
+function sortTbl(idx, col){
+  const st = tblState[idx];
+  if(st.sortCol === col) st.sortDir *= -1; else { st.sortCol = col; st.sortDir = 1; }
+  st.filtered.sort((a,b)=>{
+    let va=a[col], vb=b[col];
+    return typeof va==='string' ? va.localeCompare(vb)*st.sortDir : (va-vb)*st.sortDir;
+  });
+  st.page = 0; renderTbl(idx);
+}
+
+function filterTbl(idx, q){
+  const st = tblState[idx]; q = q.toLowerCase();
+  st.filtered = st.data.filter(r=>
+    r.utt_id.toLowerCase().includes(q)||r.label.includes(q)||r.reason.toLowerCase().includes(q));
+  if(st.sortCol) st.filtered.sort((a,b)=>{
+    let va=a[st.sortCol],vb=b[st.sortCol];
+    return typeof va==='string'?va.localeCompare(vb)*st.sortDir:(va-vb)*st.sortDir;
+  });
+  st.page = 0; renderTbl(idx);
+}
+
+function prevPage(idx){ tblState[idx].page--; renderTbl(idx); }
+function nextPage(idx){ tblState[idx].page++; renderTbl(idx); }
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+buildGlobalStats();
+buildDsCards();
+</script>
+</body>
+</html>
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HTML card helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def cmp_card(title, b64, badge=""):
+    if b64 is None: return ""
+    b = f'<span class="chart-badge">{badge}</span>' if badge else ""
+    return f"""<div class="chart-card">
+  <div class="chart-card-header"><span class="chart-title">{title}</span>{b}</div>
+  <div class="chart-body"><img src="data:image/png;base64,{b64}" loading="lazy"/></div>
+</div>"""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Build final HTML
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_html(all_datasets, out_path):
+    print("\n[html] rendering comparison charts …")
+
+    # ── comparison charts ──
+    print("  cmp: class bar …");         cb  = cmp_class_bar(all_datasets)
+    print("  cmp: abnormal ratio …");    ar  = cmp_abnormal_ratio(all_datasets)
+    print("  cmp: speaker count …");     sc  = cmp_speaker_count(all_datasets)
+    print("  cmp: fbank mean …");        fm  = cmp_fbank_mean(all_datasets)
+    print("  cmp: energy boxplot …");    eb  = cmp_energy_box(all_datasets)
+    print("  cmp: utts/spk density …");  up  = cmp_utts_per_spk(all_datasets)
+
+    cmp_html = f"""
+<div class="chart-grid mb">
+  {cmp_card("Utterance Count by Class", cb, "grouped bar")}
+  {cmp_card("Abnormal Ratio (%)", ar, "per dataset")}
+</div>
+<div class="chart-grid mb">
+  {cmp_card("Speaker Count", sc, "per dataset")}
+  {cmp_card("Utts-per-Speaker Density", up, "overlay")}
+</div>
+{"<div class='chart-grid full mb'>" + cmp_card("FBank Mean by Class (overlay)", fm, "all datasets") + "</div>" if fm else ""}
+{"<div class='chart-grid full mb'>" + cmp_card("Frame-Mean Energy Boxplots", eb, "all datasets") + "</div>" if eb else ""}
+"""
+
+    # ── per-dataset detail HTML ──
+    print("\n[html] rendering per-dataset detail charts …")
+    detail_htmls = []
+    for i, ds in enumerate(all_datasets):
+        detail_htmls.append(render_detail(ds, i))
+
+    # ── strip private keys from stats for JSON ──
+    def clean(ds):
+        return {k: v for k, v in ds.items() if not k.startswith("_")}
+
+    all_stats_json   = json.dumps([clean(ds) for ds in all_datasets], ensure_ascii=False)
+    detail_html_json = json.dumps(detail_htmls, ensure_ascii=False)
+
+    html = HTML_TEMPLATE
+    html = html.replace("__CMP_CHARTS__",       cmp_html)
+    html = html.replace("__ALL_STATS_JSON__",   all_stats_json)
+    html = html.replace("__DETAIL_HTML_JSON__", detail_html_json)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    size_kb = os.path.getsize(out_path) // 1024
+    print(f"\n  [saved] {out_path}  ({size_kb:,} KB)")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Kaldi multi-dataset visualization — single HTML SPA",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""
+        Examples
+        --------
+        # Single dataset
+        python visualize_dataset.py \\
+            --datasets "data/train:feats/train"
+
+        # Multiple datasets with friendly labels
+        python visualize_dataset.py \\
+            --datasets "data/train_A:feats/A" "data/train_B:feats/B" "data/train_C" \\
+            --labels "Train-A" "Train-B" "Train-C (no feats)"
+
+        Entry format for --datasets:  data_dir:feats_dir
+          feats_dir is optional — omit the colon if not needed.
+        """))
+    ap.add_argument("--datasets", nargs="+", required=True,
+                    metavar="DATA_DIR[:FEATS_DIR]",
+                    help="One or more dataset entries: data_dir or data_dir:feats_dir")
+    ap.add_argument("--labels", nargs="*", default=None,
+                    help="Friendly display names (must match --datasets count if given)")
+    ap.add_argument("--scp-name",         default="feats.scp")
+    ap.add_argument("--output-dir",       default="./vis_output")
+    ap.add_argument("--output-name",      default="report.html")
+    ap.add_argument("--sample-per-class", type=int, default=2000)
+    ap.add_argument("--normal-keyword",   default="normal")
+    ap.add_argument("--abnormal-keyword", default="abnormal")
+    args = ap.parse_args()
+
+    # parse dataset entries
+    entries = []
+    for entry in args.datasets:
+        if ":" in entry:
+            parts = entry.split(":", 1)
+            entries.append((parts[0].strip(), parts[1].strip()))
+        else:
+            entries.append((entry.strip(), None))
+
+    # resolve labels
+    labels = args.labels or [None] * len(entries)
+    if len(labels) != len(entries):
+        print(f"[WARNING] --labels count ({len(labels)}) != --datasets count ({len(entries)}); ignoring labels")
+        labels = [None] * len(entries)
+    labels = [lb if lb else Path(dd).name for lb, (dd, _) in zip(labels, entries)]
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # load all datasets
+    all_datasets = []
+    for (data_dir, feats_dir), label in zip(entries, labels):
+        ds = load_dataset(data_dir, feats_dir, label,
+                          args.scp_name, args.sample_per_class,
+                          args.normal_keyword, args.abnormal_keyword)
+        if ds: all_datasets.append(ds)
+
+    if not all_datasets:
+        print("[ERROR] No datasets loaded successfully."); sys.exit(1)
+
+    # summary
+    print(f"\n{'─'*54}")
+    print(f"  Loaded {len(all_datasets)} dataset(s)")
+    for ds in all_datasets:
+        pct_a = ds['n_abnormal']/max(ds['total_utts'],1)*100
+        print(f"  {ds['label']:30s}  {ds['total_utts']:>8,} utts  "
+              f"abnormal {pct_a:.1f}%  {ds['n_speakers']} spk")
+    print(f"{'─'*54}\n")
+
+    out_html = out_dir / args.output_name
+    build_html(all_datasets, out_html)
+
+    print(f"\nDone.  Open in browser:\n  {out_html}\n")
+
+
+if __name__ == "__main__":
+    main()
