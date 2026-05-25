@@ -1,29 +1,75 @@
 #!/usr/bin/env python3
 """
-Kaldi Dataset Visualization Generator
-Reads data files, computes stats, and generates a self-contained HTML dashboard.
+Kaldi Training Set Visualization — HTML Output
+- Labels inferred from spk_id (normal / abnormal keywords)
+- Multi-shard ark support via feats.scp
+- Statistical outlier annotation (IQR / Z-score / bivariate)
+- Single-file interactive HTML output
 
 Usage:
-    python3 gen_vis.py \
+    python3 visualize_dataset.py \
         --data-dir  data/fbank_20k_test5/fiber_train_s10_fix105_20k \
         --feats-dir feats_exp/feats/fbank_20k_test5/fiber_train_s10_fix105_20k \
-        --output    kaldi_vis.html \
+        --output-dir ./vis_output \
         [--scp-name feats.scp] \
         [--sample-per-class 2000] \
         [--normal-keyword normal] \
         [--abnormal-keyword abnormal]
 """
 
-import os, sys, json, argparse, warnings
-import numpy as np
-from pathlib import Path
+import os, sys, argparse, warnings, json, base64, io
 from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+from matplotlib.colors import LinearSegmentedColormap
 
 warnings.filterwarnings("ignore")
 
+# ── Color palette ─────────────────────────────────────────────────────────────
+C_NORMAL   = "#3b82f6"
+C_ABNORMAL = "#ef4444"
+C_ANOMALY  = "#f97316"
+C_GRID     = "#e5e7eb"
+C_TEXT     = "#1f2937"
+C_TITLE    = "#111827"
+C_SUB      = "#6b7280"
+C_FIG      = "#ffffff"
+C_AX       = "#f9fafb"
+
+LABEL_COLOR = {"normal": C_NORMAL, "abnormal": C_ABNORMAL}
+
+plt.rcParams.update({
+    "figure.facecolor":  C_FIG,
+    "axes.facecolor":    C_AX,
+    "axes.edgecolor":    "#d1d5db",
+    "axes.labelcolor":   C_TEXT,
+    "axes.titlecolor":   C_TITLE,
+    "xtick.color":       C_TEXT,
+    "ytick.color":       C_TEXT,
+    "text.color":        C_TEXT,
+    "grid.color":        C_GRID,
+    "grid.linewidth":    0.6,
+    "legend.facecolor":  "#ffffff",
+    "legend.edgecolor":  "#e5e7eb",
+    "legend.fontsize":   8.5,
+    "legend.framealpha": 0.95,
+    "font.family":       "DejaVu Sans",
+    "font.size":         9.5,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "axes.titlesize":    11,
+    "axes.labelsize":    9,
+})
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# I/O
+# I/O helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def read_utt2spk(path):
@@ -31,22 +77,25 @@ def read_utt2spk(path):
     with open(path) as f:
         for line in f:
             p = line.strip().split()
-            if len(p) >= 2: d[p[0]] = p[1]
+            if len(p) >= 2:
+                d[p[0]] = p[1]
     return d
 
 def read_spk2utt(path):
     d = {}
-    if not os.path.exists(path): return d
+    if not os.path.exists(path):
+        return d
     with open(path) as f:
         for line in f:
             p = line.strip().split()
-            if p: d[p[0]] = p[1:]
+            if p:
+                d[p[0]] = p[1:]
     return d
 
-def infer_label(spk_id, nkw, akw):
+def infer_label(spk_id, normal_kw, abnormal_kw):
     s = spk_id.lower()
-    if akw.lower() in s: return "abnormal"
-    if nkw.lower() in s: return "normal"
+    if abnormal_kw.lower() in s: return "abnormal"
+    if normal_kw.lower()   in s: return "normal"
     return "normal"
 
 def build_utt2label(utt2spk, nkw, akw):
@@ -56,7 +105,7 @@ def sample_scp_balanced(scp_path, utt2label, sample_per_class=2000):
     try:
         import kaldiio
     except ImportError:
-        print("  [ERROR] pip install kaldiio"); return {}
+        print("  [ERROR] kaldiio not installed: pip install kaldiio"); return {}
 
     ids_by_class = defaultdict(list)
     with open(scp_path) as f:
@@ -77,74 +126,358 @@ def sample_scp_balanced(scp_path, utt2label, sample_per_class=2000):
         reader = kaldiio.load_scp(scp_path)
         for uid in sampled_ids:
             feats[uid] = reader[uid].astype(np.float32)
-        print(f"  [kaldiio] loaded {len(feats)} utterances")
+        print(f"  [kaldiio] loaded {len(feats)} utterances total")
     except Exception as e:
-        print(f"  [WARNING] random access failed, sequential fallback: {e}")
+        print(f"  [WARNING] random access failed, falling back to sequential: {e}")
+        feats = {}
         for uid, mat in kaldiio.load_scp_sequential(scp_path):
             if uid in sampled_ids:
                 feats[uid] = mat.astype(np.float32)
-            if len(feats) >= len(sampled_ids): break
+            if len(feats) >= len(sampled_ids):
+                break
+        print(f"  [kaldiio] loaded {len(feats)} utterances (sequential fallback)")
     return feats
 
+def read_feats_scp(scp_path, utt2label, sample_per_class=2000):
+    return sample_scp_balanced(scp_path, utt2label, sample_per_class)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Build export dict
+# Outlier detection
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_export(utt2spk, spk2utt, utt2label, feats, args):
-    utt_ids = list(utt2spk.keys())
+def iqr_outlier_mask(values, k=2.0):
+    arr = np.asarray(values, float)
+    q1, q3 = np.percentile(arr, 25), np.percentile(arr, 75)
+    iqr = q3 - q1
+    lo, hi = q1 - k * iqr, q3 + k * iqr
+    return (arr < lo) | (arr > hi), lo, hi
 
-    # Speakers
-    spk_n_cnt = defaultdict(int)
-    spk_a_cnt = defaultdict(int)
-    for uid, spk in utt2spk.items():
-        if utt2label.get(uid) == "abnormal": spk_a_cnt[spk] += 1
-        else:                                 spk_n_cnt[spk] += 1
+def zscore_outlier_mask(values, thr=2.8):
+    arr = np.asarray(values, float)
+    return np.abs((arr - arr.mean()) / (arr.std() + 1e-9)) > thr
 
-    speakers = []
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Figure → base64 helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def fig_to_b64(fig, dpi=150):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", facecolor=C_FIG)
+    buf.seek(0)
+    return base64.b64encode(buf.read()).decode("utf-8")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared axis style
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _ax_style(ax, title, xlabel="", ylabel="", grid=True):
+    ax.set_title(title, fontsize=11, pad=8, fontweight="bold", color=C_TITLE)
+    if xlabel: ax.set_xlabel(xlabel, fontsize=9, color=C_SUB, labelpad=4)
+    if ylabel: ax.set_ylabel(ylabel, fontsize=9, color=C_SUB, labelpad=4)
+    if grid:   ax.grid(True, alpha=0.5, linestyle="--", linewidth=0.5)
+    ax.tick_params(labelsize=8.5)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Individual plot functions  (same logic as original, return fig objects)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def make_pie_chart(utt2label):
+    cnt = defaultdict(int)
+    for v in utt2label.values(): cnt[v] += 1
+    labels = sorted(cnt.keys())
+    sizes  = [cnt[k] for k in labels]
+    colors = [LABEL_COLOR.get(k, "#888888") for k in labels]
+
+    fig, ax = plt.subplots(figsize=(6, 5), facecolor=C_FIG)
+    wedges, texts, autotexts = ax.pie(
+        sizes, labels=labels, autopct="%1.1f%%", colors=colors,
+        explode=[0.05]*len(labels), startangle=90,
+        wedgeprops=dict(edgecolor="white", linewidth=2.5),
+        textprops=dict(color=C_TEXT, fontsize=10),
+    )
+    for at in autotexts:
+        at.set_fontsize(10); at.set_fontweight("bold"); at.set_color("white")
+    ax.text(0, -1.38, f"Total: {sum(sizes):,} utterances",
+            ha="center", fontsize=9, color=C_SUB)
+    _ax_style(ax, "Class Distribution", grid=False)
+    fig.tight_layout()
+    return fig
+
+
+def make_spk_bar(spk2utt, utt2label):
+    if not spk2utt:
+        fig, ax = plt.subplots(figsize=(12, 4), facecolor=C_FIG)
+        ax.text(0.5, 0.5, "No spk2utt data", ha="center", va="center",
+                transform=ax.transAxes, color=C_SUB, fontsize=13)
+        _ax_style(ax, "Speaker Distribution")
+        return fig
+
+    spk_n = defaultdict(int); spk_a = defaultdict(int)
     for spk, utts in spk2utt.items():
-        n = spk_n_cnt[spk]; a = spk_a_cnt[spk]
-        speakers.append({"id": spk, "label": infer_label(spk, args.normal_keyword, args.abnormal_keyword),
-                         "utt_count": n + a, "normal_count": n, "abnormal_count": a})
+        for u in utts:
+            if utt2label.get(u, "normal") == "abnormal": spk_a[spk] += 1
+            else:                                         spk_n[spk] += 1
 
-    # Utterances (all metadata; feature stats only for sampled)
-    utts_export = []
-    for uid in utt_ids:
-        spk = utt2spk[uid]
+    spks = sorted(spk2utt.keys(), key=lambda s: -len(spk2utt[s]))[:50]
+    x    = np.arange(len(spks))
+    nv   = np.array([spk_n[s] for s in spks])
+    av   = np.array([spk_a[s] for s in spks])
+
+    fig, ax = plt.subplots(figsize=(14, 5), facecolor=C_FIG)
+    ax.bar(x, nv, color=C_NORMAL,   alpha=0.80, width=0.72, label="Normal")
+    ax.bar(x, av, color=C_ABNORMAL, alpha=0.80, width=0.72, bottom=nv, label="Abnormal")
+
+    totals = nv + av
+    ratios = np.where(totals > 0, av / totals, 0)
+    thr    = ratios.mean() + 2.0 * ratios.std()
+    for i, r in enumerate(ratios):
+        if r > thr:
+            ax.annotate("★", (x[i], totals[i] + 0.3), ha="center",
+                        color=C_ABNORMAL, fontsize=9, fontweight="bold")
+    step = max(1, len(spks) // 16)
+    ax.set_xticks(x[::step])
+    ax.set_xticklabels([spks[i] for i in range(0, len(spks), step)],
+                        rotation=35, ha="right", fontsize=7)
+    ax.legend()
+    _ax_style(ax, "Top-50 Speakers: Utterance Count  (★ = high abnormal ratio)",
+              "Speaker ID", "# Utterances")
+    fig.tight_layout()
+    return fig
+
+
+def make_utts_per_spk_hist(spk2utt, utt2label):
+    n_counts, a_counts = [], []
+    for spk, utts in spk2utt.items():
+        n = sum(1 for u in utts if utt2label.get(u, "normal") == "normal")
+        a = sum(1 for u in utts if utt2label.get(u, "normal") == "abnormal")
+        if n: n_counts.append(n)
+        if a: a_counts.append(a)
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=C_FIG)
+    all_c = n_counts + a_counts
+    if all_c:
+        bins = np.linspace(0, np.percentile(all_c, 99), 35)
+        ax.hist(n_counts, bins=bins, alpha=0.65, color=C_NORMAL,
+                label=f"Normal spk (n={len(n_counts)})", density=True)
+        ax.hist(a_counts, bins=bins, alpha=0.65, color=C_ABNORMAL,
+                label=f"Abnormal spk (n={len(a_counts)})", density=True)
+        ax.legend()
+    _ax_style(ax, "Utts-per-Speaker Distribution", "# Utterances", "Density")
+    fig.tight_layout()
+    return fig
+
+
+def make_ratio_bar(spk2utt, utt2label):
+    ratios = {}
+    for spk, utts in spk2utt.items():
+        n_a = sum(1 for u in utts if utt2label.get(u, "normal") == "abnormal")
+        ratios[spk] = n_a / len(utts) if utts else 0
+    spks = sorted(ratios, key=ratios.get, reverse=True)[:40]
+    x    = np.arange(len(spks))
+    vals = [ratios[s] for s in spks]
+    colors_arr = [C_ABNORMAL if v > 0.5 else C_NORMAL for v in vals]
+
+    fig, ax = plt.subplots(figsize=(12, 5), facecolor=C_FIG)
+    ax.bar(x, vals, color=colors_arr, alpha=0.80, width=0.75)
+    ax.axhline(0.5, color="#9ca3af", lw=1.2, ls="--", label="50 % threshold")
+    step = max(1, len(spks) // 10)
+    ax.set_xticks(x[::step])
+    ax.set_xticklabels([spks[i] for i in range(0, len(spks), step)],
+                        rotation=35, ha="right", fontsize=7)
+    ax.set_ylim(0, 1.08)
+    ax.legend()
+    _ax_style(ax, "Abnormal Ratio per Speaker (top 40)", "Speaker ID", "Abnormal ratio")
+    fig.tight_layout()
+    return fig
+
+
+def make_feat_mean_std(feats, utt2label):
+    buckets = {"normal": [], "abnormal": []}
+    for uid, mat in feats.items():
         lbl = utt2label.get(uid, "normal")
-        entry = {"id": uid, "spk": spk, "label": lbl, "frames": None,
-                 "energy": None, "mean_vec": None, "std_vec": None}
-        if uid in feats:
-            mat = feats[uid]
-            entry["frames"]   = int(mat.shape[0])
-            entry["energy"]   = float(mat.mean())
-            entry["mean_vec"] = [round(float(v), 4) for v in mat.mean(axis=0)]
-            entry["std_vec"]  = [round(float(v), 4) for v in mat.std(axis=0)]
-        utts_export.append(entry)
+        if lbl in buckets: buckets[lbl].append(mat)
 
-    # Heatmap examples (5 per class, first 100 frames, all dims)
-    heatmaps = {"normal": [], "abnormal": []}
-    for lbl in ["normal", "abnormal"]:
-        candidates = [uid for uid in feats if utt2label.get(uid) == lbl]
-        np.random.shuffle(candidates)
-        for uid in candidates[:5]:
-            mat = feats[uid][:100]   # cap at 100 frames
-            heatmaps[lbl].append({
-                "id": uid,
-                "mat": [[round(float(v),3) for v in row] for row in mat.T]  # [D][T]
-            })
+    fig, (ax_m, ax_s) = plt.subplots(1, 2, figsize=(13, 5), facecolor=C_FIG)
+    for lbl, mats in buckets.items():
+        if not mats: continue
+        c     = LABEL_COLOR[lbl]
+        stack = np.stack([m.mean(axis=0) for m in mats])
+        mu, se = stack.mean(0), stack.std(0)
+        x = np.arange(stack.shape[1])
+        ax_m.plot(x, mu, color=c, lw=1.8, label=lbl)
+        ax_m.fill_between(x, mu-se, mu+se, color=c, alpha=0.15)
+        stack_s = np.stack([m.std(axis=0) for m in mats])
+        mu_s = stack_s.mean(0)
+        ax_s.plot(x, mu_s, color=c, lw=1.8, label=lbl)
+        ax_s.fill_between(x, mu_s - stack_s.std(0), mu_s + stack_s.std(0),
+                          color=c, alpha=0.12)
+    ax_m.legend(); ax_s.legend()
+    _ax_style(ax_m, "FBank Mean per Filter Bank (±1 SD)", "Filter index", "Mean")
+    _ax_style(ax_s, "FBank Std per Filter Bank (±1 SD)",  "Filter index", "Std")
+    fig.tight_layout()
+    return fig
 
-    return {
-        "dataset_name": Path(args.data_dir).name,
-        "conf":         Path(args.data_dir).parent.name,
-        "fbank_dim":    int(list(feats.values())[0].shape[1]) if feats else 80,
-        "frame_shift_ms": 10,
-        "normal_keyword":   args.normal_keyword,
-        "abnormal_keyword": args.abnormal_keyword,
-        "speakers": speakers,
-        "utts":     utts_export,
-        "heatmaps": heatmaps,
+
+def make_energy_hist(feats, utt2label):
+    en_n, en_a = [], []
+    for uid, mat in feats.items():
+        e = float(mat.mean())
+        (en_a if utt2label.get(uid, "normal") == "abnormal" else en_n).append(e)
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=C_FIG)
+    all_e = en_n + en_a
+    if all_e:
+        bins = np.linspace(np.percentile(all_e, 0.5), np.percentile(all_e, 99.5), 55)
+        ax.hist(en_n, bins=bins, alpha=0.65, color=C_NORMAL,
+                density=True, label=f"Normal (n={len(en_n)})")
+        ax.hist(en_a, bins=bins, alpha=0.65, color=C_ABNORMAL,
+                density=True, label=f"Abnormal (n={len(en_a)})")
+        if en_n:
+            outs = np.array(en_n)[zscore_outlier_mask(en_n, thr=2.8)]
+            if len(outs):
+                ylim = ax.get_ylim()
+                ax.scatter(outs, np.full(len(outs), (ylim[1]-ylim[0])*0.03 + ylim[0]),
+                           c=C_ANOMALY, marker="v", s=50, zorder=6,
+                           label=f"Outliers (n={len(outs)})")
+        ax.legend()
+    _ax_style(ax, "Frame-Mean Energy Distribution", "Energy", "Density")
+    fig.tight_layout()
+    return fig
+
+
+def make_len_vs_energy(feats, utt2label):
+    lengths, energies, colors_arr = [], [], []
+    for uid, mat in feats.items():
+        lengths.append(mat.shape[0]); energies.append(float(mat.mean()))
+        colors_arr.append(LABEL_COLOR.get(utt2label.get(uid, "normal"), C_NORMAL))
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=C_FIG)
+    ax.scatter(lengths, energies, c=colors_arr, s=8, alpha=0.45, linewidths=0)
+    al = np.array(lengths); ae = np.array(energies)
+    anom = zscore_outlier_mask(al, 2.5) | zscore_outlier_mask(ae, 2.5)
+    if anom.sum():
+        ax.scatter(al[anom], ae[anom], c=C_ANOMALY, s=50, marker="*",
+                   zorder=6, linewidths=0, label=f"Bivariate outliers (n={anom.sum()})")
+    handles = [mpatches.Patch(color=C_NORMAL,   label="Normal"),
+               mpatches.Patch(color=C_ABNORMAL, label="Abnormal")]
+    if anom.sum():
+        handles.append(mpatches.Patch(color=C_ANOMALY,
+                                       label=f"Outliers (n={anom.sum()})"))
+    ax.legend(handles=handles)
+    _ax_style(ax, "Utterance Length vs. Mean Energy", "Frames (T)", "Mean energy")
+    fig.tight_layout()
+    return fig
+
+
+def make_variance_per_dim(feats, utt2label):
+    buckets = {"normal": [], "abnormal": []}
+    for uid, mat in feats.items():
+        lbl = utt2label.get(uid, "normal")
+        if lbl in buckets: buckets[lbl].append(mat.var(axis=0))
+    means_n = means_a = None
+    fig, ax = plt.subplots(figsize=(7, 5), facecolor=C_FIG)
+    for lbl, vlist in buckets.items():
+        if not vlist: continue
+        stacked = np.stack(vlist)
+        mu = stacked.mean(0); x = np.arange(stacked.shape[1])
+        c = LABEL_COLOR[lbl]
+        ax.plot(x, mu, color=c, lw=1.8, label=lbl)
+        ax.fill_between(x, mu - stacked.std(0), mu + stacked.std(0),
+                        color=c, alpha=0.12)
+        if lbl == "normal":   means_n = mu
+        if lbl == "abnormal": means_a = mu
+    if means_n is not None and means_a is not None:
+        top5 = np.argsort(np.abs(means_n - means_a))[-5:]
+        for d in top5:
+            ax.axvline(d, color=C_ANOMALY, lw=1.0, ls=":", alpha=0.85)
+    ax.legend()
+    _ax_style(ax, "Variance per Filter Bank  (dotted = top-5 diverging dims)",
+              "Filter index", "Variance")
+    fig.tight_layout()
+    return fig
+
+
+def make_energy_boxplot(feats, utt2label):
+    en_n = [float(mat.mean()) for uid, mat in feats.items()
+            if utt2label.get(uid, "normal") == "normal"]
+    en_a = [float(mat.mean()) for uid, mat in feats.items()
+            if utt2label.get(uid, "normal") == "abnormal"]
+    data   = [x for x in [en_n, en_a] if x]
+    labels = [l for l, x in [("Normal", en_n), ("Abnormal", en_a)] if x]
+    colors = [LABEL_COLOR[l.lower()] for l in labels]
+
+    fig, ax = plt.subplots(figsize=(6, 5), facecolor=C_FIG)
+    bp = ax.boxplot(data, patch_artist=True,
+                    whiskerprops=dict(color="#9ca3af", lw=1.2),
+                    capprops=dict(color="#6b7280", lw=1.5),
+                    medianprops=dict(color="#374151", lw=2.2),
+                    flierprops=dict(marker="o", ms=3.5, linestyle="none",
+                                    markerfacecolor=C_ANOMALY,
+                                    markeredgecolor="none", alpha=0.6))
+    for patch, c in zip(bp["boxes"], colors):
+        patch.set_facecolor(c + "33"); patch.set_edgecolor(c); patch.set_linewidth(1.8)
+    for i, (d, c) in enumerate(zip(data, colors), 1):
+        s = np.random.choice(d, min(400, len(d)), replace=False)
+        ax.scatter(np.full(len(s), i) + np.random.uniform(-0.18, 0.18, len(s)),
+                   s, alpha=0.18, s=6, color=c, zorder=3, linewidths=0)
+    ax.set_xticks(range(1, len(labels)+1)); ax.set_xticklabels(labels)
+    _ax_style(ax, "Energy Boxplot by Class", "", "Mean energy")
+    fig.tight_layout()
+    return fig
+
+
+def make_heatmap(mat, title):
+    cmap = LinearSegmentedColormap.from_list(
+        "academic", ["#f0f9ff", "#7dd3fc", "#2563eb", "#dc2626", "#7f1d1d"])
+    fig, ax = plt.subplots(figsize=(10, 4.5), facecolor=C_FIG)
+    im = ax.imshow(mat.T, aspect="auto", origin="lower", cmap=cmap,
+                   interpolation="nearest")
+    plt.colorbar(im, ax=ax, fraction=0.028, pad=0.03)
+    _ax_style(ax, title, "Frame index", "Filter index", grid=False)
+    fig.tight_layout()
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Build chart data payload for JSON
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def collect_stats(utt_ids, utt2label, spk2utt, feats):
+    cnt = defaultdict(int)
+    for u in utt_ids: cnt[utt2label.get(u, "normal")] += 1
+
+    stats = {
+        "total_utts": len(utt_ids),
+        "n_normal":   cnt.get("normal", 0),
+        "n_abnormal": cnt.get("abnormal", 0),
+        "n_speakers": len(spk2utt),
+        "feats_loaded": len(feats),
+        "fbank_dim": None,
     }
+    if feats:
+        s = next(iter(feats.values()))
+        stats["fbank_dim"] = int(s.shape[1])
+    if spk2utt:
+        cnts = [len(v) for v in spk2utt.values()]
+        stats["mean_utts_per_spk"] = float(np.mean(cnts))
+
+    # Outliers
+    outliers = []
+    if feats:
+        energies = [(uid, float(mat.mean())) for uid, mat in feats.items()]
+        ids_, vals = zip(*energies)
+        mask = zscore_outlier_mask(vals, thr=2.8)
+        for i, m in enumerate(mask):
+            if m:
+                outliers.append({
+                    "utt_id": ids_[i],
+                    "label": utt2label.get(ids_[i], "normal"),
+                    "energy": round(vals[i], 4),
+                    "reason": "ENERGY_ZSCORE",
+                })
+    stats["outliers"] = outliers
+    return stats
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -154,503 +487,715 @@ def build_export(utt2spk, spk2utt, utt2label, feats, args):
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Kaldi Dataset Visualizer — {dataset_name}</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Kaldi Dataset Visualization</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,600;0,700;1,400&display=swap" rel="stylesheet"/>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
-  :root {{
-    --bg:#f4f1eb; --surface:#fff; --surface2:#f9f7f2; --border:#e0dbd0;
-    --normal:#2a6496; --abnormal:#c0392b; --outlier:#e67e22;
-    --text:#1a1a1a; --muted:#7a7060; --ink:#1a1a1a;
-  }}
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:'IBM Plex Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}}
-  header{{background:var(--ink);color:#fff;padding:0 40px;display:flex;align-items:center;justify-content:space-between;height:60px;position:sticky;top:0;z-index:100}}
-  header h1{{font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:600;letter-spacing:.08em;text-transform:uppercase}}
-  .header-meta{{font-family:'IBM Plex Mono',monospace;font-size:11px;color:#888;letter-spacing:.05em}}
-  #dashboard{{max-width:1400px;margin:0 auto;padding:32px 24px 64px}}
-  .stat-bar{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:32px}}
-  .stat-card{{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:16px 20px;position:relative;overflow:hidden}}
-  .stat-card::before{{content:'';position:absolute;top:0;left:0;right:0;height:3px}}
-  .stat-card.normal::before{{background:var(--normal)}}
-  .stat-card.abnormal::before{{background:var(--abnormal)}}
-  .stat-card.total::before{{background:var(--ink)}}
-  .stat-card.speaker::before{{background:#7d5a9e}}
-  .stat-card.ratio::before{{background:var(--outlier)}}
-  .stat-label{{font-family:'IBM Plex Mono',monospace;font-size:9px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted);margin-bottom:6px}}
-  .stat-value{{font-family:'IBM Plex Mono',monospace;font-size:26px;font-weight:600;line-height:1;margin-bottom:4px}}
-  .stat-sub{{font-size:11px;color:var(--muted)}}
-  .section-header{{display:flex;align-items:baseline;gap:12px;margin-bottom:16px;margin-top:40px;padding-bottom:8px;border-bottom:2px solid var(--ink)}}
-  .section-title{{font-family:'IBM Plex Mono',monospace;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.12em}}
-  .section-sub{{font-size:12px;color:var(--muted)}}
-  .grid-2{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}}
-  .grid-3{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:16px}}
-  .grid-1{{margin-bottom:16px}}
-  @media(max-width:900px){{.grid-2,.grid-3{{grid-template-columns:1fr}}}}
-  .chart-card{{background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:20px}}
-  .chart-title{{font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);margin-bottom:16px}}
-  .chart-wrap canvas{{max-height:280px}}
-  .chart-wrap.tall canvas{{max-height:380px}}
-  .chart-wrap.short canvas{{max-height:200px}}
-  .outlier-table-wrap{{overflow-x:auto;border:1px solid var(--border);border-radius:4px}}
-  table{{width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:11px}}
-  thead{{background:var(--ink);color:#fff}}
-  thead th{{padding:10px 14px;text-align:left;font-weight:500;letter-spacing:.06em;text-transform:uppercase;font-size:10px}}
-  tbody tr{{border-bottom:1px solid var(--border)}}
-  tbody tr:last-child{{border-bottom:none}}
-  tbody tr:nth-child(even){{background:var(--surface2)}}
-  tbody td{{padding:9px 14px}}
-  .badge{{display:inline-block;padding:2px 7px;border-radius:2px;font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}}
-  .badge-normal{{background:#dbeafe;color:#1e40af}}
-  .badge-abnormal{{background:#fee2e2;color:#991b1b}}
-  .badge-outlier{{background:#fef3c7;color:#92400e}}
-  .heatmap-controls{{display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap}}
-  .heatmap-controls button{{padding:5px 12px;border:1px solid var(--border);border-radius:3px;background:var(--bg);font-family:'IBM Plex Mono',monospace;font-size:10px;cursor:pointer;text-transform:uppercase;letter-spacing:.06em;transition:all .15s}}
-  .heatmap-controls button.active{{background:var(--ink);color:#fff;border-color:var(--ink)}}
-  .heatmap-controls select{{padding:5px 10px;border:1px solid var(--border);border-radius:3px;font-family:'IBM Plex Mono',monospace;font-size:10px;background:var(--bg)}}
-  .legend{{display:flex;gap:16px;flex-wrap:wrap;font-size:11px;margin-top:8px}}
-  .legend-item{{display:flex;align-items:center;gap:6px}}
-  .legend-dot{{width:10px;height:10px;border-radius:50%;flex-shrink:0}}
-  .pbar-row{{margin-bottom:10px}}
-  .pbar-label{{display:flex;justify-content:space-between;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-bottom:4px}}
-  .pbar-track{{height:8px;background:var(--bg);border-radius:99px;overflow:hidden}}
-  .pbar-fill{{height:100%;border-radius:99px;transition:width 1s cubic-bezier(.34,1.56,.64,1)}}
-  .no-data{{display:flex;align-items:center;justify-content:center;height:120px;color:var(--muted);font-family:'IBM Plex Mono',monospace;font-size:11px}}
-  .tooltip{{position:fixed;pointer-events:none;background:var(--ink);color:#fff;padding:6px 10px;border-radius:3px;font-family:'IBM Plex Mono',monospace;font-size:11px;z-index:999;display:none;max-width:240px;line-height:1.5}}
-  @keyframes fadeUp{{from{{opacity:0;transform:translateY(12px)}}to{{opacity:1;transform:translateY(0)}}}}
-  .animate-in{{animation:fadeUp .4s ease both}}
-  footer{{text-align:center;padding:24px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);border-top:1px solid var(--border)}}
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #f8fafc;
+    --surface:   #ffffff;
+    --border:    #e2e8f0;
+    --border-2:  #cbd5e1;
+    --text:      #0f172a;
+    --sub:       #64748b;
+    --accent-n:  #2563eb;
+    --accent-a:  #dc2626;
+    --accent-o:  #ea580c;
+    --accent-nm: #dbeafe;
+    --accent-am: #fee2e2;
+    --mono:      'IBM Plex Mono', monospace;
+    --sans:      'IBM Plex Sans', sans-serif;
+    --radius:    10px;
+    --shadow:    0 1px 3px rgba(0,0,0,.08), 0 4px 16px rgba(0,0,0,.04);
+    --shadow-lg: 0 4px 24px rgba(0,0,0,.10), 0 1px 4px rgba(0,0,0,.06);
+  }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    line-height: 1.6;
+  }
+
+  /* ── header ── */
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 2.5rem;
+    position: sticky; top: 0; z-index: 100;
+    display: flex; align-items: center; justify-content: space-between;
+    height: 58px;
+    backdrop-filter: blur(8px);
+  }
+  .logo {
+    font-family: var(--mono);
+    font-size: .78rem; font-weight: 600;
+    letter-spacing: .12em; text-transform: uppercase;
+    color: var(--sub);
+    display: flex; align-items: center; gap: .6rem;
+  }
+  .logo-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent-n); }
+  nav { display: flex; gap: 0; }
+  nav a {
+    font-size: .78rem; font-weight: 600; letter-spacing: .04em;
+    text-transform: uppercase; color: var(--sub);
+    text-decoration: none;
+    padding: .35rem .9rem;
+    border-radius: 6px;
+    transition: color .15s, background .15s;
+  }
+  nav a:hover { color: var(--text); background: var(--bg); }
+
+  /* ── hero ── */
+  .hero {
+    background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 60%, #1e293b 100%);
+    color: #f1f5f9;
+    padding: 4rem 2.5rem 3.5rem;
+    position: relative; overflow: hidden;
+  }
+  .hero::before {
+    content: '';
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(
+      -45deg,
+      transparent 0px, transparent 24px,
+      rgba(255,255,255,.018) 24px, rgba(255,255,255,.018) 25px
+    );
+    pointer-events: none;
+  }
+  .hero-inner { max-width: 900px; position: relative; }
+  .hero-tag {
+    font-family: var(--mono);
+    font-size: .7rem; letter-spacing: .16em; text-transform: uppercase;
+    color: #93c5fd; font-weight: 600;
+    margin-bottom: 1rem;
+    display: flex; align-items: center; gap: .5rem;
+  }
+  .hero-tag::before {
+    content: ''; display: inline-block;
+    width: 20px; height: 1.5px; background: #93c5fd;
+  }
+  .hero h1 {
+    font-size: clamp(1.8rem, 4vw, 2.8rem);
+    font-weight: 700; line-height: 1.2;
+    letter-spacing: -.02em; margin-bottom: 1.2rem;
+  }
+  .hero h1 span { color: #93c5fd; }
+  .hero-desc { font-size: 1rem; color: #94a3b8; max-width: 580px; }
+
+  /* ── stat cards ── */
+  .stats-strip {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 1.6rem 2.5rem;
+    display: flex; gap: 1.5rem; flex-wrap: wrap;
+  }
+  .stat-card {
+    flex: 1 1 160px;
+    padding: 1.1rem 1.4rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    position: relative; overflow: hidden;
+  }
+  .stat-card::before {
+    content: ''; position: absolute;
+    left: 0; top: 0; bottom: 0; width: 3px;
+    border-radius: 3px 0 0 3px;
+  }
+  .stat-card.n::before { background: var(--accent-n); }
+  .stat-card.a::before { background: var(--accent-a); }
+  .stat-card.g::before { background: #10b981; }
+  .stat-card.s::before { background: #8b5cf6; }
+  .stat-card.f::before { background: var(--accent-o); }
+
+  .stat-label {
+    font-family: var(--mono);
+    font-size: .65rem; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--sub); font-weight: 600; margin-bottom: .4rem;
+  }
+  .stat-value {
+    font-size: 1.7rem; font-weight: 700;
+    letter-spacing: -.03em; color: var(--text);
+    line-height: 1;
+  }
+  .stat-sub { font-size: .72rem; color: var(--sub); margin-top: .3rem; }
+
+  /* ── layout ── */
+  .page { max-width: 1400px; margin: 0 auto; padding: 2.5rem 2.5rem 4rem; }
+
+  .section {
+    margin-bottom: 3.5rem;
+    animation: fadeUp .5s ease both;
+  }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(18px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .section-header {
+    display: flex; align-items: baseline; gap: 1rem;
+    margin-bottom: 1.4rem;
+    padding-bottom: .7rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .section-title {
+    font-size: 1.05rem; font-weight: 700;
+    letter-spacing: -.01em; color: var(--text);
+  }
+  .section-tag {
+    font-family: var(--mono);
+    font-size: .65rem; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--sub);
+  }
+
+  /* ── chart grid ── */
+  .chart-grid {
+    display: grid;
+    gap: 1.4rem;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+  }
+  .chart-grid.full { grid-template-columns: 1fr; }
+  .chart-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+    transition: box-shadow .2s, transform .2s;
+  }
+  .chart-card:hover {
+    box-shadow: var(--shadow-lg);
+    transform: translateY(-2px);
+  }
+  .chart-card-header {
+    padding: .9rem 1.2rem .7rem;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .chart-title {
+    font-size: .82rem; font-weight: 700;
+    letter-spacing: .01em; color: var(--text);
+  }
+  .chart-badge {
+    font-family: var(--mono);
+    font-size: .6rem; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--sub);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px; padding: .15rem .45rem;
+  }
+  .chart-body { padding: .8rem; }
+  .chart-body img { width: 100%; height: auto; display: block; border-radius: 6px; }
+
+  /* ── outlier table ── */
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .table-toolbar {
+    padding: .8rem 1.2rem;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 1rem;
+  }
+  .table-toolbar input {
+    font-family: var(--mono);
+    font-size: .75rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: .35rem .7rem;
+    background: var(--bg); color: var(--text);
+    outline: none; width: 240px;
+    transition: border-color .15s;
+  }
+  .table-toolbar input:focus { border-color: var(--accent-n); }
+  table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+  thead { background: var(--bg); }
+  thead th {
+    padding: .6rem 1rem;
+    text-align: left;
+    font-family: var(--mono);
+    font-size: .62rem; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--sub); font-weight: 600;
+    border-bottom: 1px solid var(--border-2);
+    cursor: pointer; user-select: none;
+    white-space: nowrap;
+  }
+  thead th:hover { color: var(--text); }
+  tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody tr:hover { background: var(--bg); }
+  tbody td { padding: .55rem 1rem; color: var(--text); }
+  .badge {
+    display: inline-block; font-size: .65rem; font-weight: 700;
+    font-family: var(--mono); letter-spacing: .06em; text-transform: uppercase;
+    padding: .18rem .5rem; border-radius: 4px;
+  }
+  .badge-n { background: var(--accent-nm); color: var(--accent-n); }
+  .badge-a { background: var(--accent-am); color: var(--accent-a); }
+  .badge-o { background: #fff7ed; color: var(--accent-o); }
+  .pager {
+    padding: .65rem 1.2rem;
+    border-top: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: .75rem; color: var(--sub);
+  }
+  .pager button {
+    font-family: var(--mono); font-size: .7rem;
+    background: var(--bg); border: 1px solid var(--border);
+    color: var(--text); border-radius: 5px;
+    padding: .28rem .65rem; cursor: pointer;
+    transition: border-color .15s;
+  }
+  .pager button:hover { border-color: var(--accent-n); }
+  .pager button:disabled { opacity: .35; cursor: not-allowed; }
+
+  /* ── footer ── */
+  footer {
+    background: #0f172a;
+    color: #475569;
+    text-align: center;
+    padding: 1.8rem;
+    font-family: var(--mono);
+    font-size: .68rem; letter-spacing: .05em;
+  }
+  footer span { color: #93c5fd; }
+
+  /* ── no-data placeholder ── */
+  .empty {
+    background: var(--bg);
+    border: 1px dashed var(--border-2);
+    border-radius: var(--radius);
+    padding: 3rem 2rem; text-align: center;
+    color: var(--sub); font-size: .88rem;
+  }
+  .empty strong { display: block; font-size: 1.1rem; color: var(--text); margin-bottom: .4rem; }
 </style>
 </head>
 <body>
+
 <header>
-  <h1>⬡ Kaldi Dataset Visualizer</h1>
-  <span class="header-meta" id="header-info"></span>
+  <div class="logo">
+    <div class="logo-dot"></div>
+    kaldi · vis
+  </div>
+  <nav>
+    <a href="#overview">Overview</a>
+    <a href="#speakers">Speakers</a>
+    <a href="#features">Features</a>
+    <a href="#outliers">Outliers</a>
+  </nav>
 </header>
 
-<div id="dashboard" class="animate-in">
-  <div class="stat-bar" id="stat-bar"></div>
-
-  <div class="section-header"><span class="section-title">§1 Class Distribution</span><span class="section-sub">Utterance and speaker counts by class</span></div>
-  <div class="grid-3">
-    <div class="chart-card"><div class="chart-title">Utterance class ratio</div><div class="chart-wrap short"><canvas id="chart-pie-utt"></canvas></div></div>
-    <div class="chart-card"><div class="chart-title">Speaker class ratio</div><div class="chart-wrap short"><canvas id="chart-pie-spk"></canvas></div></div>
-    <div class="chart-card"><div class="chart-title">Utts per class</div><div class="chart-wrap short"><canvas id="chart-bar-class"></canvas></div></div>
+<div class="hero">
+  <div class="hero-inner">
+    <div class="hero-tag">Kaldi Training Set Report</div>
+    <h1>Dataset <span>Visualization</span><br>Dashboard</h1>
+    <p class="hero-desc">
+      Automated analysis of class distribution, speaker statistics,
+      FBank feature properties, and outlier detection.
+    </p>
   </div>
-
-  <div class="section-header"><span class="section-title">§2 Speaker Analysis</span><span class="section-sub">Per-speaker utterance distribution</span></div>
-  <div class="grid-2">
-    <div class="chart-card"><div class="chart-title">Top-40 speakers — utterance count (stacked)</div><div class="chart-wrap tall"><canvas id="chart-spk-bar"></canvas></div></div>
-    <div class="chart-card"><div class="chart-title">Abnormal ratio per speaker (sorted)</div><div class="chart-wrap tall"><canvas id="chart-spk-ratio"></canvas></div></div>
-  </div>
-  <div class="grid-2">
-    <div class="chart-card"><div class="chart-title">Utts-per-speaker histogram</div><div class="chart-wrap"><canvas id="chart-spk-hist"></canvas></div></div>
-    <div class="chart-card"><div class="chart-title">Speaker abnormal ratio distribution</div><div class="chart-wrap"><canvas id="chart-ratio-hist"></canvas></div></div>
-  </div>
-
-  <div class="section-header"><span class="section-title">§3 FBank Feature Statistics</span><span class="section-sub">Computed from sampled utterances</span></div>
-  <div class="grid-2">
-    <div class="chart-card"><div class="chart-title">Mean energy per filter bank dimension</div><div class="chart-wrap"><canvas id="chart-fbank-mean"></canvas></div></div>
-    <div class="chart-card"><div class="chart-title">Std deviation per filter bank dimension</div><div class="chart-wrap"><canvas id="chart-fbank-std"></canvas></div></div>
-  </div>
-  <div class="grid-2">
-    <div class="chart-card"><div class="chart-title">Frame-mean energy distribution</div><div class="chart-wrap"><canvas id="chart-energy-hist"></canvas></div></div>
-    <div class="chart-card"><div class="chart-title">Energy boxplot by class</div><div class="chart-wrap"><canvas id="chart-energy-box"></canvas></div></div>
-  </div>
-
-  <div class="section-header"><span class="section-title">§4 FBank Heatmap Example</span><span class="section-sub">Rows = filter banks · Cols = time frames</span></div>
-  <div class="grid-1">
-    <div class="chart-card">
-      <div class="heatmap-controls">
-        <button class="active" onclick="switchHeatmap('normal',this)">Normal</button>
-        <button onclick="switchHeatmap('abnormal',this)">Abnormal</button>
-        <select id="heatmap-utt-select" onchange="renderHeatmap()"></select>
-        <span style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted);margin-left:auto">rows=filter banks · cols=frames</span>
-      </div>
-      <canvas id="heatmap-canvas" height="200"></canvas>
-    </div>
-  </div>
-
-  <div class="section-header"><span class="section-title">§5 Utterance Scatter — Length × Energy</span><span class="section-sub">★ = bivariate outlier (Z-score &gt; 2.5)</span></div>
-  <div class="grid-1">
-    <div class="chart-card">
-      <canvas id="scatter-canvas" height="300"></canvas>
-      <div class="legend" style="margin-top:12px">
-        <div class="legend-item"><div class="legend-dot" style="background:var(--normal)"></div>Normal</div>
-        <div class="legend-item"><div class="legend-dot" style="background:var(--abnormal)"></div>Abnormal</div>
-        <div class="legend-item"><div class="legend-dot" style="background:var(--outlier)"></div>Bivariate outlier</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="section-header"><span class="section-title">§6 Flagged Utterances</span><span class="section-sub">Energy Z-score &gt; 2.8 or length Z-score &gt; 2.5</span></div>
-  <div class="grid-1"><div class="outlier-table-wrap" id="outlier-table-wrap"></div></div>
-
-  <div class="section-header"><span class="section-title">§7 Variance per Filter Bank Dimension</span><span class="section-sub">Dotted = top-5 most diverging dims between classes</span></div>
-  <div class="grid-1"><div class="chart-card"><div class="chart-wrap"><canvas id="chart-variance"></canvas></div></div></div>
-
-  <div class="section-header"><span class="section-title">§8 Top Speaker Breakdown</span><span class="section-sub">Proportion bars for top-20 speakers</span></div>
-  <div class="chart-card" id="spk-breakdown"></div>
 </div>
 
-<div class="tooltip" id="tooltip"></div>
-<footer>Generated from {dataset_name} · {conf} · {n_utts} utterances · {n_speakers} speakers</footer>
+<!-- ── stats strip ── -->
+<div class="stats-strip">
+  <div class="stat-card g">
+    <div class="stat-label">Total Utterances</div>
+    <div class="stat-value" id="st-total">—</div>
+  </div>
+  <div class="stat-card n">
+    <div class="stat-label">Normal</div>
+    <div class="stat-value" id="st-normal">—</div>
+    <div class="stat-sub" id="st-normal-pct"></div>
+  </div>
+  <div class="stat-card a">
+    <div class="stat-label">Abnormal</div>
+    <div class="stat-value" id="st-abnormal">—</div>
+    <div class="stat-sub" id="st-abnormal-pct"></div>
+  </div>
+  <div class="stat-card s">
+    <div class="stat-label">Speakers</div>
+    <div class="stat-value" id="st-spk">—</div>
+    <div class="stat-sub" id="st-spk-sub"></div>
+  </div>
+  <div class="stat-card f">
+    <div class="stat-label">FBank Dim</div>
+    <div class="stat-value" id="st-dim">—</div>
+    <div class="stat-sub" id="st-feats-sub"></div>
+  </div>
+</div>
+
+<div class="page">
+
+  <!-- ── Section 1: Overview ── -->
+  <div class="section" id="overview">
+    <div class="section-header">
+      <div class="section-title">Class Distribution</div>
+      <div class="section-tag">overview</div>
+    </div>
+    <div class="chart-grid" id="overview-grid">
+      __OVERVIEW_CARDS__
+    </div>
+  </div>
+
+  <!-- ── Section 2: Speakers ── -->
+  <div class="section" id="speakers">
+    <div class="section-header">
+      <div class="section-title">Speaker Analysis</div>
+      <div class="section-tag">speaker stats</div>
+    </div>
+    <div class="chart-grid full" id="speakers-grid">
+      __SPEAKER_CARDS__
+    </div>
+  </div>
+
+  <!-- ── Section 3: FBank Features ── -->
+  <div class="section" id="features">
+    <div class="section-header">
+      <div class="section-title">FBank Feature Analysis</div>
+      <div class="section-tag">acoustic features</div>
+    </div>
+    <div id="features-content">
+      __FEATURE_CONTENT__
+    </div>
+  </div>
+
+  <!-- ── Section 4: Outliers ── -->
+  <div class="section" id="outliers">
+    <div class="section-header">
+      <div class="section-title">Outlier Utterances</div>
+      <div class="section-tag">anomaly detection · z-score &gt; 2.8</div>
+    </div>
+    <div id="outlier-content">
+      __OUTLIER_CONTENT__
+    </div>
+  </div>
+
+</div>
+
+<footer>
+  Generated by <span>visualize_dataset.py</span> · Kaldi Training Set Visualization
+</footer>
 
 <script>
-const DS = {json_data};
+const STATS = __STATS_JSON__;
 
-const COLORS = {{
-  normal:'#2a6496', abnormal:'#c0392b', outlier:'#e67e22',
-  normalA:'rgba(42,100,150,0.55)', abnormalA:'rgba(192,57,43,0.55)'
-}};
-let charts={{}}, heatmapClass='normal';
+function fmt(n) {
+  if (n === null || n === undefined) return '—';
+  return n.toLocaleString();
+}
+function pct(a, b) {
+  if (!b) return '';
+  return (a / b * 100).toFixed(1) + '%';
+}
 
-function zscore(arr){{
-  const mu=arr.reduce((s,v)=>s+v,0)/arr.length;
-  const sd=Math.sqrt(arr.reduce((s,v)=>s+(v-mu)**2,0)/arr.length)+1e-9;
-  return arr.map(v=>Math.abs((v-mu)/sd));
-}}
-function histogram(values,bins=40){{
-  const mn=Math.min(...values),mx=Math.max(...values),step=(mx-mn)/bins;
-  const counts=new Array(bins).fill(0);
-  const labels=Array.from({{length:bins}},(_,i)=>(mn+i*step).toFixed(2));
-  values.forEach(v=>{{const idx=Math.min(Math.floor((v-mn)/step),bins-1);counts[idx]++;}});
-  return {{labels,counts}};
-}}
-function dc(id){{if(charts[id]){{charts[id].destroy();delete charts[id];}}}}
-const mono={{'font':{{'family':"'IBM Plex Mono'",'size':9}}}};
-const monoSm={{'font':{{'family':"'IBM Plex Mono'",'size':8}}}};
-const PIE=(labels,data,colors)=>({{
-  type:'doughnut',
-  data:{{labels,datasets:[{{data,backgroundColor:colors,borderColor:'#fff',borderWidth:3}}]}},
-  options:{{responsive:true,maintainAspectRatio:true,
-    plugins:{{legend:{{position:'bottom',labels:{{...mono,padding:12}}}},
-      tooltip:{{callbacks:{{label:ctx=>` ${{ctx.label}}: ${{ctx.raw.toLocaleString()}}`}}}}}}}}
-}});
+// populate stat strip
+window.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('st-total').textContent   = fmt(STATS.total_utts);
+  document.getElementById('st-normal').textContent  = fmt(STATS.n_normal);
+  document.getElementById('st-abnormal').textContent= fmt(STATS.n_abnormal);
+  document.getElementById('st-spk').textContent     = fmt(STATS.n_speakers);
+  document.getElementById('st-dim').textContent     = STATS.fbank_dim ?? '—';
+  document.getElementById('st-normal-pct').textContent =
+    pct(STATS.n_normal, STATS.total_utts);
+  document.getElementById('st-abnormal-pct').textContent =
+    pct(STATS.n_abnormal, STATS.total_utts);
+  if (STATS.mean_utts_per_spk != null)
+    document.getElementById('st-spk-sub').textContent =
+      'avg ' + STATS.mean_utts_per_spk.toFixed(1) + ' utts/spk';
+  document.getElementById('st-feats-sub').textContent =
+    fmt(STATS.feats_loaded) + ' utts loaded';
+});
 
-// ── Stat bar ──
-(()=>{{
-  const nu=DS.utts.filter(u=>u.label==='normal').length;
-  const au=DS.utts.filter(u=>u.label==='abnormal').length;
-  const ns=DS.speakers.filter(s=>s.label==='normal').length;
-  const as_=DS.speakers.filter(s=>s.label==='abnormal').length;
-  const ratio=(au/(nu+au)*100).toFixed(1);
-  document.getElementById('header-info').textContent=
-    `${{DS.dataset_name}} · ${{DS.utts.length.toLocaleString()}} utts · ${{DS.speakers.length}} speakers`;
-  document.getElementById('stat-bar').innerHTML=[
-    {{cls:'total',   label:'Total utts',    value:DS.utts.length.toLocaleString(), sub:'utterances'}},
-    {{cls:'normal',  label:'Normal utts',   value:nu.toLocaleString(), sub:`${{(nu/(nu+au)*100).toFixed(1)}}% of total`}},
-    {{cls:'abnormal',label:'Abnormal utts', value:au.toLocaleString(), sub:`${{ratio}}% of total`}},
-    {{cls:'speaker', label:'Total speakers',value:DS.speakers.length.toLocaleString(), sub:`${{ns}} normal · ${{as_}} abnormal`}},
-    {{cls:'ratio',   label:'Abnormal ratio',value:ratio+'%', sub:'utterance level'}},
-    {{cls:'total',   label:'FBank dim',     value:DS.fbank_dim, sub:`${{DS.frame_shift_ms}}ms frame shift`}},
-  ].map(c=>`<div class="stat-card ${{c.cls}}"><div class="stat-label">${{c.label}}</div><div class="stat-value">${{c.value}}</div><div class="stat-sub">${{c.sub}}</div></div>`).join('');
-}})();
+// ── Outlier table ──
+const outliers = STATS.outliers || [];
+let filtered = [...outliers];
+let sortCol = null, sortDir = 1;
+let page = 0;
+const PAGE_SIZE = 15;
 
-// ── §1 Class charts ──
-(()=>{{
-  const nu=DS.utts.filter(u=>u.label==='normal').length, au=DS.utts.filter(u=>u.label==='abnormal').length;
-  const ns=DS.speakers.filter(s=>s.label==='normal').length, as_=DS.speakers.filter(s=>s.label==='abnormal').length;
-  charts['pu']=new Chart(document.getElementById('chart-pie-utt'),PIE(['Normal','Abnormal'],[nu,au],[COLORS.normal,COLORS.abnormal]));
-  charts['ps']=new Chart(document.getElementById('chart-pie-spk'),PIE(['Normal','Abnormal'],[ns,as_],[COLORS.normal,COLORS.abnormal]));
-  charts['bc']=new Chart(document.getElementById('chart-bar-class'),{{
-    type:'bar',data:{{labels:['Normal','Abnormal'],datasets:[{{data:[nu,au],
-      backgroundColor:[COLORS.normalA,COLORS.abnormalA],borderColor:[COLORS.normal,COLORS.abnormal],borderWidth:2}}]}},
-    options:{{responsive:true,plugins:{{legend:{{display:false}}}},
-      scales:{{y:{{grid:{{color:'#eee'}},ticks:{{...monoSm}}}},x:{{ticks:{{...mono}}}}}}}}
-  }});
-}})();
+function renderTable() {
+  const tbody = document.getElementById('otbody');
+  const info  = document.getElementById('oinfo');
+  const btnP  = document.getElementById('oprev');
+  const btnN  = document.getElementById('onext');
+  if (!tbody) return;
 
-// ── §2 Speaker charts ──
-(()=>{{
-  const sn={{}},sa={{}};
-  DS.utts.forEach(u=>{{if(u.label==='normal')sn[u.spk]=(sn[u.spk]||0)+1;else sa[u.spk]=(sa[u.spk]||0)+1;}});
-  const sorted=[...DS.speakers].sort((a,b)=>b.utt_count-a.utt_count).slice(0,40);
-  const lbl=sorted.map(s=>s.id.length>14?'…'+s.id.slice(-13):s.id);
+  const start = page * PAGE_SIZE;
+  const slice = filtered.slice(start, start + PAGE_SIZE);
 
-  charts['sb']=new Chart(document.getElementById('chart-spk-bar'),{{
-    type:'bar',
-    data:{{labels:lbl,datasets:[
-      {{label:'Normal',  data:sorted.map(s=>sn[s.id]||0),backgroundColor:COLORS.normalA,  borderColor:COLORS.normal,  borderWidth:1}},
-      {{label:'Abnormal',data:sorted.map(s=>sa[s.id]||0),backgroundColor:COLORS.abnormalA,borderColor:COLORS.abnormal,borderWidth:1}}
-    ]}},
-    options:{{responsive:true,maintainAspectRatio:false,
-      scales:{{x:{{stacked:true,ticks:{{...monoSm,maxRotation:45}}}},y:{{stacked:true,grid:{{color:'#eee'}},ticks:{{...monoSm}}}}}},
-      plugins:{{legend:{{labels:{{...mono}}}}}}}}
-  }});
+  tbody.innerHTML = slice.map(r => `
+    <tr>
+      <td style="font-family:var(--mono);font-size:.72rem">${r.utt_id}</td>
+      <td><span class="badge ${r.label==='normal'?'badge-n':'badge-a'}">${r.label}</span></td>
+      <td style="font-family:var(--mono)">${r.energy.toFixed(4)}</td>
+      <td><span class="badge badge-o">${r.reason}</span></td>
+    </tr>`).join('');
 
-  const ratios=sorted.map(s=>{{const t=(sn[s.id]||0)+(sa[s.id]||0);return t>0?(sa[s.id]||0)/t:0;}});
-  charts['sr']=new Chart(document.getElementById('chart-spk-ratio'),{{
-    type:'bar',
-    data:{{labels:lbl,datasets:[{{label:'Abnormal ratio',data:ratios,
-      backgroundColor:ratios.map(r=>r>0.5?COLORS.abnormalA:COLORS.normalA),
-      borderColor:ratios.map(r=>r>0.5?COLORS.abnormal:COLORS.normal),borderWidth:1.5}}]}},
-    options:{{responsive:true,maintainAspectRatio:false,
-      scales:{{x:{{ticks:{{...monoSm,maxRotation:45}}}},y:{{min:0,max:1,grid:{{color:'#eee'}},ticks:{{...monoSm,callback:v=>(v*100).toFixed(0)+'%'}}}}}},
-      plugins:{{legend:{{display:false}}}}}}
-  }});
+  info.textContent = filtered.length === 0
+    ? 'No results'
+    : `Showing ${start+1}–${Math.min(start+PAGE_SIZE, filtered.length)} of ${filtered.length}`;
+  btnP.disabled = page === 0;
+  btnN.disabled = start + PAGE_SIZE >= filtered.length;
+}
 
-  const cn=DS.speakers.filter(s=>s.label==='normal').map(s=>s.utt_count);
-  const ca=DS.speakers.filter(s=>s.label==='abnormal').map(s=>s.utt_count);
-  const hn=histogram(cn.length?cn:[0],20), ha=histogram(ca.length?ca:[0],20);
-  charts['sh']=new Chart(document.getElementById('chart-spk-hist'),{{
-    type:'bar',data:{{labels:hn.labels,datasets:[
-      {{label:'Normal',  data:hn.counts,backgroundColor:COLORS.normalA,  borderColor:COLORS.normal,  borderWidth:1}},
-      {{label:'Abnormal',data:ha.counts,backgroundColor:COLORS.abnormalA,borderColor:COLORS.abnormal,borderWidth:1}}
-    ]}},
-    options:{{responsive:true,scales:{{x:{{ticks:{{...monoSm,maxRotation:30}}}},y:{{grid:{{color:'#eee'}},ticks:{{...monoSm}}}}}},plugins:{{legend:{{labels:{{...mono}}}}}}}}
-  }});
+function sortBy(col) {
+  if (sortCol === col) sortDir *= -1;
+  else { sortCol = col; sortDir = 1; }
+  filtered.sort((a, b) => {
+    let va = a[col], vb = b[col];
+    if (typeof va === 'string') return va.localeCompare(vb) * sortDir;
+    return (va - vb) * sortDir;
+  });
+  page = 0;
+  renderTable();
+}
 
-  const allRatios=DS.speakers.map(s=>{{const t=(sn[s.id]||0)+(sa[s.id]||0);return t>0?(sa[s.id]||0)/t:0;}});
-  const rBins=20, rC=new Array(rBins).fill(0);
-  allRatios.forEach(r=>{{rC[Math.min(Math.floor(r*rBins),rBins-1)]++;}});
-  charts['rh']=new Chart(document.getElementById('chart-ratio-hist'),{{
-    type:'bar',data:{{labels:Array.from({{length:rBins}},(_,i)=>((i/rBins)*100).toFixed(0)+'%'),
-      datasets:[{{label:'# Speakers',data:rC,backgroundColor:'rgba(125,90,158,0.5)',borderColor:'#7d5a9e',borderWidth:1.5}}]}},
-    options:{{responsive:true,scales:{{x:{{ticks:{{...monoSm}}}},y:{{grid:{{color:'#eee'}},ticks:{{...monoSm}}}}}},plugins:{{legend:{{display:false}}}}}}
-  }});
-}})();
+function filterTable(q) {
+  q = q.toLowerCase();
+  filtered = outliers.filter(r =>
+    r.utt_id.toLowerCase().includes(q) ||
+    r.label.includes(q) ||
+    r.reason.toLowerCase().includes(q)
+  );
+  if (sortCol) {
+    filtered.sort((a, b) => {
+      let va = a[sortCol], vb = b[sortCol];
+      if (typeof va === 'string') return va.localeCompare(vb) * sortDir;
+      return (va - vb) * sortDir;
+    });
+  }
+  page = 0;
+  renderTable();
+}
 
-// ── §3 FBank charts ──
-(()=>{{
-  const un=DS.utts.filter(u=>u.label==='normal'&&u.mean_vec);
-  const ua=DS.utts.filter(u=>u.label==='abnormal'&&u.mean_vec);
-  const dim=DS.fbank_dim||80, xs=Array.from({{length:dim}},(_,i)=>i);
-  function avg(utts,key){{
-    if(!utts.length)return new Array(dim).fill(0);
-    const s=new Array(dim).fill(0);
-    utts.forEach(u=>u[key].forEach((v,i)=>s[i]+=v));
-    return s.map(v=>v/utts.length);
-  }}
-  const mn_n=avg(un,'mean_vec'),mn_a=avg(ua,'mean_vec');
-  const sv_n=avg(un,'std_vec'), sv_a=avg(ua,'std_vec');
-  const lineOpts=(ds)=>(({{type:'line',data:{{labels:xs,datasets:ds}},options:{{
-    responsive:true,elements:{{point:{{radius:0}},line:{{tension:0.3}}}},
-    scales:{{x:{{ticks:{{...monoSm,maxTicksLimit:16}},grid:{{color:'#eee'}}}},y:{{grid:{{color:'#eee'}},ticks:{{...monoSm}}}}}},
-    plugins:{{legend:{{labels:{{...mono}}}}}}}}}}));
-  charts['fm']=new Chart(document.getElementById('chart-fbank-mean'),lineOpts([
-    {{label:'Normal',  data:mn_n,borderColor:COLORS.normal,  fill:false,borderWidth:2,pointRadius:0}},
-    {{label:'Abnormal',data:mn_a,borderColor:COLORS.abnormal,fill:false,borderWidth:2,pointRadius:0}}
-  ]));
-  charts['fs']=new Chart(document.getElementById('chart-fbank-std'),lineOpts([
-    {{label:'Normal',  data:sv_n,borderColor:COLORS.normal,  fill:false,borderWidth:2,pointRadius:0}},
-    {{label:'Abnormal',data:sv_a,borderColor:COLORS.abnormal,fill:false,borderWidth:2,pointRadius:0}}
-  ]));
-
-  const en=DS.utts.filter(u=>u.label==='normal'&&u.energy!=null).map(u=>u.energy);
-  const ea=DS.utts.filter(u=>u.label==='abnormal'&&u.energy!=null).map(u=>u.energy);
-  const all=[...en,...ea];
-  if(all.length){{
-    const bins=40,mn=Math.min(...all),mx=Math.max(...all),step=(mx-mn)/bins;
-    const hl=Array.from({{length:bins}},(_,i)=>(mn+i*step).toFixed(2));
-    function eh(vals){{const c=new Array(bins).fill(0);vals.forEach(v=>{{c[Math.min(Math.floor((v-mn)/step),bins-1)]++;}});return c;}}
-    charts['eh']=new Chart(document.getElementById('chart-energy-hist'),{{
-      type:'bar',data:{{labels:hl,datasets:[
-        {{label:'Normal',  data:eh(en),backgroundColor:COLORS.normalA,  borderColor:COLORS.normal,  borderWidth:1}},
-        {{label:'Abnormal',data:eh(ea),backgroundColor:COLORS.abnormalA,borderColor:COLORS.abnormal,borderWidth:1}}
-      ]}},
-      options:{{responsive:true,scales:{{x:{{ticks:{{...monoSm,maxTicksLimit:10,maxRotation:0}},grid:{{color:'#eee'}}}},y:{{grid:{{color:'#eee'}},ticks:{{...monoSm}}}}}},plugins:{{legend:{{labels:{{...mono}}}}}}}}
-    }});
-    function bs(vals){{
-      const s=[...vals].sort((a,b)=>a-b),q=p=>s[Math.floor(p*(s.length-1))];
-      return {{min:q(0),q1:q(.25),med:q(.5),q3:q(.75),max:q(1)}};
-    }}
-    const bn=bs(en),ba=bs(ea);
-    charts['eb']=new Chart(document.getElementById('chart-energy-box'),{{
-      type:'bar',
-      data:{{labels:['Normal','Abnormal'],datasets:[
-        {{label:'Min→Q1',data:[bn.q1-bn.min,ba.q1-ba.min],backgroundColor:'transparent',borderColor:'transparent'}},
-        {{label:'IQR (Q1→Q3)',data:[bn.q3-bn.q1,ba.q3-ba.q1],
-          backgroundColor:[COLORS.normalA,COLORS.abnormalA],borderColor:[COLORS.normal,COLORS.abnormal],borderWidth:2}}
-      ]}},
-      options:{{responsive:true,scales:{{x:{{ticks:{{...mono}}}},y:{{grid:{{color:'#eee'}},ticks:{{...monoSm}}}}}},plugins:{{legend:{{labels:{{...monoSm}}}}}}}}
-    }});
-  }}
-}})();
-
-// ── §4 Heatmap ──
-function buildHeatmap(){{
-  const sel=document.getElementById('heatmap-utt-select');
-  sel.innerHTML='';
-  (DS.heatmaps[heatmapClass]||[]).forEach((h,i)=>{{
-    const o=document.createElement('option');o.value=i;o.textContent=h.id;sel.appendChild(o);
-  }});
-  renderHeatmap();
-}}
-function switchHeatmap(cls,btn){{
-  heatmapClass=cls;
-  document.querySelectorAll('.heatmap-controls button').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');buildHeatmap();
-}}
-function renderHeatmap(){{
-  const sel=document.getElementById('heatmap-utt-select');
-  const idx=parseInt(sel.value)||0;
-  const h=(DS.heatmaps[heatmapClass]||[])[idx];
-  if(!h)return;
-  const mat=h.mat, D=mat.length, T=mat[0].length;
-  const canvas=document.getElementById('heatmap-canvas');
-  canvas.width=T;canvas.height=D;
-  const ctx=canvas.getContext('2d');
-  const img=ctx.createImageData(T,D);
-  let mn=Infinity,mx=-Infinity;
-  mat.forEach(row=>row.forEach(v=>{{if(v<mn)mn=v;if(v>mx)mx=v;}}));
-  for(let d=0;d<D;d++)for(let t=0;t<T;t++){{
-    const n=(mat[d][t]-mn)/(mx-mn+1e-9);
-    let r,g,b;
-    if(n<.25){{r=0;g=Math.round(n*4*255);b=255;}}
-    else if(n<.5){{r=0;g=255;b=Math.round((1-(n-.25)*4)*255);}}
-    else if(n<.75){{r=Math.round((n-.5)*4*255);g=255;b=0;}}
-    else{{r=255;g=Math.round((1-(n-.75)*4)*255);b=0;}}
-    const px=((D-1-d)*T+t)*4;
-    img.data[px]=r;img.data[px+1]=g;img.data[px+2]=b;img.data[px+3]=255;
-  }}
-  ctx.putImageData(img,0,0);
-}}
-buildHeatmap();
-
-// ── §5 Scatter ──
-(()=>{{
-  const canvas=document.getElementById('scatter-canvas');
-  const utts=DS.utts.filter(u=>u.frames&&u.energy!=null);
-  if(!utts.length)return;
-  const lengths=utts.map(u=>u.frames), energies=utts.map(u=>u.energy);
-  const zl=zscore(lengths),ze=zscore(energies);
-  const isAnom=zl.map((z,i)=>z>2.5||ze[i]>2.5);
-  const pad={{t:20,r:20,b:50,l:60}};
-  const W=canvas.offsetWidth||900,H=300;
-  canvas.width=W;canvas.height=H;
-  const ctx=canvas.getContext('2d');
-  const minL=Math.min(...lengths),maxL=Math.max(...lengths);
-  const minE=Math.min(...energies),maxE=Math.max(...energies);
-  const tx=v=>pad.l+(v-minL)/(maxL-minL+1e-9)*(W-pad.l-pad.r);
-  const ty=v=>H-pad.b-(v-minE)/(maxE-minE+1e-9)*(H-pad.t-pad.b);
-  ctx.strokeStyle='#e8e8e8';ctx.lineWidth=1;
-  for(let i=0;i<=5;i++){{
-    const y=pad.t+i*(H-pad.t-pad.b)/5;
-    ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();
-    ctx.fillStyle='#999';ctx.font="9px 'IBM Plex Mono'";ctx.textAlign='right';
-    ctx.fillText((maxE-i*(maxE-minE)/5).toFixed(2),pad.l-6,y+3);
-  }}
-  for(let i=0;i<=6;i++){{
-    const x=pad.l+i*(W-pad.l-pad.r)/6;
-    ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,H-pad.b);ctx.stroke();
-    ctx.fillStyle='#999';ctx.font="9px 'IBM Plex Mono'";ctx.textAlign='center';
-    ctx.fillText(Math.round(minL+i*(maxL-minL)/6),x,H-pad.b+14);
-  }}
-  ctx.fillStyle='#666';ctx.font="10px 'IBM Plex Mono'";ctx.textAlign='center';
-  ctx.fillText('Frames (T)',W/2,H-6);
-  ctx.save();ctx.translate(13,H/2);ctx.rotate(-Math.PI/2);ctx.fillText('Mean energy',0,0);ctx.restore();
-  utts.forEach((u,i)=>{{
-    const x=tx(u.frames),y=ty(u.energy);
-    if(isAnom[i]){{ctx.fillStyle=COLORS.outlier;ctx.font='16px sans-serif';ctx.textAlign='center';ctx.fillText('★',x,y+5);}}
-    else{{ctx.beginPath();ctx.arc(x,y,3,0,Math.PI*2);ctx.fillStyle=u.label==='normal'?'rgba(42,100,150,0.45)':'rgba(192,57,43,0.45)';ctx.fill();}}
-  }});
-  const tooltip=document.getElementById('tooltip');
-  canvas.onmousemove=(e)=>{{
-    const rect=canvas.getBoundingClientRect();
-    const mx=(e.clientX-rect.left)*(W/rect.width),my=(e.clientY-rect.top)*(H/rect.height);
-    let closest=null,best=100;
-    utts.forEach((u,i)=>{{const d=Math.hypot(tx(u.frames)-mx,ty(u.energy)-my);if(d<best){{best=d;closest=i;}}}});
-    if(closest!==null&&best<20){{
-      const u=utts[closest];
-      tooltip.style.display='block';tooltip.style.left=(e.clientX+12)+'px';tooltip.style.top=(e.clientY-28)+'px';
-      tooltip.innerHTML=`${{u.id}}<br>label: ${{u.label}}<br>frames: ${{u.frames}}<br>energy: ${{u.energy.toFixed(4)}}${{isAnom[closest]?'<br><b>⚠ outlier</b>':''}}`;
-    }}else tooltip.style.display='none';
-  }};
-  canvas.onmouseleave=()=>tooltip.style.display='none';
-}})();
-
-// ── §6 Outlier table ──
-(()=>{{
-  const utts=DS.utts.filter(u=>u.energy!=null&&u.frames);
-  if(!utts.length){{document.getElementById('outlier-table-wrap').innerHTML='<div class="no-data">No feature data loaded</div>';return;}}
-  const ze=zscore(utts.map(u=>u.energy)),zl=zscore(utts.map(u=>u.frames));
-  const outs=utts.filter((_,i)=>ze[i]>2.8||zl[i]>2.5).map((u,_,__,i)=>{{
-    const idx=utts.indexOf(u);
-    return{{...u,ze:ze[idx].toFixed(2),zl:zl[idx].toFixed(2),reason:ze[idx]>2.8?'ENERGY_ZSCORE':'LENGTH_ZSCORE'}};
-  }});
-  const wrap=document.getElementById('outlier-table-wrap');
-  if(!outs.length){{wrap.innerHTML='<div class="no-data">No outliers detected</div>';return;}}
-  wrap.innerHTML=`<table><thead><tr><th>Utterance ID</th><th>Label</th><th>Frames</th><th>Energy</th><th>Z(energy)</th><th>Z(length)</th><th>Reason</th></tr></thead><tbody>
-    ${{outs.slice(0,200).map(u=>`<tr><td>${{u.id}}</td><td><span class="badge badge-${{u.label}}">${{u.label}}</span></td><td>${{u.frames}}</td><td>${{u.energy.toFixed(4)}}</td><td>${{u.ze}}</td><td>${{u.zl}}</td><td><span class="badge badge-outlier">${{u.reason}}</span></td></tr>`).join('')}}
-  </tbody></table>${{outs.length>200?`<div style="padding:10px 14px;font-family:'IBM Plex Mono',monospace;font-size:10px;color:var(--muted)">Showing 200 of ${{outs.length}} outliers</div>`:''}}`;
-}})();
-
-// ── §7 Variance ──
-(()=>{{
-  const un=DS.utts.filter(u=>u.label==='normal'&&u.std_vec);
-  const ua=DS.utts.filter(u=>u.label==='abnormal'&&u.std_vec);
-  const dim=DS.fbank_dim||80,xs=Array.from({{length:dim}},(_,i)=>i);
-  function avgv(utts){{
-    if(!utts.length)return new Array(dim).fill(0);
-    const s=new Array(dim).fill(0);
-    utts.forEach(u=>u.std_vec.forEach((v,i)=>s[i]+=v*v));
-    return s.map(v=>v/utts.length);
-  }}
-  const vn=avgv(un),va=avgv(ua);
-  const diff=vn.map((v,i)=>Math.abs(v-va[i]));
-  const top5=[...diff.map((v,i)=>{{return{{v,i}};}})].sort((a,b)=>b.v-a.v).slice(0,5).map(x=>x.i);
-  const annotations={{}};
-  top5.forEach((d,k)=>{{annotations[`d${{k}}`]={{type:'line',xMin:d,xMax:d,borderColor:'rgba(230,126,34,0.6)',borderDash:[4,3],borderWidth:1.5}};}});
-  charts['vr']=new Chart(document.getElementById('chart-variance'),{{
-    type:'line',
-    data:{{labels:xs,datasets:[
-      {{label:'Normal',  data:vn,borderColor:COLORS.normal,  backgroundColor:'transparent',borderWidth:2,pointRadius:0,tension:0.3}},
-      {{label:'Abnormal',data:va,borderColor:COLORS.abnormal,backgroundColor:'transparent',borderWidth:2,pointRadius:0,tension:0.3}}
-    ]}},
-    options:{{responsive:true,
-      scales:{{x:{{ticks:{{...monoSm,maxTicksLimit:16}},grid:{{color:'#eee'}}}},y:{{grid:{{color:'#eee'}},ticks:{{...monoSm}}}}}},
-      plugins:{{legend:{{labels:{{...mono}}}},annotation:{{annotations}}}}}}
-  }});
-}})();
-
-// ── §8 Speaker breakdown ──
-(()=>{{
-  const sn={{}},sa={{}};
-  DS.utts.forEach(u=>{{if(u.label==='normal')sn[u.spk]=(sn[u.spk]||0)+1;else sa[u.spk]=(sa[u.spk]||0)+1;}});
-  const top20=[...DS.speakers].sort((a,b)=>b.utt_count-a.utt_count).slice(0,20);
-  const mx=Math.max(...top20.map(s=>(sn[s.id]||0)+(sa[s.id]||0)));
-  document.getElementById('spk-breakdown').innerHTML=`<div class="chart-title">Top-20 speaker proportion breakdown</div>`+
-    top20.map(s=>{{
-      const n=sn[s.id]||0,a=sa[s.id]||0;
-      const pn=(n/mx*100).toFixed(1),pa=(a/mx*100).toFixed(1);
-      const lbl=s.id.length>24?'…'+s.id.slice(-22):s.id;
-      return `<div class="pbar-row"><div class="pbar-label"><span>${{lbl}}</span><span style="color:var(--muted)">${{n}} normal · ${{a}} abnormal</span></div>
-        <div class="pbar-track"><div style="display:flex;height:100%">
-          <div class="pbar-fill" style="width:${{pn}}%;background:var(--normal);border-radius:99px 0 0 99px"></div>
-          <div class="pbar-fill" style="width:${{pa}}%;background:var(--abnormal);border-radius:0 99px 99px 0"></div>
-        </div></div></div>`;
-    }}).join('');
-}})();
-
-window.addEventListener('resize',()=>{{
-  dc('scatter');
-  const canvas=document.getElementById('scatter-canvas');
-  if(canvas)canvas.dispatchEvent(new Event('resize'));
-}});
+window.addEventListener('DOMContentLoaded', renderTable);
 </script>
 </body>
-</html>"""
+</html>
+"""
+
+# ── card builder ──
+def chart_card(title, b64_img, badge=""):
+    badge_html = f'<div class="chart-badge">{badge}</div>' if badge else ""
+    return f"""
+<div class="chart-card">
+  <div class="chart-card-header">
+    <div class="chart-title">{title}</div>
+    {badge_html}
+  </div>
+  <div class="chart-body">
+    <img src="data:image/png;base64,{b64_img}" alt="{title}" loading="lazy"/>
+  </div>
+</div>
+"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Main
+# Summary printer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def print_summary(utt_ids, utt2label, spk2utt, feats):
+    sep = "-" * 56
+    print(f"\n{sep}\n  Dataset Summary\n{sep}")
+    cnt = defaultdict(int)
+    for u in utt_ids: cnt[utt2label.get(u, "normal")] += 1
+    print(f"  Total utterances : {len(utt_ids):,}")
+    for k in sorted(cnt):
+        print(f"    {k:12s}: {cnt[k]:6,}  ({cnt[k]/len(utt_ids)*100:.1f}%)")
+    if spk2utt:
+        cnts = [len(v) for v in spk2utt.values()]
+        print(f"\n  Speakers        : {len(spk2utt):,}")
+        print(f"    Mean utts/spk : {np.mean(cnts):.1f}")
+    if feats:
+        s = next(iter(feats.values()))
+        print(f"\n  Features loaded : {len(feats):,}")
+        print(f"  FBank dim       : {s.shape[1]}")
+    print(f"{sep}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HTML assembly
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_html(utt_ids, utt2label, spk2utt, feats, out_path):
+    print("[html] rendering charts ...")
+
+    # ── overview section ──
+    print("  overview: pie chart ...")
+    pie_b64 = fig_to_b64(make_pie_chart(utt2label))
+    plt.close("all")
+
+    overview_cards = chart_card("Class Distribution", pie_b64, "utterances")
+
+    if spk2utt:
+        print("  overview: utts-per-spk histogram ...")
+        hist_b64 = fig_to_b64(make_utts_per_spk_hist(spk2utt, utt2label))
+        plt.close("all")
+        overview_cards += chart_card("Utts-per-Speaker Histogram", hist_b64, "density")
+
+    # ── speaker section ──
+    print("  speakers: bar chart ...")
+    spk_b64 = fig_to_b64(make_spk_bar(spk2utt, utt2label))
+    plt.close("all")
+    speaker_cards = chart_card("Top-50 Speakers by Utterance Count", spk_b64, "stacked bar")
+
+    if spk2utt:
+        print("  speakers: ratio bar ...")
+        ratio_b64 = fig_to_b64(make_ratio_bar(spk2utt, utt2label))
+        plt.close("all")
+        speaker_cards += chart_card("Abnormal Ratio per Speaker", ratio_b64, "top 40")
+
+    # ── feature section ──
+    if feats:
+        print("  features: mean/std ...")
+        ms_b64 = fig_to_b64(make_feat_mean_std(feats, utt2label))
+        plt.close("all")
+
+        print("  features: energy hist ...")
+        eh_b64 = fig_to_b64(make_energy_hist(feats, utt2label))
+        plt.close("all")
+
+        print("  features: length vs energy ...")
+        lv_b64 = fig_to_b64(make_len_vs_energy(feats, utt2label))
+        plt.close("all")
+
+        print("  features: variance per dim ...")
+        vd_b64 = fig_to_b64(make_variance_per_dim(feats, utt2label))
+        plt.close("all")
+
+        print("  features: boxplot ...")
+        bp_b64 = fig_to_b64(make_energy_boxplot(feats, utt2label))
+        plt.close("all")
+
+        print("  features: heatmaps ...")
+        n_utts = [u for u in feats if utt2label.get(u, "normal") == "normal"]
+        a_utts = [u for u in feats if utt2label.get(u, "normal") == "abnormal"]
+        hm_cards = ""
+        if n_utts:
+            u = np.random.choice(n_utts)
+            hm_b64 = fig_to_b64(make_heatmap(feats[u], f"Normal — {u[:50]}"))
+            plt.close("all")
+            hm_cards += chart_card("FBank Heatmap · Normal Sample", hm_b64, "example")
+        if a_utts:
+            u = np.random.choice(a_utts)
+            hm_b64 = fig_to_b64(make_heatmap(feats[u], f"Abnormal — {u[:50]}"))
+            plt.close("all")
+            hm_cards += chart_card("FBank Heatmap · Abnormal Sample", hm_b64, "example")
+
+        feature_content = f"""
+<div class="chart-grid full" style="margin-bottom:1.4rem">
+  {chart_card("FBank Mean & Std per Filter Bank", ms_b64, "mean ± 1 SD")}
+</div>
+<div class="chart-grid" style="margin-bottom:1.4rem">
+  {chart_card("Frame-Mean Energy Distribution", eh_b64, "density")}
+  {chart_card("Utterance Length vs. Mean Energy", lv_b64, "scatter")}
+</div>
+<div class="chart-grid" style="margin-bottom:1.4rem">
+  {chart_card("Variance per Filter Bank", vd_b64, "dotted = top-5 diverging")}
+  {chart_card("Energy Boxplot by Class", bp_b64, "with jitter")}
+</div>
+<div class="chart-grid" style="margin-bottom:1.4rem">
+  {hm_cards}
+</div>"""
+    else:
+        feature_content = """
+<div class="empty">
+  <strong>No feature data available</strong>
+  Run with <code>--feats-dir</code> pointing to a directory containing feats.scp.
+</div>"""
+
+    # ── outlier table ──
+    stats = collect_stats(utt_ids, utt2label, spk2utt, feats)
+    n_out = len(stats["outliers"])
+    if n_out:
+        outlier_content = f"""
+<div class="table-wrap">
+  <div class="table-toolbar">
+    <span style="font-size:.78rem;color:var(--sub)">
+      <strong style="color:var(--text)">{n_out:,}</strong> outlier utterances detected
+    </span>
+    <input type="text" id="osearch" placeholder="Filter by utt_id, label, reason…"
+           oninput="filterTable(this.value)"/>
+  </div>
+  <div style="overflow-x:auto">
+  <table>
+    <thead>
+      <tr>
+        <th onclick="sortBy('utt_id')">Utterance ID ↕</th>
+        <th onclick="sortBy('label')">Label ↕</th>
+        <th onclick="sortBy('energy')">Energy ↕</th>
+        <th onclick="sortBy('reason')">Reason ↕</th>
+      </tr>
+    </thead>
+    <tbody id="otbody"></tbody>
+  </table>
+  </div>
+  <div class="pager">
+    <span id="oinfo"></span>
+    <div style="display:flex;gap:.5rem">
+      <button id="oprev" onclick="page--;renderTable()">← Prev</button>
+      <button id="onext" onclick="page++;renderTable()">Next →</button>
+    </div>
+  </div>
+</div>"""
+    else:
+        outlier_content = """
+<div class="empty">
+  <strong>No outliers detected</strong>
+  No utterances exceeded the Z-score threshold of 2.8 for frame-mean energy.
+</div>"""
+
+    # ── assemble ──
+    html = HTML_TEMPLATE
+    html = html.replace("__OVERVIEW_CARDS__",  overview_cards)
+    html = html.replace("__SPEAKER_CARDS__",   speaker_cards)
+    html = html.replace("__FEATURE_CONTENT__", feature_content)
+    html = html.replace("__OUTLIER_CONTENT__", outlier_content)
+    html = html.replace("__STATS_JSON__",      json.dumps(stats))
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"\n  [saved] {out_path}  ({os.path.getsize(out_path)//1024:,} KB)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate self-contained Kaldi visualization HTML")
-    ap.add_argument("--data-dir",         required=True)
-    ap.add_argument("--feats-dir",        default=None)
+    ap = argparse.ArgumentParser(
+        description="Kaldi dataset visualization — outputs a single HTML report")
+    ap.add_argument("--data-dir",         required=True,
+                    help="Kaldi data dir with utt2spk, spk2utt")
+    ap.add_argument("--feats-dir",        default=None,
+                    help="Feature dir with feats.scp and *.ark shards")
     ap.add_argument("--scp-name",         default="feats.scp")
-    ap.add_argument("--output",           default="kaldi_vis.html")
+    ap.add_argument("--output-dir",       default="./vis_output")
+    ap.add_argument("--output-name",      default="report.html",
+                    help="HTML filename (default: report.html)")
     ap.add_argument("--sample-per-class", type=int, default=2000)
     ap.add_argument("--normal-keyword",   default="normal")
     ap.add_argument("--abnormal-keyword", default="abnormal")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
+    out_dir  = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"\n[data dir] {data_dir}")
 
     utt2spk_path = data_dir / "utt2spk"
@@ -671,30 +1216,16 @@ def main():
     scp_path  = feats_dir / args.scp_name
     if scp_path.exists():
         print(f"[feats] {scp_path}")
-        feats = sample_scp_balanced(str(scp_path), utt2label, args.sample_per_class)
+        feats = read_feats_scp(str(scp_path), utt2label, args.sample_per_class)
     else:
-        print(f"  [note] {scp_path} not found — feature sections will be empty")
+        print(f"  [note] {scp_path} not found — feature plots will be skipped")
 
-    print("[building export] ...")
-    export = build_export(utt2spk, spk2utt, utt2label, feats, args)
+    print_summary(utt_ids, utt2label, spk2utt, feats)
 
-    print("[generating HTML] ...")
-    json_str = json.dumps(export, separators=(',', ':'))
-    html = HTML_TEMPLATE.format(
-        dataset_name = export["dataset_name"],
-        conf         = export["conf"],
-        n_utts       = len(utt_ids),
-        n_speakers   = len(spk2utt),
-        json_data    = json_str,
-    )
+    out_html = out_dir / args.output_name
+    build_html(utt_ids, utt2label, spk2utt, feats, out_html)
 
-    out_path = Path(args.output)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(html)
-
-    size_mb = out_path.stat().st_size / 1024 / 1024
-    print(f"\n✅ Done: {out_path}  ({size_mb:.1f} MB)")
-    print("   Open in any browser — no server needed\n")
+    print(f"\nDone.\n  Open: {out_html}\n")
 
 
 if __name__ == "__main__":
