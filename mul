@@ -1,0 +1,84 @@
+if [[ $stage -le 3 && 3 -le $endstage ]]; then
+    mkdir -p ${xv_dir}/$test_name/score
+
+    # ===== 原有部分，不变 =====
+    subtools/getTrials.sh 1 $xv_dir/${enroll_name}/enroll.scp \
+        $xv_dir/$test_name/xvector.scp \
+        $xv_dir/$test_name/trials
+    cat $xv_dir/$test_name/trials | awk '{print $1, $2}' | \
+    ivector-compute-dot-products - \
+        "ark:ivector-normalize-length --scaleup=false scp:$xv_dir/$enroll_name/enroll.scp ark:- |" \
+        "ark:ivector-normalize-length --scaleup=false scp:$xv_dir/$test_name/xvector.scp ark:- |" \
+        ${xv_dir}/$test_name/score/nl_cosine || exit 1;
+
+    # ===== 新增部分：多原型打分，自动适应不同原型数量 =====
+
+    # 1. 自动检测原型数量 k（从 enroll.scp 的 key 后缀推断）
+    #    假设格式为 spkid_0, spkid_1, ..., spkid_{k-1}
+    proto_k=$(awk -F'_' '{print $NF}' $model_dir/epoch${epoch}_enroll.scp | \
+              sort -n | tail -1)
+    proto_k=$((proto_k + 1))  # 后缀从0开始，所以+1得到总数
+    echo "Detected $proto_k prototypes per speaker"
+
+    # 2. 对每个原型单独打分
+    score_files=""
+    for i in $(seq 0 $((proto_k - 1))); do
+        proto_scp=${xv_dir}/$test_name/score/epoch${epoch}_enroll_proto${i}.scp
+        score_file=${xv_dir}/$test_name/score/nl_cosine2_proto${i}
+
+        # 提取第 i 个原型的 scp，并将 key 还原为原始说话人ID（去掉 _i 后缀）
+        # enroll.scp 中 key 格式: spkid_i /path/to/vec
+        # 还原后格式:              spkid   /path/to/vec
+        awk -v idx="_${i}" '
+            $1 ~ idx"$" {
+                key = $1
+                sub(idx"$", "", key)   # 去掉 _i 后缀，还原为 spkid
+                print key, $2
+            }
+        ' $model_dir/epoch${epoch}_enroll.scp > $proto_scp
+
+        # 用还原后的 scp 生成 trials 并打分
+        subtools/getTrials.sh 1 $proto_scp \
+            $xv_dir/$test_name/xvector.scp \
+            $xv_dir/$test_name/trials
+        cat $xv_dir/$test_name/trials | awk '{print $1, $2}' | \
+        ivector-compute-dot-products - \
+            "ark:ivector-normalize-length --scaleup=false scp:$proto_scp ark:- |" \
+            "ark:ivector-normalize-length --scaleup=false scp:$xv_dir/$test_name/xvector.scp ark:- |" \
+            $score_file || exit 1;
+
+        score_files="$score_files $score_file"
+    done
+
+    # 3. 多原型分数融合：取每个 trial pair 在所有原型上的最大分数
+    #    输出格式与原 nl_cosine2 完全一致：spk1 utt1 score
+    python3 - <<'EOF' $score_files ${xv_dir}/$test_name/score/nl_cosine2
+import sys
+from collections import defaultdict
+
+score_files = sys.argv[1:-1]
+output_file = sys.argv[-1]
+
+scores = defaultdict(lambda: float('-inf'))  # (enroll, test) -> max_score
+
+for sf in score_files:
+    with open(sf) as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 3:
+                continue
+            key = (parts[0], parts[1])
+            val = float(parts[2])
+            if val > scores[key]:
+                scores[key] = val
+
+with open(output_file, 'w') as f:
+    for (enroll, test), score in scores.items():
+        f.write(f"{enroll} {test} {score:.6f}\n")
+print(f"Multi-prototype scores saved to {output_file}, {len(scores)} pairs total.")
+EOF
+
+    # python local/get_subcenter_score.py --k $k \
+    #     ${xv_dir}/$test_name/score/nl_cosinetmp \
+    #     ${xv_dir}/$test_name/score/nl_cosine2
+fi
