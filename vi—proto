@@ -1,0 +1,98 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+params = torch.load('your_model.params', map_location='cpu')
+prototypes = params['loss.prototypes']      # [num_class, num_proto, feat_dim]
+ema_prototypes = params['loss.ema_prototypes']
+
+print(f"Shape: {prototypes.shape}")
+
+num_class, num_proto, feat_dim = prototypes.shape
+proto_np = prototypes.detach().numpy()
+ema_np = ema_prototypes.detach().numpy()
+
+# ============================================================
+# 1. 余弦相似度矩阵热力图
+#    看所有原型两两之间的相似度，类内/类间是否有区分
+# ============================================================
+# 展平为 [num_class * num_proto, feat_dim]
+all_protos = proto_np.reshape(-1, feat_dim)
+norms = np.linalg.norm(all_protos, axis=1, keepdims=True)
+all_protos_norm = all_protos / (norms + 1e-8)
+cosine_sim = all_protos_norm @ all_protos_norm.T  # [N, N]
+
+labels = [f"c{c}_p{p}" for c in range(num_class) for p in range(num_proto)]
+
+fig, ax = plt.subplots(figsize=(8, 7))
+im = ax.imshow(cosine_sim, vmin=-1, vmax=1, cmap='RdBu_r')
+plt.colorbar(im, ax=ax)
+ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=90)
+ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels)
+# 画类别分隔线
+for c in range(1, num_class):
+    ax.axhline(c * num_proto - 0.5, color='black', linewidth=2)
+    ax.axvline(c * num_proto - 0.5, color='black', linewidth=2)
+ax.set_title("Cosine Similarity between Prototypes")
+plt.tight_layout()
+plt.savefig("proto_cosine_sim.png", dpi=150)
+plt.show()
+
+# ============================================================
+# 2. PCA 可视化
+#    看原型在低维空间的分布
+# ============================================================
+pca = PCA(n_components=2)
+all_ema = ema_np.reshape(-1, feat_dim)
+all_both = np.concatenate([all_protos, all_ema], axis=0)  # proto + ema一起降维
+reduced = pca.fit_transform(all_both)
+reduced_proto = reduced[:num_class * num_proto]
+reduced_ema   = reduced[num_class * num_proto:]
+
+colors = plt.cm.tab10(np.linspace(0, 1, num_class))
+markers_proto = ['o', 's', '^', 'D', 'v', 'p']  # 不同原型用不同形状
+
+fig, ax = plt.subplots(figsize=(8, 6))
+for c in range(num_class):
+    for p in range(num_proto):
+        idx = c * num_proto + p
+        # proto 实线，ema 虚线
+        ax.scatter(*reduced_proto[idx], color=colors[c],
+                   marker=markers_proto[p % len(markers_proto)], s=200,
+                   label=f"class{c}_proto{p}", zorder=3)
+        ax.scatter(*reduced_ema[idx], color=colors[c],
+                   marker=markers_proto[p % len(markers_proto)], s=200,
+                   alpha=0.4, edgecolors='black', linewidths=1.5,
+                   label=f"class{c}_ema{p}(ema)", zorder=2)
+        # 连接 proto 和 ema
+        ax.plot([reduced_proto[idx][0], reduced_ema[idx][0]],
+                [reduced_proto[idx][1], reduced_ema[idx][1]],
+                color=colors[c], linestyle='--', alpha=0.5)
+
+ax.set_title(f"PCA of Prototypes (explained var: {pca.explained_variance_ratio_.sum():.2%})")
+ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
+plt.tight_layout()
+plt.savefig("proto_pca.png", dpi=150)
+plt.show()
+
+# ============================================================
+# 3. 类内原型差异统计
+#    定量看同一类的多个原型是否真的不同
+# ============================================================
+print("\n=== 类内原型余弦相似度（越低说明原型越多样）===")
+for c in range(num_class):
+    protos_c = proto_np[c]  # [num_proto, feat_dim]
+    norms_c = np.linalg.norm(protos_c, axis=1, keepdims=True)
+    protos_c_norm = protos_c / (norms_c + 1e-8)
+    sim_matrix = protos_c_norm @ protos_c_norm.T
+    # 取上三角（排除对角线）
+    upper = sim_matrix[np.triu_indices(num_proto, k=1)]
+    print(f"  class{c}: mean={upper.mean():.4f}, min={upper.min():.4f}, max={upper.max():.4f}")
+
+print("\n=== proto 与 ema_proto 的差异（越小说明训练越稳定）===")
+for c in range(num_class):
+    for p in range(num_proto):
+        diff = np.linalg.norm(proto_np[c, p] - ema_np[c, p])
+        print(f"  class{c}_proto{p}: L2 diff={diff:.6f}")
