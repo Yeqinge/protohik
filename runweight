@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# ============================================================
+# run.sh —— 批量运行不同 temperature 的训练
+# 用法: bash run.sh
+# ============================================================
+
+# ---------- 配置区：按需修改 ----------
+TRAIN_SH="./train.sh"
+TRAIN_CONF_DIR="train_conf"
+BASE_CONF="26051101"          # train.sh 里 train_conf 的原始值
+TEMPERATURES=(0.05 0.07 0.1 0.15 0.2)
+# --------------------------------------
+
+# 检查 train.sh 是否存在
+if [ ! -f "$TRAIN_SH" ]; then
+    echo "[ERROR] 找不到 $TRAIN_SH，请确认路径"
+    exit 1
+fi
+
+# 读取原始 train.sh 内容（全程不修改原文件）
+TRAIN_SH_ORIG=$(cat "$TRAIN_SH")
+
+mkdir -p "$TRAIN_CONF_DIR"
+mkdir -p logs
+
+for TEMP in "${TEMPERATURES[@]}"; do
+
+    # 1. 生成新的 conf 名，例如 26051101_temp0.05
+    NEW_CONF="${BASE_CONF}_temp${TEMP}"
+
+    echo "=================================================="
+    echo "[RUN] temperature=${TEMP}  conf=${NEW_CONF}"
+    echo "=================================================="
+
+    # 2. 如果原始 JSON 存在，以它为模板替换 temperature；否则报错跳过
+    ORIG_JSON="${TRAIN_CONF_DIR}/${BASE_CONF}.json"
+    if [ ! -f "$ORIG_JSON" ]; then
+        echo "[ERROR] 找不到原始配置 ${ORIG_JSON}，跳过 temperature=${TEMP}"
+        continue
+    fi
+
+    # 用 sed 替换 temperature 字段，生成新 JSON
+    sed "s/\"temperature\":[^,}]*/\"temperature\":${TEMP}/" \
+        "$ORIG_JSON" > "${TRAIN_CONF_DIR}/${NEW_CONF}.json"
+
+    echo "[INFO] 已生成 ${TRAIN_CONF_DIR}/${NEW_CONF}.json"
+
+    # 3. 生成临时 train.sh，将 train_conf 替换为新名称
+    TEMP_TRAIN_SH="train_temp_${NEW_CONF}.sh"
+    echo "$TRAIN_SH_ORIG" | \
+        sed "s/train_conf=${BASE_CONF}/train_conf=${NEW_CONF}/" \
+        > "$TEMP_TRAIN_SH"
+    chmod +x "$TEMP_TRAIN_SH"
+
+    # 4. 运行，日志保存到 logs/
+    LOG="logs/train_temp${TEMP}.log"
+    echo "[INFO] 开始训练，日志: ${LOG}"
+    bash "$TEMP_TRAIN_SH" 2>&1 | tee "$LOG"
+
+    EXIT_CODE=${PIPESTATUS[0]}
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo "[ERROR] temperature=${TEMP} 训练失败 (exit code=${EXIT_CODE})，继续下一个"
+    else
+        echo "[INFO] temperature=${TEMP} 训练完成"
+    fi
+
+    # 5. 清理临时 train.sh
+    rm -f "$TEMP_TRAIN_SH"
+
+    echo ""
+done
+
+echo "=================================================="
+echo "[DONE] 所有 temperature 实验完成"
+echo "日志目录: logs/"
+echo "=================================================="
