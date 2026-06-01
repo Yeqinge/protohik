@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+compare_models.py
+
+把多个模型在【同一条样本】上的表现并排放在一起，用来回答：
+  - 哪些样本模型判得不好？
+  - 这些样本换别的模型有救吗？
+  - 到底是数据问题还是模型问题？
+
+诊断逻辑（按每条样本所有模型的对错）：
+  all_correct : 所有模型都判对
+  all_wrong   : 所有模型都判错      -> 偏【数据问题】(标注/录音/难样本, 换模型也救不回来)
+  disagree    : 模型之间有分歧       -> 偏【模型问题】(有模型学会了, 说明信息是可学的)
+
+输出:
+  1) xlsx : 每个数据集一个 sheet + summary, all_wrong 标红 / disagree 标黄
+  2) html : 单文件离线看板(暗色), 可搜索/筛选/排序, 浏览器直接打开
+
+依赖: pandas, openpyxl   (没有就 pip install pandas openpyxl)
+用法: 改 CONFIG 区, 然后  python3 compare_models.py
+      也可用环境变量覆盖, 例:
+      CMP_MODELS=26051101,26051102 CMP_THRESHOLD=0.6 python3 compare_models.py
+"""
+
+import os
+import sys
+import json
+import html
+import pandas as pd
+from openpyxl.styles import PatternFill, Font
+
+# ===================== CONFIG =====================
+BASE = os.environ.get("CMP_BASE",
+    "Archive/FiberArchive/codes/ModelTraining/"
+    "subtools-resnet-v1.0.0/model_exp/fbank_20k_test5/fiber_train")
+EPOCH = int(os.environ.get("CMP_EPOCH", "10"))
+
+# 要对比的模型(train_conf)。留空则自动扫描 BASE 下所有模型目录。
+MODELS = [m for m in os.environ.get("CMP_MODELS", "").split(",") if m] or []
+# 例: MODELS = ["26051101", "26051102", "26051103"]
+
+# 要对比的数据集(训练/测试都可放)。留空则自动用第一个模型下的全部数据集。
+DATASETS = [d for d in os.environ.get("CMP_DATASETS", "").split(",") if d] or []
+# 例: DATASETS = ["gujinggongjiu_fa_test_20k_sweeper", "qdhnc_fa_test_20k"]
+
+# 判 abnormal 的阈值。CSV 自带预测用 0.5；想用 0.6 改这里。
+THRESHOLD = float(os.environ.get("CMP_THRESHOLD", "0.5"))
+
+OUTPUT_XLSX = os.environ.get("CMP_OUT_XLSX", "model_comparison.xlsx")
+OUTPUT_HTML = os.environ.get("CMP_OUT_HTML", "model_comparison.html")
+# ==================================================
+
+
+def detailed_csv_path(model, dataset):
+    return os.path.join(BASE, model, f"near_epoch_{EPOCH}",
+                        dataset, "score", "eval_results", "detailed_results.csv")
+
+
+def auto_discover():
+    global MODELS, DATASETS
+    if not MODELS:
+        if not os.path.isdir(BASE):
+            sys.exit(f"[错误] BASE 不存在: {BASE}")
+        MODELS = sorted(d for d in os.listdir(BASE)
+                        if os.path.isdir(os.path.join(BASE, d)))
+        print(f"[auto] 模型: {MODELS}")
+    if not DATASETS:
+        ne = os.path.join(BASE, MODELS[0], f"near_epoch_{EPOCH}")
+        if not os.path.isdir(ne):
+            sys.exit(f"[错误] 找不到 {ne}, 检查 EPOCH / 模型名")
+        DATASETS = sorted(d for d in os.listdir(ne)
+                          if os.path.isfile(detailed_csv_path(MODELS[0], d)))
+        print(f"[auto] 数据集: {DATASETS}")
+
+
+def load_one(model, dataset):
+    path = detailed_csv_path(model, dataset)
+    if not os.path.isfile(path):
+        print(f"[skip] 找不到: {path}")
+        return None
+    df = pd.read_csv(path)
+    df = df.rename(columns={
+        "Filename": "filename", "Score": "score",
+        "True Label": "true_label", "Detector ID": "detector"})
+    missing = {"filename", "score", "true_label"} - set(df.columns)
+    if missing:
+        print(f"[skip] {path} 缺列 {missing}, 实际列={list(df.columns)}")
+        return None
+    if "detector" not in df.columns:
+        df["detector"] = ""
+    df["pred"] = df["score"].apply(lambda s: "abnormal" if s >= THRESHOLD else "normal")
+    df["correct"] = (df["pred"].str.lower() == df["true_label"].str.lower())
+    return df[["filename", "detector", "true_label", "score", "pred", "correct"]]
+
+
+def build_dataset(dataset):
+    merged, present = None, []
+    for model in MODELS:
+        df = load_one(model, dataset)
+        if df is None:
+            continue
+        present.append(model)
+        sub = df.rename(columns={
+            "score": f"{model}__score", "pred": f"{model}__pred",
+            "correct": f"{model}__correct"})
+        if merged is None:
+            merged = sub
+        else:
+            merged = merged.merge(sub.drop(columns=["true_label"]),
+                                  on=["filename", "detector"], how="outer")
+    if merged is None:
+        return None, present
+
+    cc = [f"{m}__correct" for m in present]
+
+    def diagnose(row):
+        vals = [row[c] for c in cc if pd.notna(row[c])]
+        if not vals:
+            return "no_data"
+        if all(vals):
+            return "all_correct"
+        if not any(vals):
+            return "all_wrong"
+        return "disagree"
+
+    merged["diagnosis"] = merged.apply(diagnose, axis=1)
+    order = {"all_wrong": 0, "disagree": 1, "all_correct": 2, "no_data": 3}
+    merged["_o"] = merged["diagnosis"].map(order)
+    merged = merged.sort_values(["_o", "detector", "filename"]).drop(columns="_o")
+    front = ["filename", "detector", "true_label", "diagnosis"]
+    rest = [c for c in merged.columns if c not in front]
+    return merged[front + rest], present
+
+
+# ---------------- xlsx ----------------
+def safe_sheet_name(name, used):
+    name = name[:31]
+    base, i = name, 1
+    while name in used:
+        sfx = f"_{i}"
+        name = base[:31 - len(sfx)] + sfx
+        i += 1
+    used.add(name)
+    return name
+
+
+def write_xlsx(built, summary_rows):
+    RED = PatternFill("solid", fgColor="FFC7CE")
+    YEL = PatternFill("solid", fgColor="FFEB9C")
+    HEAD = PatternFill("solid", fgColor="305496")
+    HFONT = Font(color="FFFFFF", bold=True)
+    used = set()
+    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as w:
+        for dataset, (df, present) in built.items():
+            sheet = safe_sheet_name(dataset, used)
+            df.to_excel(w, sheet_name=sheet, index=False)
+            ws = w.sheets[sheet]
+            dcol = list(df.columns).index("diagnosis") + 1
+            for r in range(2, len(df) + 2):
+                v = ws.cell(row=r, column=dcol).value
+                fill = RED if v == "all_wrong" else (YEL if v == "disagree" else None)
+                if fill:
+                    for c in range(1, len(df.columns) + 1):
+                        ws.cell(row=r, column=c).fill = fill
+            for c in range(1, len(df.columns) + 1):
+                ws.cell(row=1, column=c).fill = HEAD
+                ws.cell(row=1, column=c).font = HFONT
+        sm = pd.DataFrame(summary_rows)
+        sm.to_excel(w, sheet_name="summary", index=False)
+        ws = w.sheets["summary"]
+        for c in range(1, len(sm.columns) + 1):
+            ws.cell(row=1, column=c).fill = HEAD
+            ws.cell(row=1, column=c).font = HFONT
+    print(f"[done] xlsx -> {OUTPUT_XLSX}")
+
+
+# ---------------- html ----------------
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型逐样本对比</title>
+<style>
+:root{
+  --bg:#0a0e16; --panel:#0f1521; --panel2:#141c2b; --line:#1f2b40;
+  --txt:#cdd6e4; --dim:#7c8aa5; --accent:#39d3c4;
+  --red:#ff5d6c; --redbg:rgba(255,93,108,.13);
+  --amber:#f5b13d; --amberbg:rgba(245,177,61,.13);
+  --green:#43d17a; --greenbg:rgba(67,209,122,.10);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+  font-family:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+  font-size:13px;line-height:1.5}
+.bg{position:fixed;inset:0;z-index:-1;
+  background:radial-gradient(900px 500px at 80% -10%,rgba(57,211,196,.08),transparent 60%),
+             radial-gradient(700px 500px at -10% 110%,rgba(245,177,61,.06),transparent 60%)}
+header{padding:34px 28px 18px;border-bottom:1px solid var(--line)}
+h1{margin:0;font-size:20px;letter-spacing:.5px;font-weight:600}
+h1 .tag{color:var(--accent)}
+.sub{color:var(--dim);margin-top:6px;font-size:12px}
+.wrap{padding:22px 28px 80px;max-width:1500px;margin:0 auto}
+.cards{display:flex;gap:14px;flex-wrap:wrap;margin:18px 0 8px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:16px 18px;min-width:140px;position:relative;overflow:hidden}
+.card .n{font-size:28px;font-weight:700;letter-spacing:.5px}
+.card .l{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.card.red .n{color:var(--red)} .card.amber .n{color:var(--amber)}
+.card.green .n{color:var(--green)} .card.accent .n{color:var(--accent)}
+section{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  margin-top:22px;overflow:hidden}
+.shead{padding:16px 18px;border-bottom:1px solid var(--line);
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;cursor:pointer}
+.shead h2{margin:0;font-size:15px;font-weight:600}
+.shead .meta{color:var(--dim);font-size:11.5px}
+.diagbar{display:flex;height:8px;border-radius:5px;overflow:hidden;width:160px;
+  border:1px solid var(--line)}
+.diagbar i{display:block;height:100%}
+.diagbar .w{background:var(--red)} .diagbar .d{background:var(--amber)} .diagbar .c{background:var(--green)}
+.acc{display:flex;align-items:center;gap:8px;margin:2px 0}
+.acc .name{width:120px;color:var(--dim);font-size:11.5px;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.acc .track{flex:1;height:9px;background:#0b1019;border:1px solid var(--line);border-radius:5px;overflow:hidden}
+.acc .fill{height:100%;background:linear-gradient(90deg,var(--accent),#2aa79b)}
+.acc .val{width:54px;text-align:right;color:var(--txt);font-variant-numeric:tabular-nums}
+.body{padding:0 18px 18px}
+.summary-grid{display:grid;grid-template-columns:1fr;gap:6px;padding:14px 0}
+.controls{display:flex;gap:12px;flex-wrap:wrap;align-items:center;padding:14px 0 10px}
+.controls input[type=text]{background:#0b1019;border:1px solid var(--line);color:var(--txt);
+  border-radius:8px;padding:7px 11px;font:inherit;width:260px;outline:none}
+.controls input[type=text]:focus{border-color:var(--accent)}
+.chip{display:inline-flex;align-items:center;gap:6px;color:var(--dim);
+  font-size:11.5px;cursor:pointer;user-select:none;padding:5px 10px;border:1px solid var(--line);border-radius:999px}
+.chip input{accent-color:var(--accent)}
+.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:10px;max-height:560px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{padding:7px 10px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}
+thead th{position:sticky;top:0;background:var(--panel2);z-index:2;cursor:pointer;
+  font-weight:600;color:var(--dim);text-transform:uppercase;font-size:10.5px;letter-spacing:.6px}
+thead th:hover{color:var(--txt)}
+td.fn{color:var(--dim);font-size:11px;max-width:340px;overflow:hidden;text-overflow:ellipsis}
+tr.all_wrong{background:var(--redbg)} tr.disagree{background:var(--amberbg)}
+.badge{padding:2px 8px;border-radius:999px;font-size:10.5px;font-weight:600;letter-spacing:.4px}
+.b_all_wrong{background:var(--red);color:#180405}
+.b_disagree{background:var(--amber);color:#1c1304}
+.b_all_correct{background:rgba(67,209,122,.18);color:var(--green)}
+.b_no_data{background:#222c3e;color:var(--dim)}
+.sc{font-variant-numeric:tabular-nums}
+.sc.ok{color:var(--green)} .sc.bad{color:var(--red)}
+.lab{color:var(--dim)}
+.more{padding:11px;text-align:center;color:var(--accent);cursor:pointer;border-top:1px dashed var(--line)}
+.legend{color:var(--dim);font-size:11px;margin-top:8px}
+.legend b{color:var(--red)} .legend i{color:var(--amber);font-style:normal}
+footer{color:var(--dim);font-size:11px;text-align:center;padding:24px}
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<header>
+  <h1>模型逐样本对比 · <span class="tag">data vs model</span></h1>
+  <div class="sub" id="meta"></div>
+</header>
+<div class="wrap">
+  <div class="cards" id="cards"></div>
+  <section>
+    <div class="shead" style="cursor:default"><h2>各模型准确率 / 数据集汇总</h2></div>
+    <div class="body"><div class="summary-grid" id="summary"></div></div>
+  </section>
+  <div id="datasets"></div>
+  <footer>all_wrong = 所有模型都错 → 偏数据问题 ｜ disagree = 模型间分歧 → 偏模型问题</footer>
+</div>
+<script>
+const DATA = /*__DATA__*/;
+const MODELS = DATA.models;
+const ROW_CAP = 800;
+
+function el(t,c,txt){const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e;}
+
+document.getElementById('meta').textContent =
+  `epoch ${DATA.epoch} · 阈值 ${DATA.threshold} · ${MODELS.length} 个模型 [${MODELS.join(', ')}] · ${DATA.summary.length} 个数据集`;
+
+// cards
+let tW=0,tD=0,tN=0;
+DATA.summary.forEach(s=>{tW+=s.all_wrong;tD+=s.disagree;tN+=s.n_samples;});
+const cards=[['accent',MODELS.length,'模型'],['accent',DATA.summary.length,'数据集'],
+  ['accent',tN.toLocaleString(),'样本'],['red',tW.toLocaleString(),'all_wrong'],
+  ['amber',tD.toLocaleString(),'disagree']];
+const cc=document.getElementById('cards');
+cards.forEach(([cl,n,l])=>{const d=el('div','card '+cl);d.appendChild(el('div','n',n));d.appendChild(el('div','l',l));cc.appendChild(d);});
+
+// summary accuracy bars
+const sg=document.getElementById('summary');
+DATA.summary.forEach(s=>{
+  const block=el('div');
+  block.style.padding='10px 0';block.style.borderBottom='1px solid var(--line)';
+  const head=el('div');head.style.display='flex';head.style.justifyContent='space-between';
+  head.appendChild(el('b',null,s.dataset));
+  head.appendChild(el('span','meta',`n=${s.n_samples} · all_wrong ${s.all_wrong} · disagree ${s.disagree}`));
+  head.querySelector('.meta')||head.lastChild.classList?.add?.('');
+  head.lastChild.style.color='var(--dim)';head.lastChild.style.fontSize='11.5px';
+  block.appendChild(head);
+  MODELS.forEach(m=>{
+    const a=s[m+'_acc'];
+    const row=el('div','acc');
+    row.appendChild(el('div','name',m));
+    const tr=el('div','track');const f=el('div','fill');f.style.width=((a==null?0:a)*100).toFixed(1)+'%';tr.appendChild(f);
+    row.appendChild(tr);
+    row.appendChild(el('div','val',a==null?'-':(a*100).toFixed(1)+'%'));
+    block.appendChild(row);
+  });
+  sg.appendChild(block);
+});
+
+// dataset sections
+const root=document.getElementById('datasets');
+Object.keys(DATA.datasets).forEach(name=>{
+  const d=DATA.datasets[name];
+  const sec=el('section');
+  const cnt={all_wrong:0,disagree:0,all_correct:0,no_data:0};
+  d.rows.forEach(r=>cnt[r.diagnosis]++);
+  const tot=d.rows.length||1;
+
+  const head=el('div','shead');
+  head.appendChild(el('h2',null,name));
+  const db=el('div','diagbar');
+  [['w',cnt.all_wrong],['d',cnt.disagree],['c',cnt.all_correct]].forEach(([cl,v])=>{
+    const i=el('i',cl);i.style.width=(v/tot*100)+'%';db.appendChild(i);});
+  head.appendChild(db);
+  head.appendChild(el('div','meta',`n=${tot} · all_wrong ${cnt.all_wrong} · disagree ${cnt.disagree} · ok ${cnt.all_correct}`));
+  sec.appendChild(head);
+
+  const body=el('div','body');body.style.display='none';
+  head.onclick=()=>{body.style.display=body.style.display==='none'?'block':'none';};
+
+  // controls
+  const ctl=el('div','controls');
+  const search=el('input');search.type='text';search.placeholder='搜索 filename / detector ...';
+  ctl.appendChild(search);
+  const state={all_wrong:true,disagree:true,all_correct:false,no_data:true,q:''};
+  [['all_wrong','all_wrong'],['disagree','disagree'],['all_correct','all_correct (默认隐藏)'],['no_data','no_data']].forEach(([k,lab])=>{
+    const chip=el('label','chip');const cb=el('input');cb.type='checkbox';cb.checked=state[k];
+    cb.onchange=()=>{state[k]=cb.checked;render();};
+    chip.appendChild(cb);chip.appendChild(el('span',null,lab));ctl.appendChild(chip);
+  });
+  body.appendChild(ctl);
+
+  const tw=el('div','tablewrap');
+  const table=el('table');
+  const thead=el('thead');const htr=el('tr');
+  const cols=[['filename','filename'],['detector','det'],['true_label','true']];
+  MODELS.forEach(m=>cols.push([m+'__score',m]));
+  cols.push(['diagnosis','diagnosis']);
+  let sortKey='diagnosis',sortAsc=true;
+  cols.forEach(([k,lab])=>{const th=el('th',null,lab);th.onclick=()=>{if(sortKey===k)sortAsc=!sortAsc;else{sortKey=k;sortAsc=true;}render();};htr.appendChild(th);});
+  thead.appendChild(htr);table.appendChild(thead);
+  const tbody=el('tbody');table.appendChild(tbody);
+  tw.appendChild(table);body.appendChild(tw);
+  const legend=el('div','legend');legend.innerHTML='行底色：<b>红=all_wrong</b> ｜ <i>黄=disagree</i> ｜ 单元格：绿=该模型判对，红=判错';
+  body.appendChild(legend);
+  sec.appendChild(body);
+  root.appendChild(sec);
+
+  const order={all_wrong:0,disagree:1,all_correct:2,no_data:3};
+  function render(){
+    let rows=d.rows.filter(r=>state[r.diagnosis]);
+    const q=search.value.trim().toLowerCase();
+    if(q)rows=rows.filter(r=>(r.filename+' '+r.detector).toLowerCase().includes(q));
+    rows.sort((a,b)=>{
+      let va,vb;
+      if(sortKey==='diagnosis'){va=order[a.diagnosis];vb=order[b.diagnosis];}
+      else if(sortKey.endsWith('__score')){va=a[sortKey]??-1;vb=b[sortKey]??-1;}
+      else{va=(a[sortKey]||'').toString();vb=(b[sortKey]||'').toString();}
+      if(va<vb)return sortAsc?-1:1;if(va>vb)return sortAsc?1:-1;return 0;});
+    tbody.innerHTML='';
+    const show=rows.slice(0,ROW_CAP);
+    show.forEach(r=>{
+      const tr=el('tr',r.diagnosis);
+      tr.appendChild(Object.assign(el('td','fn'),{textContent:r.filename}));
+      tr.appendChild(el('td',null,r.detector||'-'));
+      tr.appendChild(Object.assign(el('td','lab'),{textContent:r.true_label}));
+      MODELS.forEach(m=>{
+        const sc=r[m+'__score'],ok=r[m+'__correct'];
+        const td=el('td','sc '+(ok===true?'ok':ok===false?'bad':''));
+        td.textContent = sc==null?'-':sc.toFixed(3);
+        if(ok===false&&sc!=null)td.title='预测 '+r[m+'__pred']+' / 真值 '+r.true_label;
+        tr.appendChild(td);
+      });
+      const tdb=el('td');const b=el('span','badge b_'+r.diagnosis,r.diagnosis);tdb.appendChild(b);tr.appendChild(tdb);
+      tbody.appendChild(tr);
+    });
+    if(rows.length>ROW_CAP){
+      const tr=el('tr');const td=el('td','more',`显示前 ${ROW_CAP} / 共 ${rows.length} 行（用搜索缩小范围）`);
+      td.colSpan=cols.length;tr.appendChild(td);tbody.appendChild(tr);
+    }
+    if(rows.length===0){
+      const tr=el('tr');const td=el('td');td.colSpan=cols.length;td.style.color='var(--dim)';td.style.padding='16px';td.textContent='无匹配行';tr.appendChild(td);tbody.appendChild(tr);
+    }
+  }
+  search.oninput=render;
+  render();
+});
+</script>
+</body>
+</html>"""
+
+
+def write_html(built, summary_rows):
+    datasets = {}
+    for name, (df, present) in built.items():
+        recs = []
+        for _, row in df.iterrows():
+            rec = {
+                "filename": str(row["filename"]),
+                "detector": "" if pd.isna(row["detector"]) else str(row["detector"]),
+                "true_label": str(row["true_label"]),
+                "diagnosis": str(row["diagnosis"]),
+            }
+            for m in MODELS:
+                sc = row.get(f"{m}__score")
+                pr = row.get(f"{m}__pred")
+                co = row.get(f"{m}__correct")
+                rec[f"{m}__score"] = None if pd.isna(sc) else round(float(sc), 6)
+                rec[f"{m}__pred"] = None if pd.isna(pr) else str(pr)
+                rec[f"{m}__correct"] = None if pd.isna(co) else bool(co)
+            recs.append(rec)
+        datasets[name] = {"rows": recs}
+
+    data = {
+        "epoch": EPOCH, "threshold": THRESHOLD, "models": MODELS,
+        "summary": summary_rows, "datasets": datasets,
+    }
+    payload = json.dumps(data, ensure_ascii=False)
+    out = HTML_TEMPLATE.replace("/*__DATA__*/", payload)
+    with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
+        f.write(out)
+    print(f"[done] html -> {OUTPUT_HTML}")
+
+
+def main():
+    auto_discover()
+    built, summary_rows = {}, []
+    for dataset in DATASETS:
+        df, present = build_dataset(dataset)
+        if df is None:
+            continue
+        built[dataset] = (df, present)
+        row = {"dataset": dataset, "n_samples": int(len(df))}
+        for m in MODELS:
+            cc = f"{m}__correct"
+            if cc in df:
+                acc = df[cc].mean(skipna=True)
+                row[f"{m}_acc"] = None if pd.isna(acc) else round(float(acc), 4)
+            else:
+                row[f"{m}_acc"] = None
+        row["all_wrong"] = int((df["diagnosis"] == "all_wrong").sum())
+        row["disagree"] = int((df["diagnosis"] == "disagree").sum())
+        summary_rows.append(row)
+
+    if not built:
+        sys.exit("[错误] 没读到任何 detailed_results.csv, 检查 BASE / EPOCH / 名称")
+
+    write_xlsx(built, summary_rows)
+    write_html(built, summary_rows)
+    print("\n看板用法: 浏览器打开 html, 默认只显示 all_wrong(红) + disagree(黄)。")
+    print("  all_wrong = 换模型也救不回 -> 查数据;  disagree = 有模型学会了 -> 模型/训练问题")
+
+
+if __name__ == "__main__":
+    main()
