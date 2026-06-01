@@ -1,64 +1,84 @@
 #!/bin/bash
 
 # ============================================================
-# run.sh —— 批量运行不同 temperature 的训练
+# run.sh —— 批量运行不同 diversity_weight 的训练（串行）
 # 用法: bash run.sh
 # ============================================================
 
 # ---------- 配置区：按需修改 ----------
 TRAIN_SH="./train.sh"
 BASE_CONF="26051101"
-BASE_TEMP="0.1"
-TEMPERATURES=(0.05 0.07 0.1 0.15 0.2)
+PARAM="diversity_weight"         # 要替换的参数名
+BASE_VAL="0.1"                   # train.sh 里该参数的原始值
+VALUES=(0.05 0.1 0.2 0.3 0.5)   # 批量运行的值
 # --------------------------------------
 
-# 检查 train.sh 是否存在
 if [ ! -f "$TRAIN_SH" ]; then
-    echo "[ERROR] 找不到 $TRAIN_SH，请确认路径"
+    echo "[ERROR] 找不到 $TRAIN_SH"
     exit 1
 fi
 
 mkdir -p logs
+mkdir -p train_scripts
 
-for TEMP in "${TEMPERATURES[@]}"; do
+for VAL in "${VALUES[@]}"; do
 
-    NEW_CONF="${BASE_CONF}_temp${TEMP}"
+    NEW_CONF="${BASE_CONF}_${PARAM}${VAL}"
 
     echo "=================================================="
-    echo "[RUN] temperature=${TEMP}  conf=${NEW_CONF}"
+    echo "[RUN] ${PARAM}=${VAL}  conf=${NEW_CONF}"
     echo "=================================================="
 
-    # 生成临时 train.sh，同时替换两处：
-    # 1. train_conf=26051101 → train_conf=26051101_temp0.05
-    # 2. "temperature":0.1   → "temperature":0.05
-    TEMP_TRAIN_SH="train_temp_${NEW_CONF}.sh"
-    sed \
-        "s/train_conf=${BASE_CONF}/train_conf=${NEW_CONF}/" \
-        "$TRAIN_SH" | \
-    sed \
-        "s/\"temperature\":${BASE_TEMP}/\"temperature\":${TEMP}/" \
-        > "$TEMP_TRAIN_SH"
+    TEMP_TRAIN_SH="train_scripts/train_${NEW_CONF}.sh"
+
+    python3 - "$TRAIN_SH" "$TEMP_TRAIN_SH" "$BASE_CONF" "$NEW_CONF" "$PARAM" "$BASE_VAL" "$VAL" << 'PYEOF'
+import sys, re
+
+src, dst, base_conf, new_conf, param, base_val, val = sys.argv[1:]
+
+with open(src, 'r') as f:
+    content = f.read()
+
+# 1. 替换 train_conf
+content = content.replace(f'train_conf={base_conf}', f'train_conf={new_conf}', 1)
+
+# 2. 只替换 proto1_loss_params 块里的目标参数
+def replace_param(m):
+    block = m.group(0)
+    block = re.sub(rf'"{param}":[0-9.]+', f'"{param}":{val}', block, count=1)
+    return block
+
+content = re.sub(
+    r'"proto1_loss_params"\s*:\s*\{[^}]+\}',
+    replace_param,
+    content
+)
+
+with open(dst, 'w') as f:
+    f.write(content)
+
+print(f"[INFO] 已保存脚本: {dst}")
+PYEOF
+
     chmod +x "$TEMP_TRAIN_SH"
 
-    # 运行，日志保存到 logs/
-    LOG="logs/train_temp${TEMP}.log"
+    LOG="logs/train_${PARAM}${VAL}.log"
     echo "[INFO] 开始训练，日志: ${LOG}"
     bash "$TEMP_TRAIN_SH" 2>&1 | tee "$LOG"
 
     EXIT_CODE=${PIPESTATUS[0]}
     if [ $EXIT_CODE -ne 0 ]; then
-        echo "[ERROR] temperature=${TEMP} 训练失败 (exit code=${EXIT_CODE})，继续下一个"
+        echo "[ERROR] ${PARAM}=${VAL} 训练失败 (exit=${EXIT_CODE})，继续下一个"
     else
-        echo "[INFO] temperature=${TEMP} 训练完成"
+        echo "[INFO] ${PARAM}=${VAL} 训练完成"
     fi
 
-    # 清理临时 train.sh
-    rm -f "$TEMP_TRAIN_SH"
-
     echo ""
+
 done
 
 echo "=================================================="
-echo "[DONE] 所有 temperature 实验完成"
+echo "[DONE] 所有实验完成"
+echo "脚本目录: train_scripts/"
 echo "日志目录: logs/"
 echo "=================================================="
