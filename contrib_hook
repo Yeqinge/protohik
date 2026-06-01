@@ -1,0 +1,291 @@
+# -*- coding: utf-8 -*-
+"""
+contrib_hook.py
+逐样本贡献追踪，只改 Res_SE_Launcher.py 两行，不改 trainer/res_se_p/egs。
+依赖同目录 sample_tracker.py。
+
+真实样本 id 的拿法（不动任何源码、兼容 num_workers>0 和 shuffle）：
+  DataLoader 的 batch 采样器在【主进程】运行，每个 batch 会先吐出"这一批用了哪些
+  数据集下标"。我们把这个采样器包一层、按 FIFO 记录下标，再和每个产出的 batch 一一配对。
+  数据集下标本身就是稳定 id（__getitem__(i) 永远读 egs 第 i 行，shuffle 只改顺序）。
+  想要可读的 utt/chunk 名，给 instrument 传 id_source（list/dict/callable）即可。
+
+梯度路径：在损失模块输入张量上挂 register_hook，反传时拿到每样本真实梯度 dL/dX，
+算 grad_norm（贡献大小/难易）与 align（与本 batch 共识方向是否一致，负=有害嫌疑）。
+"""
+
+import os
+import hashlib
+from collections import deque
+
+import torch
+import torch.nn.functional as F
+
+from sample_tracker import SampleContributionTracker
+
+_ACTIVE = None
+
+
+def capture(logits, targets):
+    if _ACTIVE is not None:
+        _ACTIVE._record_pred(logits, targets)
+
+
+def _to_2d(t):
+    if t.dim() == 2:
+        return t
+    if t.dim() == 3:
+        return t.mean(dim=-1) if t.shape[-1] > 1 else t[..., 0]
+    return t.reshape(t.shape[0], -1)
+
+
+def _hash_ids(feats):
+    feats = feats.detach().to("cpu").contiguous()
+    return [hashlib.blake2b(feats[i].numpy().tobytes(), digest_size=8).hexdigest()
+            for i in range(feats.shape[0])]
+
+
+def _split_targets(batch):
+    """只为拿 targets（喂给可选的 loss/正确性记录）。拿不到就 None。"""
+    if isinstance(batch, dict):
+        for k in ("label", "labels", "target", "targets", "y"):
+            if k in batch:
+                return batch[k], batch.get("feat", batch.get("feats"))
+        return None, None
+    if isinstance(batch, (list, tuple)):
+        feats = batch[0]
+        return (batch[1] if len(batch) > 1 else None), feats
+    return None, batch
+
+
+def _find_loss_module(model):
+    m = getattr(model, "loss", None)
+    if isinstance(m, torch.nn.Module):
+        return "loss", m
+    cand = (None, None)
+    keys = ("loss", "softmax", "margin", "proto", "aam", "arc")
+    for name, mod in model.named_modules():
+        if any(k in type(mod).__name__.lower() for k in keys):
+            cand = (name, mod)
+    return cand
+
+
+def _find_classifier(model, num_targets):
+    found = (None, None)
+    for name, m in model.named_modules():
+        out = None
+        if isinstance(m, torch.nn.Linear):
+            out = m.out_features
+        elif hasattr(m, "out_features"):
+            out = getattr(m, "out_features")
+        else:
+            w = getattr(m, "weight", None)
+            if isinstance(w, torch.Tensor) and w.dim() >= 2:
+                out = w.shape[0]
+        if out == num_targets:
+            found = (name, m)
+    return found
+
+
+def _get_dataloader_with_sampler(loader):
+    """找到真正持有 batch_sampler 的 torch DataLoader（可能被 fast loader 包了一层）。"""
+    if getattr(loader, "batch_sampler", None) is not None:
+        return loader
+    for attr in ("loader", "_loader", "dataloader", "_dataloader", "dl", "_dl"):
+        inner = getattr(loader, attr, None)
+        if inner is not None and getattr(inner, "batch_sampler", None) is not None:
+            return inner
+    return None
+
+
+class _RecordingBatchSampler:
+    """包住 batch_sampler：主进程里把每个 batch 的下标列表记进 sink（FIFO）。"""
+    def __init__(self, bs, sink):
+        self._bs = bs
+        self._sink = sink
+
+    def __iter__(self):
+        for idxs in self._bs:
+            self._sink.append(list(idxs))
+            yield idxs
+
+    def __len__(self):
+        return len(self._bs)
+
+    def __getattr__(self, item):
+        return getattr(self._bs, item)
+
+
+class _Instrumenter:
+    def __init__(self, model, num_targets, save_dir, id_source):
+        self.model = model
+        self.num_targets = num_targets
+        self.tracker = SampleContributionTracker(save_dir)
+        self.save_dir = save_dir
+        self.id_source = id_source       # None / list / dict / callable(idx)->str
+        self._stash = None               # (ids, targets)
+        self._idx_queue = deque()        # batch 采样器记录的下标，FIFO
+        self._hooks = []
+        self.real_ids = False
+
+    def resolve_ids(self, idxs):
+        src = self.id_source
+        if src is None:
+            return [str(i) for i in idxs]
+        if callable(src):
+            return [str(src(i)) for i in idxs]
+        return [str(src[i]) for i in idxs]   # list 或 dict
+
+    def stash(self, ids, targets):
+        self._stash = (ids, targets)
+
+    # —— 主路径：损失模块输入梯度 ——
+    def _loss_pre_hook(self, module, args):
+        if not self.model.training or self._stash is None:
+            return
+        X = None
+        for a in args:
+            if torch.is_tensor(a) and a.is_floating_point() and a.dim() >= 2 and a.requires_grad:
+                X = a; break
+        if X is None:
+            return
+        ids = list(self._stash[0]); holder = {}
+
+        def _grad_cb(grad):
+            try:
+                g = grad.detach().reshape(grad.shape[0], -1).float()
+                gn = g.norm(dim=1)
+                al = F.cosine_similarity(g, g.sum(0, keepdim=True).expand_as(g), dim=1)
+                if len(ids) == gn.shape[0]:
+                    self.tracker.update_grad(ids, gn.cpu().numpy(), al.cpu().numpy())
+            finally:
+                h = holder.get("h")
+                if h is not None:
+                    h.remove()
+
+        holder["h"] = X.register_hook(_grad_cb)
+
+    # —— 可选：分类头 -> loss/正确性 ——
+    def _clf_hook(self, m, i, o):
+        self._record_pred(o, self._stash[1] if self._stash else None)
+
+    def _record_pred(self, logits, targets):
+        if not self.model.training or self._stash is None or targets is None:
+            return
+        ids = list(self._stash[0])
+        logits = _to_2d(logits.detach().float())
+        t = targets.detach().long().to(logits.device).reshape(-1)
+        if t.shape[0] != logits.shape[0]:
+            return
+        loss = F.cross_entropy(logits, t, reduction="none")
+        self.tracker.update_pred(ids, loss.cpu().numpy(),
+                                 (logits.argmax(1) == t).cpu().numpy())
+
+    def attach_model(self):
+        lname, lmod = _find_loss_module(self.model)
+        if lmod is None:
+            print("[contrib] 警告：没定位到损失模块，主指标无法采集。")
+        else:
+            self._hooks.append(lmod.register_forward_pre_hook(self._loss_pre_hook))
+            print(f"[contrib] 梯度采集已挂到损失模块: {lname}")
+        cname, cmod = _find_classifier(self.model, self.num_targets)
+        if cmod is not None:
+            self._hooks.append(cmod.register_forward_hook(self._clf_hook))
+            print(f"[contrib] 额外记录 loss/正确性，分类头: {cname}")
+        else:
+            print("[contrib] 未找到普通分类头（如原型损失），只记 grad_norm/align。")
+
+    def attach_real_ids(self, loader):
+        dl = _get_dataloader_with_sampler(loader)
+        if dl is None:
+            print("[contrib] 未找到 batch_sampler，无法用真实下标 id，回退到特征哈希。\n"
+                  "          （你的 loader 可能不是标准 map-style DataLoader）")
+            return False
+        dl.batch_sampler = _RecordingBatchSampler(dl.batch_sampler, self._idx_queue)
+        self.real_ids = True
+        kind = ("整数下标" if self.id_source is None else "id_source 映射")
+        print(f"[contrib] 已启用真实样本 id（{kind}）。")
+        return True
+
+    def finalize(self, out_csv=None):
+        self.tracker.save_epoch()
+        for h in self._hooks:
+            h.remove()
+        out_csv = out_csv or os.path.join(self.save_dir, "contrib_summary.csv")
+        return SampleContributionTracker.summarize(self.save_dir, out_csv)
+
+
+class _LoaderWrapper:
+    def __init__(self, loader, inst, start_epoch):
+        self._loader = loader; self._inst = inst
+        self._epoch = start_epoch; self._started = False
+
+    def __iter__(self):
+        if self._started:
+            self._inst.tracker.save_epoch(); self._epoch += 1
+        self._started = True
+        self._inst.tracker.set_epoch(self._epoch)
+        self._inst._idx_queue.clear()                 # 新一轮，清空残留下标
+        for batch in self._loader:
+            targets, feats = _split_targets(batch)
+            if self._inst.real_ids and self._inst._idx_queue:
+                ids = self._inst.resolve_ids(self._inst._idx_queue.popleft())
+            else:
+                ids = _hash_ids(feats) if feats is not None else None
+            self._inst.stash(ids, targets)
+            yield batch
+
+    def __len__(self):
+        return len(self._loader)
+
+    def __getattr__(self, item):
+        return getattr(self._loader, item)
+
+
+def instrument(model, bunch, num_targets, save_dir,
+               loader_attr="train_loader", start_epoch=0,
+               real_ids=True, id_source=None):
+    """
+    在 trainer_process.run() 之前调用；run() 之后调用 .finalize()。
+
+    real_ids  : True 用 batch 采样器的真实数据集下标当 id（推荐）。
+    id_source : 想要可读的 utt/chunk 名时传入：
+                  - list/array：id_source[下标] -> 名字（顺序须与 egs 行序一致）
+                  - dict      ：id_source[下标] -> 名字
+                  - callable  ：id_source(下标) -> 名字
+                默认 None：直接用整数下标字符串（已是稳定真实 id）。
+    """
+    global _ACTIVE
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    if "RANK" in os.environ:
+        save_dir = os.path.join(save_dir, f"rank{rank}")
+
+    inst = _Instrumenter(model, num_targets, save_dir, id_source)
+    _ACTIVE = inst
+    inst.attach_model()
+
+    loader = getattr(bunch, loader_attr)
+    if real_ids:
+        inst.attach_real_ids(loader)
+    setattr(bunch, loader_attr, _LoaderWrapper(loader, inst, start_epoch))
+    print(f"[contrib] 已包装训练 loader: bunch.{loader_attr}; 落盘 -> {save_dir}")
+    return inst
+
+
+# ============================================================
+# Res_SE_Launcher.py 只加两处：
+#
+# 【1】 trainer_process = trainer.SimpleTrainer(...) 之后：
+#   from contrib_hook import instrument
+#   contrib = instrument(
+#       model=model, bunch=bunch, num_targets=info["num_targets"],
+#       save_dir=os.path.join(model_dir, "contrib"),
+#       loader_attr="train_loader",
+#       start_epoch=train_stage if train_stage > 0 else 0,
+#       real_ids=True,            # 用真实下标 id
+#       # id_source=my_name_list, # 可选：下标->utt/chunk 名
+#   )
+#
+# 【2】 trainer_process.run() 之后：
+#   contrib.finalize()
+# ============================================================
