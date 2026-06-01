@@ -1,12 +1,16 @@
 #!/bin/bash
 
 # ============================================================
-# run.sh —— 批量运行不同 diversity_weight 的训练（串行）
+# run.sh —— 批量运行不同参数的训练（串行）
 # 用法: bash run.sh
+# 放置路径: Archive/FiberArchive/codes/ModelTraining/subtools-resnet-v1.0.0/
 # ============================================================
 
 # ---------- 配置区：按需修改 ----------
-TRAIN_SH="./train.sh"
+BASE_DIR="Archive/FiberArchive/codes/ModelTraining/subtools-resnet-v1.0.0"
+TRAIN_SH="$BASE_DIR/train.sh"
+TRAIN_SCRIPTS_DIR="$BASE_DIR/train_scripts"
+LOGS_DIR="$BASE_DIR/logs"
 BASE_CONF="26051101"
 PARAM="diversity_weight"         # 要替换的参数名
 BASE_VAL="0.1"                   # train.sh 里该参数的原始值
@@ -18,8 +22,8 @@ if [ ! -f "$TRAIN_SH" ]; then
     exit 1
 fi
 
-mkdir -p logs
-mkdir -p train_scripts
+mkdir -p "$TRAIN_SCRIPTS_DIR"
+mkdir -p "$LOGS_DIR"
 
 for VAL in "${VALUES[@]}"; do
 
@@ -29,7 +33,7 @@ for VAL in "${VALUES[@]}"; do
     echo "[RUN] ${PARAM}=${VAL}  conf=${NEW_CONF}"
     echo "=================================================="
 
-    TEMP_TRAIN_SH="train_scripts/train_${NEW_CONF}.sh"
+    TEMP_TRAIN_SH="$TRAIN_SCRIPTS_DIR/train_${NEW_CONF}.sh"
 
     python3 - "$TRAIN_SH" "$TEMP_TRAIN_SH" "$BASE_CONF" "$NEW_CONF" "$PARAM" "$BASE_VAL" "$VAL" << 'PYEOF'
 import sys, re
@@ -62,7 +66,7 @@ PYEOF
 
     chmod +x "$TEMP_TRAIN_SH"
 
-    LOG="logs/train_${PARAM}${VAL}.log"
+    LOG="$LOGS_DIR/train_${PARAM}${VAL}.log"
     echo "[INFO] 开始训练，日志: ${LOG}"
     bash "$TEMP_TRAIN_SH" 2>&1 | tee "$LOG"
 
@@ -79,6 +83,6 @@ done
 
 echo "=================================================="
 echo "[DONE] 所有实验完成"
-echo "脚本目录: train_scripts/"
-echo "日志目录: logs/"
+echo "脚本目录: $TRAIN_SCRIPTS_DIR"
+echo "日志目录: $LOGS_DIR"
 echo "=================================================="
