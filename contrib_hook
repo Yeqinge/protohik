@@ -201,7 +201,16 @@ class _Instrumenter:
             print("[contrib] 未找到 batch_sampler，无法用真实下标 id，回退到特征哈希。\n"
                   "          （你的 loader 可能不是标准 map-style DataLoader）")
             return False
-        dl.batch_sampler = _RecordingBatchSampler(dl.batch_sampler, self._idx_queue)
+        wrapped = _RecordingBatchSampler(dl.batch_sampler, self._idx_queue)
+        # DataLoader/DataLoaderFast 在 __setattr__ 里禁止初始化后改 batch_sampler，
+        # 故直接写进实例 __dict__ 绕过该保护（迭代时 PyTorch 仍按 batch_sampler 取批）。
+        try:
+            object.__setattr__(dl, "batch_sampler", wrapped)
+        except Exception:
+            dl.__dict__["batch_sampler"] = wrapped
+        # 有些版本迭代走的是内部 _index_sampler，一并指过去以防万一
+        if "_index_sampler" in dl.__dict__:
+            dl.__dict__["_index_sampler"] = wrapped
         self.real_ids = True
         kind = ("整数下标" if self.id_source is None else "id_source 映射")
         print(f"[contrib] 已启用真实样本 id（{kind}）。")
