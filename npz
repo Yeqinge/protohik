@@ -1,0 +1,10 @@
+python3 -c "
+import numpy as np
+d = np.load('model_exp/fbank_20k_test5/fiber_train/26051101/contrib/contrib_epoch000.npz', allow_pickle=True)
+print('字段:', list(d.keys()))
+print('样本数:', len(d['ids']))
+print()
+print('前10个样本:')
+for i in range(min(10, len(d['ids']))):
+    print(f\"  id={d['ids'][i]}  grad_norm={d['grad_norm'][i]:.4f}  align={d['align'][i]:.4f}  loss={d['loss'][i]:.4f}  correct={d['correct'][i]}\")
+"
