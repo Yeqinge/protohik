@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 gen_viz_html.py
-一个脚本搞定：读 npz + summary CSV，输出一个自包含的 HTML 可视化文件。
+读 npz + summary CSV → 输出一个自包含 HTML 可视化。浏览器直接打开。
 
 用法:
   python3 gen_viz_html.py \
@@ -11,42 +11,54 @@ gen_viz_html.py
     --max-rows     10000
 """
 
-import argparse, os, glob, json, csv
+import argparse, os, glob, json, csv, math
 import numpy as np
 from collections import Counter
 
 
+def sf(v, default=0):
+    """safe float: nan/inf/空字符串 → default"""
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return default
+    try:
+        f = float(v)
+        return default if (math.isnan(f) or math.isinf(f)) else round(f, 4)
+    except (ValueError, TypeError):
+        return default
+
+
 def collect_data(contrib_dir, summary_csv, max_rows):
-    # 读 summary
     with open(summary_csv) as f:
         all_rows = list(csv.DictReader(f))
     has_utt = "utt_id" in all_rows[0] if all_rows else False
     tag_counts = dict(Counter(r.get("tag", "normal") for r in all_rows))
     total = len(all_rows)
 
-    # 选样本：优先 harmful_suspect > hard > high_influence > normal > easy
     priority = {"harmful_suspect": 0, "hard": 1, "high_influence": 2, "normal": 3, "easy_redundant": 4}
-    all_rows.sort(key=lambda r: (priority.get(r.get("tag", "normal"), 9), -float(r.get("self_influence", 0))))
+    all_rows.sort(key=lambda r: (priority.get(r.get("tag", "normal"), 9), -sf(r.get("self_influence", 0))))
     selected = all_rows[:max_rows]
     selected_ids = set(r["id"] for r in selected)
 
-    # 读 npz 轨迹（向量化，不逐条循环）
     files = sorted(glob.glob(os.path.join(contrib_dir, "contrib_epoch*.npz")))
     epochs = []
     traj = {}
-    sel_arr = np.array(list(selected_ids))          # 用于 np.isin
+    sel_arr = np.array(list(selected_ids))
     for f in files:
         ep = int(os.path.basename(f)[len("contrib_epoch"):-len(".npz")])
         epochs.append(ep)
         d = np.load(f, allow_pickle=True)
         ids_arr = d["ids"].astype(str)
-        mask = np.isin(ids_arr, sel_arr)            # 向量化筛选
+        mask = np.isin(ids_arr, sel_arr)
         hit_ids = ids_arr[mask]
-        hit_gn = np.round(d["grad_norm"][mask], 4)
-        hit_al = np.round(d["align"][mask], 4)
-        for k in range(len(hit_ids)):               # 只循环命中的（≤max_rows）
-            traj.setdefault(hit_ids[k], {})[ep] = (float(hit_gn[k]), float(hit_al[k]))
-        print(f"  epoch {ep}: {mask.sum()} / {len(ids_arr)} matched")
+        hit_gn = d["grad_norm"][mask]
+        hit_al = d["align"][mask]
+        for k in range(len(hit_ids)):
+            gn = float(hit_gn[k]); al = float(hit_al[k])
+            traj.setdefault(hit_ids[k], {})[ep] = (
+                round(gn, 4) if not math.isnan(gn) else None,
+                round(al, 4) if not math.isnan(al) else None,
+            )
+        print(f"  epoch {ep}: {mask.sum()} matched")
     epochs.sort()
 
     samples = []
@@ -58,12 +70,12 @@ def collect_data(contrib_dir, summary_csv, max_rows):
         entry = {
             "id": sid,
             "tag": r.get("tag", "normal"),
-            "mgn": round(float(r.get("mean_grad_norm", 0)), 4),
-            "si": round(float(r.get("self_influence", 0)), 2),
-            "ma": round(float(r.get("mean_align", 0)), 4),
-            "fna": round(float(r.get("frac_neg_align", 0)), 3),
-            "fe": int(r.get("forget_events", 0)),
-            "fc": int(r.get("final_correct", -1)),
+            "mgn": sf(r.get("mean_grad_norm", 0)),
+            "si": sf(r.get("self_influence", 0)),
+            "ma": sf(r.get("mean_align", 0)),
+            "fna": sf(r.get("frac_neg_align", 0)),
+            "fe": int(sf(r.get("forget_events", 0))),
+            "fc": int(sf(r.get("final_correct", -1), -1)),
             "tgn": tgn,
             "tal": tal,
         }
@@ -71,226 +83,182 @@ def collect_data(contrib_dir, summary_csv, max_rows):
             entry["utt"] = r.get("utt_id", "")
         samples.append(entry)
 
-    return json.dumps({
+    data = {
         "total": total, "exported": len(samples), "tag_counts": tag_counts,
         "epochs": epochs, "has_utt": has_utt, "samples": samples,
-    }, ensure_ascii=False)
+    }
+    # 确保输出合法 JSON（无 NaN/Infinity）
+    return json.dumps(data, ensure_ascii=False, allow_nan=False)
 
 
-HTML_TEMPLATE = r"""<!DOCTYPE html>
+HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Sample Contribution Tracker</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:#0a0a0f; color:#d0d0dc; font-family:'JetBrains Mono','Fira Code','SF Mono','Consolas',monospace; font-size:12px; }
-  .wrap { max-width:1260px; margin:0 auto; padding:20px 24px; }
-  h1 { font-size:20px; font-weight:800; color:#e0e0ef; letter-spacing:-0.5px; }
-  .subtitle { font-size:11px; color:#555; margin-left:16px; }
-  .header { display:flex; align-items:baseline; gap:8px; margin-bottom:20px; }
-  .charts { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:20px; }
-  .card { background:#16161e; border-radius:8px; padding:18px; }
-  .card-title { font-size:12px; font-weight:700; color:#8888a0; margin-bottom:10px; }
-  .traj-section { display:none; margin-bottom:20px; }
-  .traj-section.active { display:block; }
-  .traj-header { display:flex; align-items:center; gap:12px; margin-bottom:14px; }
-  .traj-name { font-size:14px; font-weight:700; color:#e0e0e8; }
-  .traj-meta { font-size:11px; color:#666; }
-  .traj-charts { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
-  .controls { display:flex; gap:10px; margin-bottom:12px; flex-wrap:wrap; align-items:center; }
-  select,input[type=text] { background:#1e1e2a; color:#ccc; border:1px solid #333; border-radius:4px; padding:6px 10px; font-size:12px; font-family:inherit; outline:none; }
-  input[type=text] { flex:1; min-width:180px; }
-  .page-info { font-size:11px; color:#555; margin-left:auto; }
-  table { width:100%; border-collapse:collapse; }
-  th { padding:8px 10px; text-align:left; font-size:10px; font-weight:700; color:#555; text-transform:uppercase; letter-spacing:1px; border-bottom:1px solid #222; position:sticky; top:0; background:#16161e; cursor:pointer; user-select:none; }
-  th:hover { color:#aaa; }
-  td { padding:6px 10px; font-size:12px; color:#c0c0cc; border-bottom:1px solid #1a1a24; font-variant-numeric:tabular-nums; }
-  tr.row { cursor:pointer; transition:background .12s; }
-  tr.row:hover { background:#1a1a28; }
-  tr.row.selected { background:#1e1e3a; }
-  .tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:10px; font-weight:700; color:#fff; letter-spacing:.5px; white-space:nowrap; }
-  .tag-harmful_suspect { background:#ef4444; }
-  .tag-hard { background:#f59e0b; }
-  .tag-high_influence { background:#8b5cf6; }
-  .tag-normal { background:#4b5563; }
-  .tag-easy_redundant { background:#22c55e; }
-  .neg { color:#ef4444; }
-  .pos { color:#22c55e; }
-  .dim { color:#444; }
-  .pager { display:flex; justify-content:center; gap:6px; margin-top:12px; }
-  .btn { background:#1e1e2a; color:#aaa; border:1px solid #333; border-radius:4px; padding:5px 14px; font-size:11px; cursor:pointer; font-family:inherit; }
-  .btn:disabled { opacity:.3; cursor:default; }
-  .hint { font-size:11px; color:#444; margin-bottom:8px; }
-  .table-wrap { max-height:460px; overflow:auto; }
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#d0d0dc;font-family:'JetBrains Mono','Fira Code','Consolas',monospace;font-size:12px}
+.wrap{max-width:1260px;margin:0 auto;padding:20px 24px}
+h1{font-size:20px;font-weight:800;color:#e0e0ef}
+.sub{font-size:11px;color:#555;margin-left:16px}
+.hdr{display:flex;align-items:baseline;gap:8px;margin-bottom:20px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
+.cd{background:#16161e;border-radius:8px;padding:18px}
+.ct{font-size:12px;font-weight:700;color:#8888a0;margin-bottom:10px}
+#trajSec{display:none;margin-bottom:20px}
+.th{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+.tn{font-size:14px;font-weight:700;color:#e0e0e8}
+.tm{font-size:11px;color:#666}
+.ctrls{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
+select,input[type=text]{background:#1e1e2a;color:#ccc;border:1px solid #333;border-radius:4px;padding:6px 10px;font-size:12px;font-family:inherit;outline:none}
+input[type=text]{flex:1;min-width:180px}
+.pi{font-size:11px;color:#555;margin-left:auto}
+table{width:100%;border-collapse:collapse}
+thead th{padding:8px 10px;text-align:left;font-size:10px;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid #222;position:sticky;top:0;background:#16161e;cursor:pointer}
+thead th:hover{color:#aaa}
+td{padding:6px 10px;font-size:12px;color:#c0c0cc;border-bottom:1px solid #1a1a24;font-variant-numeric:tabular-nums}
+tr.r{cursor:pointer;transition:background .12s}
+tr.r:hover{background:#1a1a28}
+tr.r.sel{background:#1e1e3a}
+.tg{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;color:#fff;letter-spacing:.5px;white-space:nowrap}
+.tg-harmful_suspect{background:#ef4444}.tg-hard{background:#f59e0b}.tg-high_influence{background:#8b5cf6}.tg-normal{background:#4b5563}.tg-easy_redundant{background:#22c55e}
+.neg{color:#ef4444}.pos{color:#22c55e}.dim{color:#444}
+.pgr{display:flex;justify-content:center;gap:6px;margin-top:12px}
+.btn{background:#1e1e2a;color:#aaa;border:1px solid #333;border-radius:4px;padding:5px 14px;font-size:11px;cursor:pointer;font-family:inherit}
+.btn:disabled{opacity:.3;cursor:default}
+.hint{font-size:11px;color:#444;margin-bottom:8px}
+.tw{max-height:460px;overflow:auto}
+#errBox{display:none;background:#3b1111;border:1px solid #ef4444;color:#fca5a5;padding:12px 16px;border-radius:6px;margin-bottom:16px;font-size:12px;white-space:pre-wrap}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="header">
-    <h1>Sample Contribution Tracker</h1>
-    <span class="subtitle" id="subtitle"></span>
-  </div>
-  <div class="charts">
-    <div class="card"><div class="card-title">标签分布（全量）</div><canvas id="tagChart" height="200"></canvas></div>
-    <div class="card"><div class="card-title">Grad Norm vs Align（前 3000）</div><canvas id="scatterChart" height="200"></canvas></div>
-  </div>
-  <div class="traj-section" id="trajSection">
-    <div class="card">
-      <div class="traj-header">
-        <span id="trajTag"></span>
-        <span class="traj-name" id="trajName"></span>
-        <span class="traj-meta" id="trajMeta"></span>
-      </div>
-      <div class="traj-charts">
-        <div><div class="card-title">Gradient Norm（越高=越难）</div><canvas id="gnChart" height="180"></canvas></div>
-        <div><div class="card-title">Alignment（负=逆共识=有害嫌疑）</div><canvas id="alChart" height="180"></canvas></div>
-      </div>
-    </div>
-  </div>
-  <div class="hint">👆 点击表格中的样本查看梯度随 epoch 的变化轨迹</div>
-  <div class="card">
-    <div class="controls">
-      <select id="tagFilter"><option value="all">全部标签</option></select>
-      <select id="sortKey">
-        <option value="si">Self Influence ↓</option>
-        <option value="mgn">Grad Norm ↓</option>
-        <option value="ma_desc">Align ↑</option>
-        <option value="ma_asc">Align ↓（最负）</option>
-        <option value="fna">负对齐占比 ↓</option>
-        <option value="fe">遗忘次数 ↓</option>
-      </select>
-      <input type="text" id="searchBox" placeholder="搜索 utt-id / sample id ...">
-      <span class="page-info" id="pageInfo"></span>
-    </div>
-    <div class="table-wrap"><table><thead id="thead"></thead><tbody id="tbody"></tbody></table></div>
-    <div class="pager">
-      <button class="btn" id="prevBtn" onclick="goPrev()">← 上一页</button>
-      <button class="btn" id="nextBtn" onclick="goNext()">下一页 →</button>
-    </div>
+<div id="errBox"></div>
+<div class="hdr"><h1>Sample Contribution Tracker</h1><span class="sub" id="sub"></span></div>
+<div class="row2">
+  <div class="cd"><div class="ct">标签分布（全量）</div><canvas id="cTag" height="200"></canvas></div>
+  <div class="cd"><div class="ct">Grad Norm vs Align（前 3000）</div><canvas id="cScat" height="200"></canvas></div>
+</div>
+<div id="trajSec" class="cd">
+  <div class="th"><span id="tTag"></span><span class="tn" id="tName"></span><span class="tm" id="tMeta"></span></div>
+  <div class="row2">
+    <div><div class="ct">Gradient Norm（越高=越难）</div><canvas id="cGn" height="180"></canvas></div>
+    <div><div class="ct">Alignment（负=逆共识=有害嫌疑）</div><canvas id="cAl" height="180"></canvas></div>
   </div>
 </div>
+<div class="hint">点击表格中的样本查看梯度随 epoch 的变化轨迹</div>
+<div class="cd">
+  <div class="ctrls">
+    <select id="fTag"><option value="all">全部标签</option></select>
+    <select id="fSort">
+      <option value="si">Self Influence</option>
+      <option value="mgn">Grad Norm</option>
+      <option value="ma_desc">Align (高→低)</option>
+      <option value="ma_asc">Align (低→高)</option>
+      <option value="fna">负对齐占比</option>
+      <option value="fe">遗忘次数</option>
+    </select>
+    <input type="text" id="fQ" placeholder="搜索 utt-id / sample id ...">
+    <span class="pi" id="pInfo"></span>
+  </div>
+  <div class="tw"><table><thead id="thd"></thead><tbody id="tbd"></tbody></table></div>
+  <div class="pgr"><button class="btn" id="bPrev" onclick="pPrev()">← 上一页</button><button class="btn" id="bNext" onclick="pNext()">下一页 →</button></div>
+</div>
+</div>
 <script>
+try {
 const DATA = __DATA_PLACEHOLDER__;
-const TAG_COLORS = {harmful_suspect:"#ef4444",hard:"#f59e0b",high_influence:"#8b5cf6",normal:"#6b7280",easy_redundant:"#22c55e"};
-const TAG_LABELS = {harmful_suspect:"有害嫌疑",hard:"关键难样本",high_influence:"高影响力",normal:"正常",easy_redundant:"冗余易样本"};
-const PAGE_SIZE = 50;
-let filtered = [], page = 0, selectedId = null, gnChartObj = null, alChartObj = null;
+const TC={harmful_suspect:"#ef4444",hard:"#f59e0b",high_influence:"#8b5cf6",normal:"#6b7280",easy_redundant:"#22c55e"};
+const TL={harmful_suspect:"有害嫌疑",hard:"关键难样本",high_influence:"高影响力",normal:"正常",easy_redundant:"冗余易样本"};
+const PS=50;
+let filt=[],pg=0,selId=null,gC=null,aC=null;
+document.getElementById("sub").textContent=DATA.total.toLocaleString()+" total · "+DATA.exported.toLocaleString()+" exported · "+DATA.epochs.length+" epochs";
 
-document.getElementById("subtitle").textContent =
-  `${DATA.total.toLocaleString()} total · ${DATA.exported.toLocaleString()} exported · ${DATA.epochs.length} epochs`;
+// 标签图
+var tgs=Object.entries(DATA.tag_counts).sort(function(a,b){return b[1]-a[1]});
+new Chart(document.getElementById("cTag"),{type:"bar",data:{labels:tgs.map(function(t){return TL[t[0]]||t[0]}),datasets:[{data:tgs.map(function(t){return t[1]}),backgroundColor:tgs.map(function(t){return TC[t[0]]||"#666"}),borderRadius:4}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}},y:{ticks:{color:"#999",font:{size:11}},grid:{display:false}}}}});
 
-// --- 标签分布图 ---
-{
-  const tags = Object.entries(DATA.tag_counts).sort((a,b)=>b[1]-a[1]);
-  new Chart(document.getElementById("tagChart"), {
-    type:"bar",
-    data:{labels:tags.map(t=>TAG_LABELS[t[0]]||t[0]),datasets:[{data:tags.map(t=>t[1]),backgroundColor:tags.map(t=>TAG_COLORS[t[0]]||"#666"),borderRadius:4}]},
-    options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>c.raw.toLocaleString()}}},scales:{x:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}},y:{ticks:{color:"#999",font:{size:11}},grid:{display:false}}}}
-  });
+// 散点图
+var pts=DATA.samples.slice(0,3000);
+var byT={};
+pts.forEach(function(s){(byT[s.tag]=byT[s.tag]||[]).push({x:s.mgn,y:s.ma})});
+new Chart(document.getElementById("cScat"),{type:"scatter",data:{datasets:Object.entries(byT).map(function(e){return{label:TL[e[0]]||e[0],data:e[1],backgroundColor:TC[e[0]]||"#666",pointRadius:2}})},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#888",font:{size:10},boxWidth:10}}},scales:{x:{title:{display:true,text:"grad_norm",color:"#555",font:{size:10}},ticks:{color:"#555",font:{size:9}},grid:{color:"#1a1a24"}},y:{title:{display:true,text:"align",color:"#555",font:{size:10}},ticks:{color:"#555",font:{size:9}},grid:{color:"#1a1a24"}}}}});
+
+// 标签筛选器
+var fTag=document.getElementById("fTag");
+Object.keys(TC).forEach(function(t){var o=document.createElement("option");o.value=t;o.textContent=(TL[t]||t)+" ("+(DATA.tag_counts[t]||0)+")";fTag.appendChild(o)});
+
+// 表头
+var cols=DATA.has_utt?[["utt","UTT-ID"],["id","ID"],["tag","标签"],["si","Self Inf"],["mgn","Grad Norm"],["ma","Align"],["fna","负对齐%"],["fe","遗忘"],["fc","末轮"]]:[["id","ID"],["tag","标签"],["si","Self Inf"],["mgn","Grad Norm"],["ma","Align"],["fna","负对齐%"],["fe","遗忘"],["fc","末轮"]];
+document.getElementById("thd").innerHTML="<tr>"+cols.map(function(c){return"<th>"+c[1]+"</th>"}).join("")+"</tr>";
+
+function applyF(){
+  var tag=fTag.value,q=document.getElementById("fQ").value.trim().toLowerCase(),sk=document.getElementById("fSort").value;
+  var rows=DATA.samples;
+  if(tag!=="all") rows=rows.filter(function(s){return s.tag===tag});
+  if(q) rows=rows.filter(function(s){return(s.utt||s.id).toLowerCase().indexOf(q)>=0||s.id.indexOf(q)>=0});
+  rows=rows.slice();
+  if(sk==="ma_asc") rows.sort(function(a,b){return a.ma-b.ma});
+  else if(sk==="ma_desc") rows.sort(function(a,b){return b.ma-a.ma});
+  else rows.sort(function(a,b){return(b[sk]||0)-(a[sk]||0)});
+  filt=rows;pg=0;render()
 }
 
-// --- 散点图 ---
-{
-  const pts = DATA.samples.slice(0,3000);
-  const byTag = {};
-  pts.forEach(s => { (byTag[s.tag] = byTag[s.tag]||[]).push({x:s.mgn,y:s.ma}); });
-  new Chart(document.getElementById("scatterChart"), {
-    type:"scatter",
-    data:{datasets:Object.entries(byTag).map(([tag,d])=>({label:TAG_LABELS[tag]||tag,data:d,backgroundColor:TAG_COLORS[tag]||"#666",pointRadius:2}))},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#888",font:{size:10},boxWidth:10}}},scales:{x:{title:{display:true,text:"grad_norm",color:"#555",font:{size:10}},ticks:{color:"#555",font:{size:9}},grid:{color:"#1a1a24"}},y:{title:{display:true,text:"align",color:"#555",font:{size:10}},ticks:{color:"#555",font:{size:9}},grid:{color:"#1a1a24"}}}}
-  });
+function render(){
+  var tp=Math.max(1,Math.ceil(filt.length/PS));
+  document.getElementById("pInfo").textContent=filt.length.toLocaleString()+" 条 · 第 "+(pg+1)+"/"+tp+" 页";
+  document.getElementById("bPrev").disabled=pg===0;
+  document.getElementById("bNext").disabled=pg>=tp-1;
+  var sl=filt.slice(pg*PS,(pg+1)*PS);
+  var tb=document.getElementById("tbd");tb.innerHTML="";
+  sl.forEach(function(s){
+    var tr=document.createElement("tr");
+    tr.className="r"+(s.id===selId?" sel":"");
+    tr.onclick=function(){selSample(s)};
+    var c=[];
+    if(DATA.has_utt) c.push('<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(s.utt||"")+'">'+(s.utt||"")+"</td>");
+    c.push('<td style="color:#888">'+s.id+"</td>");
+    c.push('<td><span class="tg tg-'+s.tag+'">'+(TL[s.tag]||s.tag)+"</span></td>");
+    c.push("<td>"+(s.si!=null?s.si.toFixed(1):"—")+"</td>");
+    c.push("<td>"+(s.mgn!=null?s.mgn.toFixed(4):"—")+"</td>");
+    c.push('<td class="'+(s.ma<0?"neg":"pos")+'">'+(s.ma!=null?s.ma.toFixed(4):"—")+"</td>");
+    c.push("<td>"+((s.fna!=null?(s.fna*100).toFixed(0):"-"))+"%</td>");
+    c.push('<td style="color:'+(s.fe>=2?"#f59e0b":"#666")+'">'+(s.fe!=null?s.fe:"—")+"</td>");
+    c.push('<td class="'+(s.fc===1?"pos":s.fc===0?"neg":"dim")+'">'+(s.fc===1?"✓":s.fc===0?"✗":"—")+"</td>");
+    tr.innerHTML=c.join("");
+    tb.appendChild(tr)
+  })
 }
 
-// --- 表格 ---
-const tagFilter = document.getElementById("tagFilter");
-Object.entries(TAG_COLORS).forEach(([t])=>{
-  const opt = document.createElement("option");
-  opt.value=t; opt.textContent=`${TAG_LABELS[t]} (${DATA.tag_counts[t]||0})`;
-  tagFilter.appendChild(opt);
-});
-const cols = DATA.has_utt
-  ? [{k:"utt",l:"UTT-ID"},{k:"id",l:"ID"},{k:"tag",l:"标签"},{k:"si",l:"Self Inf"},{k:"mgn",l:"Grad Norm"},{k:"ma",l:"Align"},{k:"fna",l:"负对齐%"},{k:"fe",l:"遗忘"},{k:"fc",l:"末轮正确"}]
-  : [{k:"id",l:"ID"},{k:"tag",l:"标签"},{k:"si",l:"Self Inf"},{k:"mgn",l:"Grad Norm"},{k:"ma",l:"Align"},{k:"fna",l:"负对齐%"},{k:"fe",l:"遗忘"},{k:"fc",l:"末轮正确"}];
-document.getElementById("thead").innerHTML = "<tr>" + cols.map(c=>`<th>${c.l}</th>`).join("") + "</tr>";
-
-function applyFilter() {
-  const tag = tagFilter.value;
-  const q = document.getElementById("searchBox").value.trim().toLowerCase();
-  const sk = document.getElementById("sortKey").value;
-  let rows = DATA.samples;
-  if (tag !== "all") rows = rows.filter(s => s.tag === tag);
-  if (q) rows = rows.filter(s => (s.utt||s.id).toLowerCase().includes(q) || s.id.includes(q));
-  rows = [...rows];
-  if (sk === "ma_asc") rows.sort((a,b) => a.ma - b.ma);
-  else if (sk === "ma_desc") rows.sort((a,b) => b.ma - a.ma);
-  else rows.sort((a,b) => (b[sk]||0) - (a[sk]||0));
-  filtered = rows; page = 0; render();
-}
-
-function render() {
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  document.getElementById("pageInfo").textContent = `${filtered.length.toLocaleString()} 条 · 第 ${page+1}/${totalPages} 页`;
-  document.getElementById("prevBtn").disabled = page === 0;
-  document.getElementById("nextBtn").disabled = page >= totalPages - 1;
-  const slice = filtered.slice(page * PAGE_SIZE, (page+1) * PAGE_SIZE);
-  const tbody = document.getElementById("tbody");
-  tbody.innerHTML = "";
-  slice.forEach(s => {
-    const tr = document.createElement("tr");
-    tr.className = "row" + (s.id === selectedId ? " selected" : "");
-    tr.onclick = () => selectSample(s);
-    const cells = [];
-    if (DATA.has_utt) cells.push(`<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${s.utt||''}">${s.utt||''}</td>`);
-    cells.push(`<td style="color:#888">${s.id}</td>`);
-    cells.push(`<td><span class="tag tag-${s.tag}">${TAG_LABELS[s.tag]||s.tag}</span></td>`);
-    cells.push(`<td>${s.si.toFixed(1)}</td>`);
-    cells.push(`<td>${s.mgn.toFixed(4)}</td>`);
-    cells.push(`<td class="${s.ma<0?'neg':'pos'}">${s.ma.toFixed(4)}</td>`);
-    cells.push(`<td>${(s.fna*100).toFixed(0)}%</td>`);
-    cells.push(`<td style="color:${s.fe>=2?'#f59e0b':'#666'}">${s.fe}</td>`);
-    cells.push(`<td class="${s.fc===1?'pos':s.fc===0?'neg':'dim'}">${s.fc===1?'✓':s.fc===0?'✗':'—'}</td>`);
-    tr.innerHTML = cells.join("");
-    tbody.appendChild(tr);
-  });
-}
-
-function selectSample(s) {
-  selectedId = s.id;
-  const sec = document.getElementById("trajSection");
-  sec.className = "traj-section active";
-  document.getElementById("trajTag").innerHTML = `<span class="tag tag-${s.tag}">${TAG_LABELS[s.tag]||s.tag}</span>`;
-  document.getElementById("trajName").textContent = s.utt || s.id;
-  document.getElementById("trajMeta").textContent = `SI=${s.si}  GN=${s.mgn}  Align=${s.ma}  Forget=${s.fe}`;
-  const labels = DATA.epochs.map(e => "ep"+e);
-  if (gnChartObj) gnChartObj.destroy();
-  if (alChartObj) alChartObj.destroy();
-  gnChartObj = new Chart(document.getElementById("gnChart"), {
-    type:"line",
-    data:{labels, datasets:[{label:"grad_norm",data:s.tgn,borderColor:"#f59e0b",backgroundColor:"#f59e0b",pointRadius:4,tension:.2}]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}},y:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}}}}
-  });
-  alChartObj = new Chart(document.getElementById("alChart"), {
-    type:"line",
-    data:{labels, datasets:[
-      {label:"align",data:s.tal,borderColor:"#3b82f6",backgroundColor:"#3b82f6",pointRadius:4,tension:.2},
-      {label:"零线",data:DATA.epochs.map(()=>0),borderColor:"#ef4444",borderDash:[4,4],pointRadius:0}
-    ]},
-    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}},y:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}}}}
-  });
+function selSample(s){
+  selId=s.id;
+  var sec=document.getElementById("trajSec");sec.style.display="block";
+  document.getElementById("tTag").innerHTML='<span class="tg tg-'+s.tag+'">'+(TL[s.tag]||s.tag)+"</span>";
+  document.getElementById("tName").textContent=s.utt||s.id;
+  document.getElementById("tMeta").textContent="SI="+s.si+"  GN="+s.mgn+"  Align="+s.ma+"  Forget="+s.fe;
+  var lb=DATA.epochs.map(function(e){return"ep"+e});
+  if(gC)gC.destroy();if(aC)aC.destroy();
+  gC=new Chart(document.getElementById("cGn"),{type:"line",data:{labels:lb,datasets:[{label:"grad_norm",data:s.tgn,borderColor:"#f59e0b",backgroundColor:"#f59e0b",pointRadius:4,tension:.2,spanGaps:true}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}},y:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}}}}});
+  aC=new Chart(document.getElementById("cAl"),{type:"line",data:{labels:lb,datasets:[{label:"align",data:s.tal,borderColor:"#3b82f6",backgroundColor:"#3b82f6",pointRadius:4,tension:.2,spanGaps:true},{label:"零线",data:DATA.epochs.map(function(){return 0}),borderColor:"#ef4444",borderDash:[4,4],pointRadius:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}},y:{ticks:{color:"#555",font:{size:10}},grid:{color:"#1a1a24"}}}}});
   render();
-  sec.scrollIntoView({behavior:"smooth",block:"start"});
+  sec.scrollIntoView({behavior:"smooth",block:"start"})
 }
 
-function goPrev() { if(page>0){page--;render();} }
-function goNext() { const tp=Math.ceil(filtered.length/PAGE_SIZE); if(page<tp-1){page++;render();} }
+function pPrev(){if(pg>0){pg--;render()}}
+function pNext(){var tp=Math.ceil(filt.length/PS);if(pg<tp-1){pg++;render()}}
 
-tagFilter.addEventListener("change", applyFilter);
-document.getElementById("sortKey").addEventListener("change", applyFilter);
-document.getElementById("searchBox").addEventListener("input", applyFilter);
-applyFilter();
+fTag.addEventListener("change",applyF);
+document.getElementById("fSort").addEventListener("change",applyF);
+document.getElementById("fQ").addEventListener("input",applyF);
+applyF();
+
+} catch(err) {
+  var box=document.getElementById("errBox");
+  box.style.display="block";
+  box.textContent="JavaScript 错误:\\n"+err.message+"\\n\\n"+err.stack;
+}
 </script>
 </body>
 </html>"""
@@ -307,12 +275,12 @@ def main():
 
     print("[gen_viz] 收集数据 ...")
     data_json = collect_data(args.contrib_dir, args.summary_csv, args.max_rows)
+    print(f"[gen_viz] JSON 大小: {len(data_json)/1024/1024:.1f} MB")
     html = HTML_TEMPLATE.replace("__DATA_PLACEHOLDER__", data_json)
     with open(out, "w", encoding="utf-8") as f:
         f.write(html)
     size_mb = os.path.getsize(out) / 1024 / 1024
     print(f"[gen_viz] 已生成 {out}  ({size_mb:.1f} MB)")
-    print(f"[gen_viz] 用浏览器打开即可，无需任何服务器。")
 
 
 if __name__ == "__main__":
