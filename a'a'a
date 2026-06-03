@@ -1,0 +1,7 @@
+python3 -c "
+from sample_tracker import SampleContributionTracker
+import os
+d = os.path.dirname('$(find model_exp/ -name contrib_epoch000.npz)')
+print('目录:', d)
+SampleContributionTracker.summarize(d, os.path.join(d, 'contrib_summary.csv'))
+"
