@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-export_html_v3.py —— 工业级大样本贡献度分析可视化工具（智能路径与自适应对齐版）
+export_html_diag.py —— 工业级大样本贡献度分析可视化工具（带全链路诊断日志）
+优化策略：骨架 HTML + 外挂二进制数据包 (.bin)，利用前端零拷贝流式加载解决卡死问题。
 """
 
 import argparse
@@ -9,7 +10,6 @@ import csv
 import glob
 import os
 import sys
-import re
 import numpy as np
 
 # 标签映射
@@ -21,89 +21,87 @@ def fv(row, key):
 
 def main():
     print("\n" + "="*60)
-    print("🚀 [START] V3 智能自适应修复版可视化打包工具启动...")
+    print("🚀 [START] 诊断与数据打包脚本启动...")
     print("="*60)
     
-    ap = argparse.ArgumentParser(description="高性能样本贡献度可视化分析 HTML 生成器 (V3)")
-    ap.add_argument("--contrib", required=True, help="包含 epoch*.npz 和 summary CSV 的目录路径")
-    ap.add_argument("--egs",     default="", help="可选：外部文本映射文件")
+    ap = argparse.ArgumentParser(description="高性能样本贡献度可视化分析 HTML 生成器（诊断版）")
+    ap.add_argument("--contrib", required=True, help="包含 contrib_epoch*.npz 和 summary CSV 的目录路径")
+    ap.add_argument("--egs",     default="", help="可选：包含原始 utt_id 映射的 train.csv 或 text 文件路径")
     ap.add_argument("--summary", default="", help="可选：明确指定 summary CSV 的路径")
     ap.add_argument("--output",  default="contrib_viz.html", help="输出的 HTML 文件名")
     args = ap.parse_args()
 
-    # 1. 定位并读取 Summary CSV
+    # 打印环境诊断信息
+    print(f"📍 命令行当前工作路径 (CWD): {os.getcwd()}")
+    print(f"📁 输入的目标数据目录 (--contrib): {os.path.abspath(args.contrib)}")
+    print(f"📄 预设的网页输出名称 (--output): {args.output}")
+
+    # 1. 寻找并加载 Summary CSV
     sp = args.summary
     if not sp:
         for nm in ("contrib_summary_with_uttid.csv", "contrib_summary.csv"):
             p = os.path.join(args.contrib, nm)
-            if os.path.exists(p): sp = p; break
+            if os.path.exists(p): 
+                sp = p
+                break
     
+    print(f"🔍 [步骤 1/4] 正在定位 Summary CSV 配置文件...")
+    print(f"      寻找到的 CSV 路径: {sp}")
     if not sp or not os.path.exists(sp):
-        # 兜底机制：如果找不到上面两个特定名字，直接模糊搜索当前目录下的任意 csv
-        csv_files = glob.glob(os.path.join(args.contrib, "*.csv"))
-        if csv_files: sp = csv_files[0]
-
-    if not sp or not os.path.exists(sp):
-        print(f"❌ 严重错误: 在指定目录 [{args.contrib}] 下找不到任何 summary CSV 配置文件！")
+        print(f"❌ 严重错误: 在指定目录下找不到任何 summary CSV 配置文件！")
+        print(f"   请检查该目录下是否存在 'contrib_summary.csv' 或 'contrib_summary_with_uttid.csv'")
         sys.exit(1)
 
-    print(f"🔍 [1/4] 正在解析主配置 CSV: {sp}")
     rows = []
     with open(sp, newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f): rows.append(r)
+        for r in csv.DictReader(f): 
+            rows.append(r)
+    
     n = len(rows)
-    print(f"      成功读取 {n} 条样本。")
+    print(f"      📊 成功读取！共解析出 {n} 行样本配置指标。")
+    if n == 0:
+        print("⚠️ 警告: CSV 文件内容为空或标题行不匹配，无法建立索引，程序安全退出。")
+        sys.exit(0)
 
     id2idx = {r["id"]: i for i, r in enumerate(rows)}
 
-    # 2. 提取 utt_id 映射
-    print("[2/4] 正在建立 sample_id -> utt_id 的文本映射...")
+    # 2. 读取额外映射的 utt-id
+    print("[步骤 2/4] 正在建立 sample_id 到 utt_id 的文本映射...")
     idx2utt = {}
-    
+    if args.egs and os.path.exists(args.egs):
+        print(f"      -> 检测到外挂文本映射文件: {args.egs}")
+        with open(args.egs, encoding="utf-8") as f:
+            first = f.readline()
+            delim = "\t" if "\t" in first else " "
+        with open(args.egs, encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= n: break
+                p = line.strip().split(delim)
+                if p: idx2utt[i] = p[0]
+                
     if rows and "utt_id" in rows[0]:
-        print("      ✅ 检测到 CSV 包含 'utt_id' 列，完美匹配！")
+        print("      -> 直接从 CSV 内部激活 'utt_id' 字段映射。")
         idx2utt = {i: r["utt_id"] for i, r in enumerate(rows) if r.get("utt_id")}
-    else:
-        print("      ℹ️ CSV 中未发现 'utt_id' 列，将默认使用数字 ID 填充展示")
 
-    # 3. 自适应载入各 Epoch 的轨迹数据 (.npz)
-    print("[3/4] 正在扫描并压缩各 Epoch 轨迹矩阵 (.npz) ...")
+    # 3. 载入各 Epoch 的轨迹数据 (.npz)
+    print("[步骤 3/4] 正在扫描并解析各 Epoch 轨迹矩阵 (.npz) ...")
+    search_path = os.path.join(args.contrib, "contrib_epoch*.npz")
+    files = sorted(glob.glob(search_path))
+    print(f"      🔎 检索通配符路径: {search_path}")
+    print(f"      匹配到的轨迹文件 (.npz) 数量: {len(files)} 个")
     
-    # 智能模糊匹配：同时搜寻包含 epoch 的所有 npz 文件
-    all_files = glob.glob(os.path.join(args.contrib, "*epoch*.npz"))
-    
-    # 正则表达式：专门用来提取文件名里的数字（比如从 contrib_epoch12.npz 或 epoch_12.npz 中提取出 12）
-    epoch_pattern = re.compile(r'epoch_?(\d+)')
-    
-    valid_files_with_ep = []
-    for f in window_files if 'window_files' in locals() else _filter_files(all_files, epoch_pattern):
-        pass
-        
-    # 辅助过滤与提取函数
-    files_with_ep = []
-    for f in all_files:
-        match = epoch_pattern.search(os.path.basename(f))
-        if match:
-            ep_num = int(match.group(1))
-            files_with_ep.append((ep_num, f))
-            
-    # 按 Epoch 数字从小到大严格排序
-    files_with_ep.sort(key=lambda x: x[0])
-    
-    epochs = [x[0] for x in files_with_ep]
-    files = [x[1] for x in files_with_ep]
-    
+    epochs = []
     gn_mat, al_mat = None, None
     gn_min, gn_scale = 0.0, 1.0
     has_traj = len(files) > 0
 
     if has_traj:
         ne = len(files)
-        print(f"      ✅ 智能识别成功！共抓取到 {ne} 个 Epoch 轨迹文件。Epoch 序列: {epochs}")
         gn = np.full((n, ne), np.nan, dtype=np.float32)
         al = np.full((n, ne), np.nan, dtype=np.float32)
-        
         for ei, f in enumerate(files):
+            ep = int(os.path.basename(f)[len("contrib_epoch"):-len(".npz")])
+            epochs.append(ep)
             d = np.load(f, allow_pickle=True)
             ids_str = d["ids"].astype(str)
             try:
@@ -115,21 +113,23 @@ def main():
             gn[idxs[m], ei] = d["grad_norm"][m]
             al[idxs[m], ei] = d["align"][m]
         
+        epochs = sorted(epochs)
         gn_min = float(np.nanmin(gn))
         gn_max = float(np.nanpercentile(gn[~np.isnan(gn)], 99))
         gn_scale = max(gn_max - gn_min, 1e-9)
         
-        gn_q = np.clip((gn - gn_min) / gn_scale * 255, 0, 255).astype(np.uint8)
-        al_q = np.clip((al + 1.0) / 2.0 * 253, 0, 253).astype(np.uint8)
+        gn_q = np.clip((gn - gn_min) / gn_scale * 255, 0, 255)
         gn_q[np.isnan(gn)] = 255
-        al_q[np.isnan(al)] = 245
-        gn_mat = gn_q
-        al_mat = al_q
+        al_q = np.clip((al + 1.0) / 2.0 * 253, 0, 253)
+        al_q[np.isnan(al)] = 254
+        gn_mat = gn_q.astype(np.uint8)
+        al_mat = al_q.astype(np.uint8)
+        print("      ✅ 历史轨迹大矩阵动态压缩完毕。")
     else:
-        print("      ⚠️ 警告: 未在指定目录下扫描到任何包含 'epoch' 关键字的 .npz 轨迹文件！右侧图表将无法渲染。")
+        print("      ℹ️ 提示: 未发现任何 epoch 轨迹文件，系统将自适应退化为纯静态指标模式。")
 
-    # 4. 排序并流式紧凑打包
-    print("[4/4] 正在执行后端流式紧凑打包...")
+    # 4. 后端核心优化：预排序与流式打包
+    print("[步骤 4/4] 正在执行后端预排序与二进制流紧凑打包...")
     si_vals = np.array([fv(r, "self_influence") for r in rows], dtype=np.float64)
     order = np.argsort(-si_vals)
     rows = [rows[i] for i in order]
@@ -143,7 +143,7 @@ def main():
     forget = np.clip([fv(r, "forget_events") for r in rows], -128, 127).astype(np.int8)
     final_co = np.clip([fv(r, "final_correct") for r in rows], -128, 127).astype(np.int8)
 
-    utt_list = [idx2utt.get(int(ids_arr[i]), f"ID-{ids_arr[i]}") for i in range(n)]
+    utt_list = [idx2utt.get(int(ids_arr[i]), str(ids_arr[i])) for i in range(n)]
     utt_bytes = "\n".join(utt_list).encode("utf-8")
     utt_len = len(utt_bytes)
 
@@ -154,8 +154,15 @@ def main():
         gn_final = b""
         al_final = b""
 
-    # 写入二进制文件
+    # ── 开始执行磁盘写入（带物理诊断） ──
+    print("\n💾 [WRITE] 开始请求磁盘写入物理文件...")
+    
     bin_path = os.path.splitext(args.output)[0] + ".bin"
+    abs_bin_path = os.path.abspath(bin_path)
+    abs_html_path = os.path.abspath(args.output)
+    
+    # A. 写入二进制数据包
+    print(f"  ➡️ 正在写入二进制数据包: {abs_bin_path}")
     with open(bin_path, "wb") as fb:
         fb.write(np.array([n, len(epochs), utt_len, 1 if has_traj else 0], dtype=np.int32).tobytes())
         fb.write(np.array([gn_min, gn_scale], dtype=np.float32).tobytes())
@@ -171,186 +178,170 @@ def main():
         fb.write(utt_bytes)
         fb.write(gn_final)
         fb.write(al_final)
+    
+    if os.path.exists(bin_path):
+        print(f"     👍 检查成功！.bin 文件已生成，空间占用: {os.path.getsize(bin_path)/1e6:.2f} MB")
+    else:
+        print(f"     ❌ 严重错误！.bin 文件在写入后未能在操作系统中检测到，请检查磁盘写权限。")
 
-    # 写入安全替换的 HTML 网页
+    # B. 写入骨架 HTML 页面
+    print(f"  ➡️ 正在写入可视化网页骨架: {abs_html_path}")
     bin_filename = os.path.basename(bin_path)
-    
-    # 借用之前的原生 HTML 骨架
-    from main import get_html_skeleton_template if 'get_html_skeleton_template' in globals() else None
-    html_content = _get_html_layout()
-    
-    html_content = html_content.replace("__BIN_FILENAME__", str(bin_filename))
-    html_content = html_content.replace("__EPOCHS_ARRAY__", str(epochs))
-
     with open(args.output, "w", encoding="utf-8") as f:
-        f.write(html_content)
+        f.write(make_skeleton_html(bin_filename, epochs, n))
+        
+    if os.path.exists(args.output):
+        print(f"     👍 检查成功！.html 文件已生成，空间占用: {os.path.getsize(args.output)/1024:.2f} KB")
+    else:
+        print(f"     ❌ 严重错误！.html 网页文件未能成功创建。")
 
-    print(f"\n✨ [SUCCESS] 修复版可视化数据流全套构建成功！")
-    print(f" 📂 网页骨架: {os.path.abspath(args.output)}")
-    print(f" 📦 数据底座: {os.path.abspath(bin_path)} (当前大小: {os.path.getsize(bin_path)/1024/1024:.2f} MB)")
+    print("\n" + "="*60)
+    print("✨ [SUCCESS] 脚本全链路运行完毕！无任何隐藏中断发生。")
+    print("="*60 + "\n")
 
 
-def _get_html_layout():
-    # 承接上文完全隔离的纯前端代码块
-    # 保持完整的 css、js、全中文交互面板
-    return """<!DOCTYPE html>
+def make_skeleton_html(bin_filename, epochs, n):
+    return f"""<!DOCTYPE html>
 <html lang="zh"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sample Contribution Analyzer V3</title>
-<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
-<script src="chart.umd.min.js" onerror="this.src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js'"></script>
+<title>Sample Contribution Analyzer (High Performance)</title>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 <style>
-:root {
-  --bg:#090b11;--surf:#0f1219;--surf2:#141820;--bdr:#1e2333;--bdr2:#252b3d;
-  --tx:#c8d0e0;--mt:#5a658a;--ac:#f59e0b;--harmful:#f87171;--hard:#fb923c;
-  --inf:#818cf8;--easy:#34d399;--mono:'Fira Code',monospace;--sans:'Noto Sans SC',sans-serif;
-}
-*,*::before,*::after { box-sizing:border-box; margin:0; padding:0; }
-html,body { height:100%; background:var(--bg); color:var(--tx); font-family:var(--sans); overflow:hidden; }
-.layout { display:grid; grid-template-columns:460px 1fr; grid-template-rows:56px 1fr; height:100vh; }
-.header { grid-column:1/-1; display:flex; align-items:center; padding:0 20px; gap:14px; border-bottom:1px solid var(--bdr); background:var(--surf); }
-.htitle { font-size:14px; font-weight:700; color:var(--ac); letter-spacing:.05em; font-family:var(--mono); }
-.hmeta { font-size:11px; color:var(--mt); font-family:var(--mono); }
-.hstatus { margin-left:auto; font-size:11px; color:var(--ac); font-family:var(--mono); padding:2px 8px; border:1px solid var(--bdr2); border-radius:2px; }
-.panel-left { border-right:1px solid var(--bdr); display:flex; flex-direction:column; background:var(--surf); overflow:hidden; }
-.controls { padding:12px; border-bottom:1px solid var(--bdr); display:flex; flex-direction:column; gap:8px; }
-.controls input, .controls select { width:100%; padding:7px 10px; background:var(--bg); border:1px solid var(--bdr2); color:var(--tx); font-family:var(--sans); font-size:12px; outline:none; border-radius:3px; }
-.controls input:focus, .controls select:focus { border-color:var(--ac); }
-.crow { display:flex; gap:6px; } .crow select { flex:1; }
-.vlist-header { display:grid; grid-template-columns:1fr 60px 60px 95px; padding:8px 12px; font-size:11px; font-weight:700; color:var(--mt); border-bottom:1px solid var(--bdr2); background:var(--bg); }
-.vlist-header div:nth-child(2), .vlist-header div:nth-child(3) { text-align:right; }
-.vlist { flex:1; overflow-y:auto; position:relative; background:var(--surf); }
-.vlist::-webkit-scrollbar { width:5px; }
-.vlist::-webkit-scrollbar-thumb { background:var(--bdr2); border-radius:3px; }
-.srow { display:grid; grid-template-columns:1fr 60px 60px 95px; align-items:center; padding:0 12px; cursor:pointer; gap:6px; border-bottom:1px solid var(--bdr); height:36px; position:absolute; width:100%; transition:background .1s; }
-.srow:hover { background:var(--surf2); }
-.srow.sel { background:rgba(245,158,11,.09); border-left:3px solid var(--ac); padding-left:9px; }
-.sid { font-family:var(--mono); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.sgn, .sal { text-align:right; font-size:11px; font-family:var(--mono); color:var(--tx); }
-.sal.pos { color:var(--easy); } .sal.neg { color:var(--harmful); }
-.col-tag { justify-self:end; }
-.tag-badge { display:inline-flex; align-items:center; padding:2px 6px; border-radius:2px; font-size:10px; font-weight:500; border:1px solid; scale:0.95; }
-.tag-badge.harmful_suspect { color:var(--harmful); border-color:var(--harmful); background:rgba(248,113,113,.06); }
-.tag-badge.hard { color:var(--hard); border-color:var(--hard); background:rgba(251,146,60,.06); }
-.tag-badge.high_influence { color:var(--inf); border-color:var(--inf); background:rgba(129,140,248,.06); }
-.tag-badge.easy_redundant { color:var(--easy); border-color:var(--easy); background:rgba(52,211,153,.06); }
-.tag-badge.normal { color:var(--mt); border-color:var(--bdr2); }
-.pagination { padding:8px 12px; border-top:1px solid var(--bdr); display:flex; align-items:center; gap:8px; font-family:var(--mono); font-size:11px; color:var(--mt); }
-.pagination button { padding:3px 12px; background:var(--surf2); border:1px solid var(--bdr2); color:var(--tx); cursor:pointer; border-radius:2px; }
-.pagination button:disabled { opacity:.3; cursor:default; }
-.pagination button:not(:disabled):hover { border-color:var(--ac); color:var(--ac); }
-.pginfo { flex:1; text-align:center; }
-.panel-right { display:flex; flex-direction:column; overflow:hidden; background:var(--bg); }
-.chart-hdr { padding:16px 20px; border-bottom:1px solid var(--bdr); background:var(--surf); display:flex; align-items:flex-start; gap:16px; }
-.ctitle { font-family:var(--mono); font-size:14px; color:var(--ac); font-weight:700; }
-.csub { font-size:11px; color:var(--mt); margin-top:4px; }
-.stat-grid { margin-left:auto; display:flex; gap:16px; }
-.stat-item { text-align:right; background:var(--surf2); padding:6px 12px; border-radius:4px; border:1px solid var(--bdr); min-width:90px; }
-.slbl { font-size:9px; color:var(--mt); text-transform:uppercase; font-weight:600; letter-spacing:.02em; }
-.sval { font-size:14px; font-family:var(--mono); font-weight:600; color:var(--tx); margin-top:1px; }
-.chart-area { flex:1; padding:20px; display:flex; flex-direction:column; gap:16px; overflow:hidden; }
-.chart-wrap { flex:1; position:relative; min-height:0; background:var(--surf); border:1px solid var(--bdr); border-radius:6px; padding:10px; }
-.chart-wrap canvas { position:absolute; inset:0; }
-.legend { display:flex; gap:20px; font-size:11px; color:var(--mt); justify-content:center; }
-.li { display:flex; align-items:center; gap:6px; }
-.ld { width:8px; height:8px; border-radius:50%; }
-.ld.gn { background:var(--ac); } .ld.al { background:var(--inf); }
-.placeholder { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; color:var(--mt); }
-.phi { font-size:42px; opacity:.2; }
-.expl-container { background:var(--surf); border:1px solid var(--bdr); border-radius:6px; padding:14px; display:flex; flex-direction:column; gap:8px; }
-.expl-title { font-size:12px; font-weight:700; color:var(--ac); border-bottom:1px solid var(--bdr2); padding-bottom:4px; margin-bottom:2px; }
-.expl-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:10px; font-size:11.5px; }
-.expl-item { line-height:1.4; } .eb { color:var(--tx); font-weight:600; }
+:root{{--bg:#090b11;--surf:#0f1219;--surf2:#141820;--bdr:#1e2333;--bdr2:#252b3d;
+  --tx:#c8d0e0;--mt:#4a5270;--ac:#f59e0b;--harmful:#f87171;--hard:#fb923c;
+  --inf:#818cf8;--easy:#34d399;--mono:'Fira Code',monospace;--sans:'DM Sans',sans-serif;}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0;}}
+html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sans);overflow:hidden;}}
+body::before{{content:'';position:fixed;inset:0;pointer-events:none;
+  background-image:linear-gradient(var(--bdr) 1px,transparent 1px),linear-gradient(90deg,var(--bdr) 1px,transparent 1px);
+  background-size:40px 40px;opacity:.22;}}
+.layout{{position:relative;z-index:1;display:grid;grid-template-columns:420px 1fr;grid-template-rows:56px 1fr;height:100vh;}}
+.header{{grid-column:1/-1;display:flex;align-items:center;padding:0 20px;gap:14px;border-bottom:1px solid var(--bdr);background:var(--surf);font-family:var(--mono);}}
+.htitle{{font-size:14px;font-weight:600;color:var(--ac);letter-spacing:.05em;}}
+.hmeta{{font-size:11px;color:var(--mt);}}
+.hbadges{{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;}}
+.hstatus{{font-size:11px;color:var(--ac);font-family:var(--mono);padding:2px 8px;border:1px solid var(--bdr2);border-radius:2px;animation:blink 1.5s infinite;}}
+@keyframes blink{{0%,100%{{opacity:1;}}50%{{opacity:0.4;}}}}
+.tag-badge{{display:inline-flex;align-items:center;padding:2px 7px;border-radius:2px;font-size:10px;font-family:var(--mono);font-weight:500;border:1px solid;}}
+.tag-badge.harmful_suspect{{color:var(--harmful);border-color:var(--harmful);background:rgba(248,113,113,.08);}}
+.tag-badge.hard{{color:var(--hard);border-color:var(--hard);background:rgba(251,146,60,.08);}}
+.tag-badge.high_influence{{color:var(--inf);border-color:var(--inf);background:rgba(129,140,248,.08);}}
+.tag-badge.easy_redundant{{color:var(--easy);border-color:var(--easy);background:rgba(52,211,153,.08);}}
+.tag-badge.normal{{color:var(--mt);border-color:var(--bdr2);}}
+.panel-left{{border-right:1px solid var(--bdr);display:flex;flex-direction:column;background:var(--surf);overflow:hidden;}}
+.controls{{padding:10px 12px;border-bottom:1px solid var(--bdr);display:flex;flex-direction:column;gap:8px;}}
+.controls input,.controls select{{width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--bdr2);color:var(--tx);font-family:var(--mono);font-size:11px;outline:none;border-radius:2px;}}
+.controls input:focus,.controls select:focus{{border-color:var(--ac);}}
+.crow{{display:flex;gap:6px;}}.crow select{{flex:1;}}
+.vlist{{flex:1;overflow-y:auto;position:relative;}}
+.vlist::-webkit-scrollbar{{width:4px;}}
+.vlist::-webkit-scrollbar-thumb{{background:var(--bdr2);border-radius:2px;}}
+.srow{{display:grid;grid-template-columns:1fr 58px 58px 90px;align-items:center;padding:0 12px;cursor:pointer;gap:6px;border-bottom:1px solid var(--bdr);height:34px;position:absolute;width:100%;transition:background .1s;}}
+.srow:hover{{background:var(--surf2);}}
+.srow.sel{{background:rgba(245,158,11,.07);border-left:2px solid var(--ac);padding-left:10px;}}
+.sid{{font-family:var(--mono);font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
+.sgn,.sal{{text-align:right;font-size:10px;font-family:var(--mono);color:var(--mt);}}
+.sal.pos{{color:var(--easy);}}.sal.neg{{color:var(--harmful);}}
+.col-tag{{justify-self:end;}}
+.pagination{{padding:7px 12px;border-top:1px solid var(--bdr);display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:10px;color:var(--mt);}}
+.pagination button{{padding:3px 10px;background:var(--surf2);border:1px solid var(--bdr2);color:var(--tx);font-family:var(--mono);font-size:10px;cursor:pointer;border-radius:2px;}}
+.pagination button:disabled{{opacity:.3;cursor:default;}}
+.pagination button:not(:disabled):hover{{border-color:var(--ac);color:var(--ac);}}
+.pginfo{{flex:1;text-align:center;}}
+.panel-right{{display:flex;flex-direction:column;overflow:hidden;}}
+.chart-hdr{{padding:14px 20px 10px;border-bottom:1px solid var(--bdr);background:var(--surf);display:flex;align-items:flex-start;gap:16px;}}
+.ctitle{{font-family:var(--mono);font-size:12px;color:var(--ac);font-weight:600;}}
+.csub{{font-family:var(--mono);font-size:10px;color:var(--mt);margin-top:3px;}}
+.stat-grid{{margin-left:auto;display:flex;gap:20px;}}
+.stat-item{{text-align:right;}}
+.slbl{{font-size:9px;color:var(--mt);font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em;}}
+.sval{{font-size:15px;font-family:var(--mono);font-weight:500;color:var(--tx);margin-top:2px;}}
+.chart-area{{flex:1;padding:20px 24px 16px;display:flex;flex-direction:column;gap:14px;overflow:hidden;}}
+.chart-wrap{{flex:1;position:relative;min-height:0;}}.chart-wrap canvas{{position:absolute;inset:0;}}
+.placeholder{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:var(--mt);font-family:var(--mono);}}
+.phi{{font-size:36px;opacity:.18;}}.placeholder p{{font-size:11px;}}
+.legend{{display:flex;gap:20px;font-family:var(--mono);font-size:10px;color:var(--mt);}}
+.li{{display:flex;align-items:center;gap:6px;}}
+.ld{{width:8px;height:8px;border-radius:50%;flex-shrink:0;}}
+.ld.gn{{background:var(--ac);}}.ld.al{{background:var(--inf);}}
 </style>
 </head><body>
 <div class="layout" id="app">
   <header class="header">
-    <span class="htitle">SAMPLE CONTRIBUTION ANALYZER (V3)</span>
-    <span class="hmeta" id="hmeta">正在初始化二进制底座...</span>
-    <span class="hstatus" id="hstatus">⏳ STREAMING BINARY DATA...</span>
+    <span class="htitle">SAMPLE CONTRIBUTION ANALYZER</span>
+    <span class="hmeta" id="hmeta">正在连接二进制引擎...</span>
+    <div class="hbadges" id="hbadges">
+      <span class="hstatus" id="hstatus">⏳ DATA LOADING: STREAMING BINARY BUFFER...</span>
+    </div>
   </header>
   <div class="panel-left">
     <div class="controls">
-      <input id="search" placeholder="🔍 输入 utt_id 或样本数字 ID 检索..." oninput="onSearch()">
+      <input id="search" placeholder="搜索 utt-id / 样本 id ..." oninput="onSearch()">
       <div class="crow">
         <select id="tag-f" onchange="rebuild()">
-          <option value="-1">🎯 所有诊断标签分类</option>
-          <option value="0">⚠ harmful_suspect (潜在脏数据/高噪异常)</option>
-          <option value="1">🔸 hard (高拟合难度/边界关键样本)</option>
-          <option value="2">↑ high_influence (高正面贡献/金子样本)</option>
-          <option value="3">🔹 easy_redundant (低难度冗余/可降采样)</option>
-          <option value="4">⬜ normal (常规平稳样本)</option>
+          <option value="-1">所有标签</option>
+          <option value="0">⚠ harmful_suspect</option>
+          <option value="1">hard</option>
+          <option value="2">↑ high_influence</option>
+          <option value="3">easy_redundant</option>
+          <option value="4">normal</option>
         </select>
         <select id="sort-f" onchange="rebuild()">
-          <option value="si">排序: 自影响度 self_influence ↓</option>
-          <option value="gn">排序: 平均梯度 mean_grad_norm ↓</option>
-          <option value="al">排序: 平均对齐度 mean_align ↑</option>
-          <option value="fn">排序: 负对齐比例 frac_neg_align ↓</option>
-          <option value="fo">排序: 遗忘次数 forget_events ↓</option>
+          <option value="si">self_influence ↓</option>
+          <option value="gn">mean_grad_norm ↓</option>
+          <option value="al">mean_align ↑</option>
+          <option value="fn">frac_neg_align ↓</option>
+          <option value="fo">forget_events ↓</option>
         </select>
       </div>
-    </div>
-    <div class="vlist-header">
-      <div>utt_id</div><div>Avg_Grad</div><div>Avg_Align</div><div style="text-align:right;">Tag</div>
     </div>
     <div class="vlist" id="vlist">
       <div id="vinner" style="position:relative;"></div>
     </div>
     <div class="pagination">
-      <button id="bp" onclick="prevPage()" disabled>◀ 上一页</button>
+      <button id="bp" onclick="prevPage()" disabled>◀</button>
       <span class="pginfo" id="pginfo">—</span>
-      <button id="bn" onclick="nextPage()" disabled>下一页 ▶</button>
+      <button id="bn" onclick="nextPage()" disabled>▶</button>
     </div>
   </div>
   <div class="panel-right">
     <div class="chart-hdr">
-      <div>
-        <div class="ctitle" id="ctitle">🔍 未选择样本</div>
-        <div class="csub" id="csub">从左侧列表中点击任意样本，实时获取各阶段训练动力学轨迹</div>
-      </div>
+      <div><div class="ctitle" id="ctitle">— SELECT A SAMPLE —</div>
+           <div class="csub"   id="csub"></div></div>
       <div class="stat-grid" id="stat-grid"></div>
     </div>
     <div class="chart-area">
       <div id="ph" class="placeholder">
-        <div class="phi">📊</div>
-        <p>请在左侧点击具体样本进行细粒度动力学分析</p>
+        <div class="phi">◈</div>
+        <p>从左侧点击一个样本，查看梯度随 epoch 的变化轨迹</p>
       </div>
-      <div id="cc" style="display:none;flex:1;flex-direction:column;gap:14px;">
+      <div id="cc" style="display:none;flex:1;flex-direction:column;gap:12px;">
         <div class="chart-wrap"><canvas id="myChart"></canvas></div>
         <div class="legend">
-          <div class="li"><div class="ld gn"></div><span class="eb">grad_norm</span> (梯度模长 - 左轴)</div>
-          <div class="li"><div class="ld al"></div><span class="eb">align</span> (对齐度/一致性 - 右轴)</div>
-        </div>
-      </div>
-      
-      <div class="expl-container">
-        <div class="expl-title">💡 工业深度学习·样本动力学核心指标指南</div>
-        <div class="expl-grid">
-          <div class="expl-item"><span class="eb">self_influence (自影响度):</span> 衡量该样本对自身损失的贡献。<span style="color:var(--harmful); font-weight:bold;">极高负值</span>代表移除它后模型表现反而剧烈提升，通常锁定了误标注、严重硬件噪声或畸变脏数据。</div>
-          <div class="expl-item"><span class="eb">grad_norm (梯度模长):</span> 代表样本对模型参数更新的冲击力。中后期依然维持在<span style="color:var(--hard); font-weight:bold;">高位</span>代表模型难以拟合它（属于难样本或特异性边界）。</div>
-          <div class="expl-item"><span class="eb">align (方向对齐度):</span> 取值 [-1, 1]。正值代表该样本和当前全局优化方向一致，负值代表该样本和全局主流方向发生严重的拉扯与对抗。</div>
-          <div class="expl-item"><span class="eb">forget_events (遗忘事件):</span> 样本在训练中经历“被正确分类又转为错误分类”的波动次数。次数极高说明该样本逼近决策边界（Boundary Cases）。</div>
+          <div class="li"><div class="ld gn"></div>grad_norm（左轴）</div>
+          <div class="li"><div class="ld al"></div>align（右轴）</div>
         </div>
       </div>
     </div>
   </div>
 </div>
 <script>
-const DATA_URL = "__BIN_FILENAME__";
-const EPOCHS = __EPOCHS_ARRAY__;
+const DATA_URL = "{bin_filename}";
+const EPOCHS = {epochs};
 const TAG_NAMES = ["harmful_suspect","hard","high_influence","easy_redundant","normal"];
 
 let _N, _NE, HAS_TRAJ, _GN_MIN, _GN_SC;
 let IDS, TAGS, SELF_INF, MEAN_GN, MEAN_AL, FRAC_NEG, FORGET, FINAL_CO, UTT_IDS;
 let GN_U8 = null, AL_U8 = null;
 
-const PAGE = 100, ROW_H = 36;
+const PAGE = 100, ROW_H = 34;
 let filtered = null, pageStart = 0, selIdx = -1, chart = null, stimer = null;
 let presordered = null;
-const sortCache = {};
+const sortCache = {{}};
 
-async function loadBinaryData() {
-  try {
+async function loadBinaryData() {{
+  try {{
     const res = await fetch(DATA_URL);
     if(!res.ok) throw new Error("无法读取对应的 .bin 数据包，请确保它们放在同一目录下且通过 Web Server 访问。");
     const buffer = await res.arrayBuffer();
@@ -365,7 +356,7 @@ async function loadBinaryData() {
     _GN_MIN = metaF32[0];
     _GN_SC = metaF32[1];
     
-    document.getElementById('hmeta').textContent = _N.toLocaleString() + " 样本 · " + _NE + " Epochs 轨迹数据已挂载";
+    document.getElementById('hmeta').textContent = `${{_N.toLocaleString()}} samples · ${{_NE}} epochs`;
 
     let offset = 64;
     IDS      = new Int32Array(buffer, offset, _N); offset += _N * 4;
@@ -381,32 +372,48 @@ async function loadBinaryData() {
     const stringBlock = new Uint8Array(buffer, offset, uttLen); offset += uttLen;
     UTT_IDS = txtDecoder.decode(stringBlock).split('\\n');
     
-    if(HAS_TRAJ) {
+    if(HAS_TRAJ) {{
       const trajSize = _N * _NE;
       GN_U8 = new Uint8Array(buffer, offset, trajSize); offset += trajSize;
       AL_U8 = new Uint8Array(buffer, offset, trajSize); offset += trajSize;
-    }
+    }}
 
     presordered = new Int32Array(_N);
     for(let i=0; i<_N; i++) presordered[i] = i;
     filtered = presordered;
     
+    buildTagBadges();
     renderPage();
     document.getElementById('hstatus').style.display = 'none';
 
-  } catch(e) {
+  }} catch(e) {{
     document.getElementById('hstatus').textContent = "❌ 加载失败: " + e.message;
     document.getElementById('hstatus').style.color = "var(--harmful)";
-  }
-}
+    document.getElementById('hstatus').style.animation = "none";
+  }}
+}}
 
-function renderPage() {
+function buildTagBadges() {{
+  const cnt = [0,0,0,0,0];
+  for(let i=0; i<_N; i++) cnt[TAGS[i]]++;
+  const el = document.getElementById('hbadges');
+  el.innerHTML = '';
+  [0,1,2,3].forEach(t => {{
+    if(!cnt[t]) return;
+    const b = document.createElement('span');
+    b.className = `tag-badge ${{TAG_NAMES[t]}}`;
+    b.textContent = `${{TAG_NAMES[t].replace(/_/g,' ')}} ${{cnt[t].toLocaleString()}}`;
+    el.appendChild(b);
+  }});
+}}
+
+function renderPage() {{
   const total = filtered.length;
   const pages = Math.max(1, Math.ceil(total / PAGE));
   const page = Math.floor(pageStart / PAGE) + 1;
   const slice = filtered.slice(pageStart, pageStart + PAGE);
 
-  document.getElementById('pginfo').textContent = page + " / " + pages + " 页 (共 " + total.toLocaleString() + " 条)";
+  document.getElementById('pginfo').textContent = `${{page}}/${{pages}} (${{total.toLocaleString()}})`;
   document.getElementById('bp').disabled = pageStart <= 0;
   document.getElementById('bn').disabled = pageStart + PAGE >= total;
 
@@ -414,134 +421,146 @@ function renderPage() {
   inner.style.height = (slice.length * ROW_H) + 'px';
   inner.innerHTML = '';
   
-  for(let vi=0; vi<slice.length; vi++) {
+  for(let vi=0; vi<slice.length; vi++) {{
     const i = slice[vi];
     const d = document.createElement('div');
     d.className = 'srow' + (i === selIdx ? ' sel' : '');
     d.style.top = (vi * ROW_H) + 'px';
-    const uid = UTT_IDS[i] || ("ID-" + IDS[i]);
+    const uid = UTT_IDS[i];
     const tag = TAG_NAMES[TAGS[i]];
     const gn = MEAN_GN[i];
     const al = MEAN_AL[i];
-    const alc = isNaN(al) ? '' : (al >= 0 ? 'pos' : 'neg');
+    const alc = isNaN(al) ? '' : al >= 0 ? 'pos' : 'neg';
     d.innerHTML =
-      '<div class="sid" title="' + uid + '">' + uid + '</div>'+
-      '<div class="sgn">' + (isNaN(gn)?'—':gn.toFixed(2)) + '</div>'+
-      '<div class="sal ' + alc + '">' + (isNaN(al)?'—':al.toFixed(2)) + '</div>'+
-      '<div class="col-tag"><span class="tag-badge ' + tag + '">' + tag + '</span></div>';
+      `<div class="sid" title="${{uid}}">${{uid}}</div>`+
+      `<div class="sgn">${{isNaN(gn)?'—':gn.toFixed(3)}}</div>`+
+      `<div class="sal ${{alc}}">${{isNaN(al)?'—':al.toFixed(3)}}</div>`+
+      `<div class="col-tag"><span class="tag-badge ${{tag}}">${{tag.replace(/_/g,' ')}}</span></div>`;
     d.addEventListener('click', () => selectSample(i, d));
     inner.appendChild(d);
-  }
+  }}
   document.getElementById('vlist').scrollTop = 0;
-}
+}}
 
-function prevPage() { if(pageStart > 0) { pageStart = Math.max(0, pageStart - PAGE); renderPage(); } }
-function nextPage() { if(pageStart + PAGE < filtered.length) { pageStart += PAGE; renderPage(); } }
-function onSearch() { clearTimeout(stimer); stimer = setTimeout(rebuild, 200); }
+function prevPage() {{ if(pageStart > 0) {{ pageStart = Math.max(0, pageStart - PAGE); renderPage(); }} }}
+function nextPage() {{ if(pageStart + PAGE < filtered.length) {{ pageStart += PAGE; renderPage(); }} }}
+function onSearch() {{ clearTimeout(stimer); stimer = setTimeout(rebuild, 200); }}
 
-function getVal(sk, i) {
+function getVal(sk, i) {{
   if(sk === 'si') return SELF_INF[i];
   if(sk === 'gn') return MEAN_GN[i];
   if(sk === 'al') return -MEAN_AL[i];
   if(sk === 'fn') return FRAC_NEG[i];
   if(sk === 'fo') return FORGET[i];
   return SELF_INF[i];
-}
+}}
 
-function rebuild() {
+function rebuild() {{
   const tagF = parseInt(document.getElementById('tag-f').value);
   const sk = document.getElementById('sort-f').value;
   const q = document.getElementById('search').value.trim().toLowerCase();
+  const noFilter = tagF < 0 && !q;
 
-  if (tagF < 0 && !q && sk === 'si') {
+  if (noFilter && sk === 'si') {{
     filtered = presordered;
-  } else {
-    const cacheKey = tagF + "|" + sk + "|" + q;
-    if(sortCache[cacheKey]) {
+  }} else {{
+    const cacheKey = `${{tagF}}|${{sk}}|${{q}}`;
+    if(sortCache[cacheKey]) {{
       filtered = sortCache[cacheKey];
-    } else {
+    }} else {{
       let arr = [];
-      for(let i=0; i<_N; i++) {
+      for(let i=0; i<_N; i++) {{
         if(tagF >= 0 && TAGS[i] !== tagF) continue;
-        if(q) {
+        if(q) {{
           const uid = UTT_IDS[i].toLowerCase();
           if(!uid.includes(q) && !String(IDS[i]).includes(q)) continue;
-        }
+        }}
         arr.push(i);
-      }
+      }}
       if(sk !== 'si') arr.sort((a, b) => getVal(sk, b) - getVal(sk, a));
       if(!q) sortCache[cacheKey] = arr;
       filtered = arr;
-    }
-  }
+    }}
+  }}
   pageStart = 0; 
   renderPage();
-}
+}}
 
-function selectSample(idx, el) {
+function selectSample(idx, el) {{
   selIdx = idx;
   document.querySelectorAll('.srow').forEach(r => r.classList.remove('sel'));
   el.classList.add('sel');
   
   const uid = UTT_IDS[idx];
   const tag = TAG_NAMES[TAGS[idx]];
-  document.getElementById('ctitle').textContent = "样本 UTT_ID: " + uid;
-  document.getElementById('csub').textContent = "内部数字序号: " + IDS[idx] + " | 诊断标签类别: " + tag;
+  document.getElementById('ctitle').textContent = uid;
+  document.getElementById('csub').textContent = `tag: ${{tag}}  ·  self_influence: ${{SELF_INF[idx].toFixed(2)}}  ·  forget: ${{FORGET[idx]}}`;
 
   const stats = [
-    {l:'自影响度 (SI)', v:SELF_INF[idx].toFixed(2)},
-    {l:'平均梯度模长', v:MEAN_GN[idx].toFixed(4)},
-    {l:'平均对齐度',     v:MEAN_AL[idx].toFixed(4)},
-    {l:'遗忘事件次数',    v:FORGET[idx]},
+    {{l:'SELF INFLUENCE', v:SELF_INF[idx].toFixed(1)}},
+    {{l:'MEAN GRAD NORM', v:MEAN_GN[idx].toFixed(4)}},
+    {{l:'MEAN ALIGN',     v:MEAN_AL[idx].toFixed(4)}},
+    {{l:'NEG ALIGN %',    v:(FRAC_NEG[idx]*100).toFixed(0)+'%'}},
   ];
   document.getElementById('stat-grid').innerHTML = stats.map(s =>
-    '<div class="stat-item"><div class="slbl">' + s.l + '</div><div class="sval">' + s.v + '</div></div>'
+    `<div class="stat-item"><div class="slbl">${{s.l}}</div><div class="sval">${{s.v}}</div></div>`
   ).join('');
 
   drawChart(idx);
-}
+}}
 
-function drawChart(idx) {
-  if(!HAS_TRAJ) {
+function drawChart(idx) {{
+  if(!HAS_TRAJ) {{
     document.getElementById('ph').style.display = 'flex';
-    document.getElementById('ph').querySelector('p').textContent = '动态轨迹不可用 (.npz 缺失)';
+    document.getElementById('ph').querySelector('p').textContent = '轨迹数据不可用';
     document.getElementById('cc').style.display = 'none';
     return;
-  }
+  }}
   document.getElementById('ph').style.display = 'none';
   document.getElementById('cc').style.display = 'flex';
   
   const gn = [], al = [];
-  for(let e=0; e<_NE; e++) {
+  for(let e=0; e<_NE; e++) {{
     const base = idx * _NE + e;
     const g = GN_U8[base], a = AL_U8[base];
     gn.push(g === 255 ? null : _GN_MIN + (g / 255) * _GN_SC);
     al.push(a === 254 ? null : (a / 253) * 2 - 1);
-  }
+  }}
   
   const ctx = document.getElementById('myChart').getContext('2d');
   if(chart) chart.destroy();
-  chart = new Chart(ctx, {
+  chart = new Chart(ctx, {{
     type: 'line',
-    data: {
-      labels: EPOCHS.map(e => "Ep" + e),
+    data: {{
+      labels: EPOCHS.map(e => `ep${{e}}`),
       datasets: [
-        {label:'梯度模长 (grad_norm)', data:gn, borderColor:'#f59e0b', backgroundColor:'rgba(245,158,11,.05)', borderWidth:2, pointRadius:3, yAxisID:'y'},
-        {label:'一致对齐度 (align)', data:al, borderColor:'#818cf8', backgroundColor:'rgba(129,140,248,.05)', borderWidth:2, pointRadius:3, yAxisID:'y2'}
+        {{label:'grad_norm', data:gn, borderColor:'#f59e0b', backgroundColor:'rgba(245,158,11,.1)', borderWidth:2, pointRadius:4, tension:.3, yAxisID:'y'}},
+        {{label:'align', data:al, borderColor:'#818cf8', backgroundColor:'rgba(129,140,248,.1)', borderWidth:2, pointRadius:4, tension:.3, yAxisID:'y2'}}
       ]
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false, animation: {duration:100},
-      interaction: {mode:'index', intersect:false},
-      plugins: { legend: {display:false} },
-      scales: {
-        x: {grid:{color:'#1e2333'}, ticks:{color:'#5a658a', font:{family:'Fira Code',size:10}}},
-        y: {grid:{color:'#1e2333'}, ticks:{color:'#f59e0b', font:{family:'Fira Code',size:10}}, title:{display:true,text:'梯度显著性',color:'#5a658a'}},
-        y2:{position:'right', grid:{display:false}, ticks:{color:'#818cf8', font:{family:'Fira Code',size:10}}, title:{display:true,text:'优化方向对齐度 [-1, 1]',color:'#5a658a'}}
-      }
-    }
-  });
-}
+    }},
+    options: {{
+      responsive: true, maintainAspectRatio: false, animation: {{duration:150}},
+      interaction: {{mode:'index', intersect:false}},
+      plugins: {{
+        legend: {{display:false}},
+        tooltip: {{
+          backgroundColor:'#141820', borderColor:'#252b3d', borderWidth:1,
+          titleColor:'#c8d0e0', bodyColor:'#7a8299',
+          titleFont:{{family:'Fira Code',size:11}}, bodyFont:{{family:'Fira Code',size:10}},
+          callbacks:{{label:c=>`  ${{c.dataset.label}}: ${{c.parsed.y?.toFixed(5)??'—'}}`}}
+        }}
+      }},
+      scales: {{
+        x: {{grid:{{color:'#1e2333'}}, ticks:{{color:'#4a5270', font:{{family:'Fira Code',size:10}}}}}},
+        y: {{grid:{{color:'#1e2333'}}, ticks:{{color:'#f59e0b', font:{{family:'Fira Code',size:9}}}}, title:{{display:true,text:'grad_norm',color:'#4a5270',font:{{family:'Fira Code',size:9}}}}}},
+        y2:{{position:'right', grid:{{display:false}}, ticks:{{color:'#818cf8', font:{{family:'Fira Code',size:9}}}}, title:{{display:true,text:'align',color:'#4a5270',font:{{family:'Fira Code',size:9}}}}}}
+      }}
+    }}
+  }});
+}}
 
 loadBinaryData();
 </script></body></html>"""
+
+if __name__ == "__main__":
+    main()
