@@ -143,7 +143,7 @@ def main():
     forget = np.clip([fv(r, "forget_events") for r in rows], -128, 127).astype(np.int8)
     final_co = np.clip([fv(r, "final_correct") for r in rows], -128, 127).astype(np.int8)
 
-    utt_list = [idx2utt.get(int(ids_arr[i]), str(ids_arr[i])) for i in range(n)]
+    utt_list = [idx2utt.get(int(ids_arr[i]), "") for i in range(n)]
     utt_bytes = "\n".join(utt_list).encode("utf-8")
     utt_len = len(utt_bytes)
 
@@ -216,7 +216,7 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 body::before{{content:'';position:fixed;inset:0;pointer-events:none;
   background-image:linear-gradient(var(--bdr) 1px,transparent 1px),linear-gradient(90deg,var(--bdr) 1px,transparent 1px);
   background-size:40px 40px;opacity:.22;}}
-.layout{{position:relative;z-index:1;display:grid;grid-template-columns:420px 1fr;grid-template-rows:56px 1fr;height:100vh;}}
+.layout{{position:relative;z-index:1;display:grid;grid-template-columns:460px 1fr;grid-template-rows:56px 1fr;height:100vh;}}
 .header{{grid-column:1/-1;display:flex;align-items:center;padding:0 20px;gap:14px;border-bottom:1px solid var(--bdr);background:var(--surf);font-family:var(--mono);}}
 .htitle{{font-size:14px;font-weight:600;color:var(--ac);letter-spacing:.05em;}}
 .hmeta{{font-size:11px;color:var(--mt);}}
@@ -234,13 +234,23 @@ body::before{{content:'';position:fixed;inset:0;pointer-events:none;
 .controls input,.controls select{{width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--bdr2);color:var(--tx);font-family:var(--mono);font-size:11px;outline:none;border-radius:2px;}}
 .controls input:focus,.controls select:focus{{border-color:var(--ac);}}
 .crow{{display:flex;gap:6px;}}.crow select{{flex:1;}}
+/* ── 列表表头 ── */
+.list-header{{display:grid;grid-template-columns:52px 1fr 1fr 58px 58px 96px;align-items:center;
+  padding:0 12px;gap:4px;border-bottom:1px solid var(--bdr2);height:26px;
+  font-family:var(--mono);font-size:9px;color:var(--mt);text-transform:uppercase;letter-spacing:.05em;background:var(--surf2);}}
 .vlist{{flex:1;overflow-y:auto;position:relative;}}
 .vlist::-webkit-scrollbar{{width:4px;}}
 .vlist::-webkit-scrollbar-thumb{{background:var(--bdr2);border-radius:2px;}}
-.srow{{display:grid;grid-template-columns:1fr 58px 58px 90px;align-items:center;padding:0 12px;cursor:pointer;gap:6px;border-bottom:1px solid var(--bdr);height:34px;position:absolute;width:100%;transition:background .1s;}}
+/* ── 列表行：6列 sample_id | utt_id | gn | al | tag ── */
+.srow{{display:grid;grid-template-columns:52px 1fr 1fr 58px 58px 96px;align-items:center;
+  padding:0 12px;cursor:pointer;gap:4px;border-bottom:1px solid var(--bdr);height:36px;
+  position:absolute;width:100%;transition:background .1s;}}
 .srow:hover{{background:var(--surf2);}}
 .srow.sel{{background:rgba(245,158,11,.07);border-left:2px solid var(--ac);padding-left:10px;}}
-.sid{{font-family:var(--mono);font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
+/* sample_id：固定宽度数字列 */
+.s-sid{{font-family:var(--mono);font-size:10px;color:var(--mt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+/* utt_id：主标识，截断省略 */
+.s-uid{{font-family:var(--mono);font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .sgn,.sal{{text-align:right;font-size:10px;font-family:var(--mono);color:var(--mt);}}
 .sal.pos{{color:var(--easy);}}.sal.neg{{color:var(--harmful);}}
 .col-tag{{justify-self:end;}}
@@ -250,10 +260,15 @@ body::before{{content:'';position:fixed;inset:0;pointer-events:none;
 .pagination button:not(:disabled):hover{{border-color:var(--ac);color:var(--ac);}}
 .pginfo{{flex:1;text-align:center;}}
 .panel-right{{display:flex;flex-direction:column;overflow:hidden;}}
+/* ── 详情面板 header ── */
 .chart-hdr{{padding:14px 20px 10px;border-bottom:1px solid var(--bdr);background:var(--surf);display:flex;align-items:flex-start;gap:16px;}}
-.ctitle{{font-family:var(--mono);font-size:12px;color:var(--ac);font-weight:600;}}
-.csub{{font-family:var(--mono);font-size:10px;color:var(--mt);margin-top:3px;}}
-.stat-grid{{margin-left:auto;display:flex;gap:20px;}}
+.chdr-id-block{{display:flex;flex-direction:column;gap:4px;min-width:0;}}
+.ctitle{{font-family:var(--mono);font-size:13px;color:var(--ac);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+.c-sid-row{{display:flex;align-items:center;gap:8px;}}
+.c-sid-lbl{{font-size:9px;color:var(--mt);font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em;background:var(--bdr2);padding:1px 5px;border-radius:2px;}}
+.c-sid-val{{font-size:11px;color:var(--mt);font-family:var(--mono);}}
+.csub{{font-family:var(--mono);font-size:10px;color:var(--mt);margin-top:2px;}}
+.stat-grid{{margin-left:auto;display:flex;gap:20px;flex-shrink:0;}}
 .stat-item{{text-align:right;}}
 .slbl{{font-size:9px;color:var(--mt);font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em;}}
 .sval{{font-size:15px;font-family:var(--mono);font-weight:500;color:var(--tx);margin-top:2px;}}
@@ -277,7 +292,7 @@ body::before{{content:'';position:fixed;inset:0;pointer-events:none;
   </header>
   <div class="panel-left">
     <div class="controls">
-      <input id="search" placeholder="搜索 utt-id / 样本 id ..." oninput="onSearch()">
+      <input id="search" placeholder="搜索 utt-id / sample_id ..." oninput="onSearch()">
       <div class="crow">
         <select id="tag-f" onchange="rebuild()">
           <option value="-1">所有标签</option>
@@ -296,6 +311,15 @@ body::before{{content:'';position:fixed;inset:0;pointer-events:none;
         </select>
       </div>
     </div>
+    <!-- 列表表头 -->
+    <div class="list-header">
+      <span>ID</span>
+      <span>utt_id</span>
+      <span>sample_id</span>
+      <span style="text-align:right">grad_n</span>
+      <span style="text-align:right">align</span>
+      <span style="text-align:right">tag</span>
+    </div>
     <div class="vlist" id="vlist">
       <div id="vinner" style="position:relative;"></div>
     </div>
@@ -307,8 +331,14 @@ body::before{{content:'';position:fixed;inset:0;pointer-events:none;
   </div>
   <div class="panel-right">
     <div class="chart-hdr">
-      <div><div class="ctitle" id="ctitle">— SELECT A SAMPLE —</div>
-           <div class="csub"   id="csub"></div></div>
+      <div class="chdr-id-block">
+        <div class="ctitle" id="ctitle">— SELECT A SAMPLE —</div>
+        <div class="c-sid-row" id="c-sid-row" style="display:none;">
+          <span class="c-sid-lbl">sample_id</span>
+          <span class="c-sid-val" id="c-sid-val">—</span>
+        </div>
+        <div class="csub" id="csub"></div>
+      </div>
       <div class="stat-grid" id="stat-grid"></div>
     </div>
     <div class="chart-area">
@@ -335,7 +365,7 @@ let _N, _NE, HAS_TRAJ, _GN_MIN, _GN_SC;
 let IDS, TAGS, SELF_INF, MEAN_GN, MEAN_AL, FRAC_NEG, FORGET, FINAL_CO, UTT_IDS;
 let GN_U8 = null, AL_U8 = null;
 
-const PAGE = 100, ROW_H = 34;
+const PAGE = 100, ROW_H = 36;
 let filtered = null, pageStart = 0, selIdx = -1, chart = null, stimer = null;
 let presordered = null;
 const sortCache = {{}};
@@ -370,6 +400,7 @@ async function loadBinaryData() {{
     
     const txtDecoder = new TextDecoder("utf-8");
     const stringBlock = new Uint8Array(buffer, offset, uttLen); offset += uttLen;
+    // UTT_IDS[i] 可能为空字符串（CSV 没有 utt_id 字段时），回退到 sample_id
     UTT_IDS = txtDecoder.decode(stringBlock).split('\\n');
     
     if(HAS_TRAJ) {{
@@ -407,6 +438,12 @@ function buildTagBadges() {{
   }});
 }}
 
+// 获取显示用的 utt_id（若为空则回退到 sample_id 字符串）
+function getUttDisplay(i) {{
+  const u = UTT_IDS[i];
+  return (u && u.length > 0) ? u : String(IDS[i]);
+}}
+
 function renderPage() {{
   const total = filtered.length;
   const pages = Math.max(1, Math.ceil(total / PAGE));
@@ -426,13 +463,17 @@ function renderPage() {{
     const d = document.createElement('div');
     d.className = 'srow' + (i === selIdx ? ' sel' : '');
     d.style.top = (vi * ROW_H) + 'px';
-    const uid = UTT_IDS[i];
+    const uid = getUttDisplay(i);
+    const sid = String(IDS[i]);
     const tag = TAG_NAMES[TAGS[i]];
     const gn = MEAN_GN[i];
     const al = MEAN_AL[i];
     const alc = isNaN(al) ? '' : al >= 0 ? 'pos' : 'neg';
+    // 6 列：rank-id(序号) | utt_id | sample_id | grad_norm | align | tag
     d.innerHTML =
-      `<div class="sid" title="${{uid}}">${{uid}}</div>`+
+      `<div class="s-sid" title="sample_id: ${{sid}}">#${{pageStart + vi + 1}}</div>`+
+      `<div class="s-uid" title="utt_id: ${{uid}}">${{uid}}</div>`+
+      `<div class="s-sid" title="sample_id: ${{sid}}">${{sid}}</div>`+
       `<div class="sgn">${{isNaN(gn)?'—':gn.toFixed(3)}}</div>`+
       `<div class="sal ${{alc}}">${{isNaN(al)?'—':al.toFixed(3)}}</div>`+
       `<div class="col-tag"><span class="tag-badge ${{tag}}">${{tag.replace(/_/g,' ')}}</span></div>`;
@@ -472,8 +513,10 @@ function rebuild() {{
       for(let i=0; i<_N; i++) {{
         if(tagF >= 0 && TAGS[i] !== tagF) continue;
         if(q) {{
-          const uid = UTT_IDS[i].toLowerCase();
-          if(!uid.includes(q) && !String(IDS[i]).includes(q)) continue;
+          // 同时匹配 utt_id 和 sample_id
+          const uid = getUttDisplay(i).toLowerCase();
+          const sid = String(IDS[i]).toLowerCase();
+          if(!uid.includes(q) && !sid.includes(q)) continue;
         }}
         arr.push(i);
       }}
@@ -491,10 +534,16 @@ function selectSample(idx, el) {{
   document.querySelectorAll('.srow').forEach(r => r.classList.remove('sel'));
   el.classList.add('sel');
   
-  const uid = UTT_IDS[idx];
+  const uid = getUttDisplay(idx);
+  const sid = String(IDS[idx]);
   const tag = TAG_NAMES[TAGS[idx]];
+
+  // 详情面板：主标题显示 utt_id，副行显示 sample_id
   document.getElementById('ctitle').textContent = uid;
-  document.getElementById('csub').textContent = `tag: ${{tag}}  ·  self_influence: ${{SELF_INF[idx].toFixed(2)}}  ·  forget: ${{FORGET[idx]}}`;
+  document.getElementById('c-sid-val').textContent = sid;
+  document.getElementById('c-sid-row').style.display = 'flex';
+  document.getElementById('csub').textContent =
+    `tag: ${{tag}}  ·  self_influence: ${{SELF_INF[idx].toFixed(2)}}  ·  forget: ${{FORGET[idx]}}`;
 
   const stats = [
     {{l:'SELF INFLUENCE', v:SELF_INF[idx].toFixed(1)}},
