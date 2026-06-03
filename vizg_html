@@ -30,23 +30,23 @@ def collect_data(contrib_dir, summary_csv, max_rows):
     selected = all_rows[:max_rows]
     selected_ids = set(r["id"] for r in selected)
 
-    # 读 npz 轨迹
+    # 读 npz 轨迹（向量化，不逐条循环）
     files = sorted(glob.glob(os.path.join(contrib_dir, "contrib_epoch*.npz")))
     epochs = []
     traj = {}
+    sel_arr = np.array(list(selected_ids))          # 用于 np.isin
     for f in files:
         ep = int(os.path.basename(f)[len("contrib_epoch"):-len(".npz")])
         epochs.append(ep)
         d = np.load(f, allow_pickle=True)
         ids_arr = d["ids"].astype(str)
-        for k in range(len(ids_arr)):
-            sid = ids_arr[k]
-            if sid in selected_ids:
-                traj.setdefault(sid, {})[ep] = (
-                    round(float(d["grad_norm"][k]), 4),
-                    round(float(d["align"][k]), 4),
-                )
-        print(f"  epoch {ep} loaded")
+        mask = np.isin(ids_arr, sel_arr)            # 向量化筛选
+        hit_ids = ids_arr[mask]
+        hit_gn = np.round(d["grad_norm"][mask], 4)
+        hit_al = np.round(d["align"][mask], 4)
+        for k in range(len(hit_ids)):               # 只循环命中的（≤max_rows）
+            traj.setdefault(hit_ids[k], {})[ep] = (float(hit_gn[k]), float(hit_al[k]))
+        print(f"  epoch {ep}: {mask.sum()} / {len(ids_arr)} matched")
     epochs.sort()
 
     samples = []
