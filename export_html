@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-export_html_v2.py —— 工业级超大数据集样本可视化工具
-优化策略：将大数组/文本剥离为同名 .bin 文件，通过前端零拷贝异步二进制流加载，彻底解决 HTML 卡死问题。
+export_html_diag.py —— 工业级大样本贡献度分析可视化工具（带全链路诊断日志）
+优化策略：骨架 HTML + 外挂二进制数据包 (.bin)，利用前端零拷贝流式加载解决卡死问题。
 """
 
 import argparse
@@ -12,7 +12,7 @@ import os
 import sys
 import numpy as np
 
-# ── 标签映射 ──────────────────────────────────────────────
+# 标签映射
 TAG_MAP = {"harmful_suspect": 0, "hard": 1, "high_influence": 2, "easy_redundant": 3, "normal": 4}
 
 def fv(row, key):
@@ -20,34 +20,56 @@ def fv(row, key):
     except: return float("nan")
 
 def main():
-    ap = argparse.ArgumentParser(description="高性能样本贡献度可视化分析 HTML 生成器")
+    print("\n" + "="*60)
+    print("🚀 [START] 诊断与数据打包脚本启动...")
+    print("="*60)
+    
+    ap = argparse.ArgumentParser(description="高性能样本贡献度可视化分析 HTML 生成器（诊断版）")
     ap.add_argument("--contrib", required=True, help="包含 contrib_epoch*.npz 和 summary CSV 的目录路径")
     ap.add_argument("--egs",     default="", help="可选：包含原始 utt_id 映射的 train.csv 或 text 文件路径")
     ap.add_argument("--summary", default="", help="可选：明确指定 summary CSV 的路径")
-    ap.add_argument("--output",  default="contrib_viz.html", help="输出的 HTML 文件名 (会自动在其同目录下生成同名 .bin 文件)")
+    ap.add_argument("--output",  default="contrib_viz.html", help="输出的 HTML 文件名")
     args = ap.parse_args()
+
+    # 打印环境诊断信息
+    print(f"📍 命令行当前工作路径 (CWD): {os.getcwd()}")
+    print(f"📁 输入的目标数据目录 (--contrib): {os.path.abspath(args.contrib)}")
+    print(f"📄 预设的网页输出名称 (--output): {args.output}")
 
     # 1. 寻找并加载 Summary CSV
     sp = args.summary
     if not sp:
         for nm in ("contrib_summary_with_uttid.csv", "contrib_summary.csv"):
             p = os.path.join(args.contrib, nm)
-            if os.path.exists(p): sp = p; break
+            if os.path.exists(p): 
+                sp = p
+                break
+    
+    print(f"🔍 [步骤 1/4] 正在定位 Summary CSV 配置文件...")
+    print(f"      寻找到的 CSV 路径: {sp}")
     if not sp or not os.path.exists(sp):
-        print("❌ 错误: 找不到 summary CSV 配置文件"); sys.exit(1)
+        print(f"❌ 严重错误: 在指定目录下找不到任何 summary CSV 配置文件！")
+        print(f"   请检查该目录下是否存在 'contrib_summary.csv' 或 'contrib_summary_with_uttid.csv'")
+        sys.exit(1)
 
-    print("[1/4] 正在读取样本 summary 主指标...")
     rows = []
     with open(sp, newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f): rows.append(r)
+        for r in csv.DictReader(f): 
+            rows.append(r)
+    
     n = len(rows)
+    print(f"      📊 成功读取！共解析出 {n} 行样本配置指标。")
+    if n == 0:
+        print("⚠️ 警告: CSV 文件内容为空或标题行不匹配，无法建立索引，程序安全退出。")
+        sys.exit(0)
+
     id2idx = {r["id"]: i for i, r in enumerate(rows)}
-    print(f"      成功载入 {n} 个样本配置项。")
 
     # 2. 读取额外映射的 utt-id
-    print("[2/4] 正在建立 sample_id 到 utt_id 的文本映射...")
+    print("[步骤 2/4] 正在建立 sample_id 到 utt_id 的文本映射...")
     idx2utt = {}
     if args.egs and os.path.exists(args.egs):
+        print(f"      -> 检测到外挂文本映射文件: {args.egs}")
         with open(args.egs, encoding="utf-8") as f:
             first = f.readline()
             delim = "\t" if "\t" in first else " "
@@ -56,12 +78,18 @@ def main():
                 if i >= n: break
                 p = line.strip().split(delim)
                 if p: idx2utt[i] = p[0]
+                
     if rows and "utt_id" in rows[0]:
+        print("      -> 直接从 CSV 内部激活 'utt_id' 字段映射。")
         idx2utt = {i: r["utt_id"] for i, r in enumerate(rows) if r.get("utt_id")}
 
     # 3. 载入各 Epoch 的轨迹数据 (.npz)
-    print("[3/4] 正在扫描并解析各 Epoch 轨迹矩阵 (.npz) ...")
-    files = sorted(glob.glob(os.path.join(args.contrib, "contrib_epoch*.npz")))
+    print("[步骤 3/4] 正在扫描并解析各 Epoch 轨迹矩阵 (.npz) ...")
+    search_path = os.path.join(args.contrib, "contrib_epoch*.npz")
+    files = sorted(glob.glob(search_path))
+    print(f"      🔎 检索通配符路径: {search_path}")
+    print(f"      匹配到的轨迹文件 (.npz) 数量: {len(files)} 个")
+    
     epochs = []
     gn_mat, al_mat = None, None
     gn_min, gn_scale = 0.0, 1.0
@@ -84,28 +112,28 @@ def main():
             m = idxs >= 0
             gn[idxs[m], ei] = d["grad_norm"][m]
             al[idxs[m], ei] = d["align"][m]
-            print(f"      解析进度: Epoch {ep:03d} 已就绪")
         
         epochs = sorted(epochs)
         gn_min = float(np.nanmin(gn))
         gn_max = float(np.nanpercentile(gn[~np.isnan(gn)], 99))
         gn_scale = max(gn_max - gn_min, 1e-9)
         
-        # 归一化并压缩存储为 uint8 节省 75% 硬盘空间
         gn_q = np.clip((gn - gn_min) / gn_scale * 255, 0, 255)
         gn_q[np.isnan(gn)] = 255
         al_q = np.clip((al + 1.0) / 2.0 * 253, 0, 253)
         al_q[np.isnan(al)] = 254
         gn_mat = gn_q.astype(np.uint8)
         al_mat = al_q.astype(np.uint8)
+        print("      ✅ 历史轨迹大矩阵动态压缩完毕。")
+    else:
+        print("      ℹ️ 提示: 未发现任何 epoch 轨迹文件，系统将自适应退化为纯静态指标模式。")
 
     # 4. 后端核心优化：预排序与流式打包
-    print("[4/4] 正在执行后端预排序与二进制流紧凑打包...")
+    print("[步骤 4/4] 正在执行后端预排序与二进制流紧凑打包...")
     si_vals = np.array([fv(r, "self_influence") for r in rows], dtype=np.float64)
-    order = np.argsort(-si_vals) # 按 self_influence 降序，保证前端渲染无需再耗时排序
+    order = np.argsort(-si_vals)
     rows = [rows[i] for i in order]
 
-    # 构建一维连续内存紧凑数组 (C-Contiguous)
     ids_arr = np.array([int(r["id"]) if r["id"].isdigit() else int(order[i]) for i, r in enumerate(rows)], dtype=np.int32)
     tags_arr = np.array([TAG_MAP.get(r.get("tag", "normal"), 4) for r in rows], dtype=np.uint8)
     self_inf = np.array([fv(r, "self_influence") for r in rows], dtype=np.float32)
@@ -115,7 +143,6 @@ def main():
     forget = np.clip([fv(r, "forget_events") for r in rows], -128, 127).astype(np.int8)
     final_co = np.clip([fv(r, "final_correct") for r in rows], -128, 127).astype(np.int8)
 
-    # 处理海量 utt_id 文本，使用纯字节流追加，规避字符串解析瓶颈
     utt_list = [idx2utt.get(int(ids_arr[i]), str(ids_arr[i])) for i in range(n)]
     utt_bytes = "\n".join(utt_list).encode("utf-8")
     utt_len = len(utt_bytes)
@@ -127,15 +154,19 @@ def main():
         gn_final = b""
         al_final = b""
 
-    # ── 写入同名的外挂二进制文件 (.bin) ──
+    # ── 开始执行磁盘写入（带物理诊断） ──
+    print("\n💾 [WRITE] 开始请求磁盘写入物理文件...")
+    
     bin_path = os.path.splitext(args.output)[0] + ".bin"
+    abs_bin_path = os.path.abspath(bin_path)
+    abs_html_path = os.path.abspath(args.output)
+    
+    # A. 写入二进制数据包
+    print(f"  ➡️ 正在写入二进制数据包: {abs_bin_path}")
     with open(bin_path, "wb") as fb:
-        # 写入 64 字节固定长度的 Header 区 (用于前端解析寻址)
         fb.write(np.array([n, len(epochs), utt_len, 1 if has_traj else 0], dtype=np.int32).tobytes())
         fb.write(np.array([gn_min, gn_scale], dtype=np.float32).tobytes())
-        fb.write(b"\x00" * 40) # 预留对齐位
-        
-        # 顺序流写入底层数据块
+        fb.write(b"\x00" * 40)
         fb.write(ids_arr.tobytes())
         fb.write(tags_arr.tobytes())
         fb.write(self_inf.tobytes())
@@ -147,15 +178,26 @@ def main():
         fb.write(utt_bytes)
         fb.write(gn_final)
         fb.write(al_final)
+    
+    if os.path.exists(bin_path):
+        print(f"     👍 检查成功！.bin 文件已生成，空间占用: {os.path.getsize(bin_path)/1e6:.2f} MB")
+    else:
+        print(f"     ❌ 严重错误！.bin 文件在写入后未能在操作系统中检测到，请检查磁盘写权限。")
 
-    # ── 写入骨架 HTML ──
+    # B. 写入骨架 HTML 页面
+    print(f"  ➡️ 正在写入可视化网页骨架: {abs_html_path}")
     bin_filename = os.path.basename(bin_path)
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(make_skeleton_html(bin_filename, epochs, n))
+        
+    if os.path.exists(args.output):
+        print(f"     👍 检查成功！.html 文件已生成，空间占用: {os.path.getsize(args.output)/1024:.2f} KB")
+    else:
+        print(f"     ❌ 严重错误！.html 网页文件未能成功创建。")
 
-    print(f"\n✨ 工业级优化完成！")
-    print(f" 📦 页面骨架文件: {args.output} ({os.path.getsize(args.output)/1024:.1f} KB) -> 瞬间秒开")
-    print(f" 📂 二进制数据包: {bin_path} ({os.path.getsize(bin_path)/1e6:.1f} MB) -> 前端零拷贝流式加载")
+    print("\n" + "="*60)
+    print("✨ [SUCCESS] 脚本全链路运行完毕！无任何隐藏中断发生。")
+    print("="*60 + "\n")
 
 
 def make_skeleton_html(bin_filename, epochs, n):
@@ -298,14 +340,12 @@ let filtered = null, pageStart = 0, selIdx = -1, chart = null, stimer = null;
 let presordered = null;
 const sortCache = {{}};
 
-// 前端核心：基于 ArrayBuffer 的零拷贝数据映射加载
 async function loadBinaryData() {{
   try {{
     const res = await fetch(DATA_URL);
     if(!res.ok) throw new Error("无法读取对应的 .bin 数据包，请确保它们放在同一目录下且通过 Web Server 访问。");
     const buffer = await res.arrayBuffer();
     
-    // 1. 解析 Header 寻址元数据区 (前64字节)
     const metaI32 = new Int32Array(buffer, 0, 4);
     _N = metaI32[0];
     _NE = metaI32[1];
@@ -318,7 +358,6 @@ async function loadBinaryData() {{
     
     document.getElementById('hmeta').textContent = `${{_N.toLocaleString()}} samples · ${{_NE}} epochs`;
 
-    // 2. 内存对齐寻址绑定视图 (实现零拷贝，毫秒级读取数千万数据)
     let offset = 64;
     IDS      = new Int32Array(buffer, offset, _N); offset += _N * 4;
     TAGS     = new Uint8Array(buffer, offset, _N); offset += _N * 1;
@@ -329,19 +368,16 @@ async function loadBinaryData() {{
     FORGET   = new Int8Array(buffer, offset, _N); offset += _N * 1;
     FINAL_CO = new Int8Array(buffer, offset, _N); offset += _N * 1;
     
-    // 3. 提取字符串文本流数据
     const txtDecoder = new TextDecoder("utf-8");
     const stringBlock = new Uint8Array(buffer, offset, uttLen); offset += uttLen;
     UTT_IDS = txtDecoder.decode(stringBlock).split('\\n');
     
-    // 4. 提取历史训练轨迹大矩阵
     if(HAS_TRAJ) {{
       const trajSize = _N * _NE;
       GN_U8 = new Uint8Array(buffer, offset, trajSize); offset += trajSize;
       AL_U8 = new Uint8Array(buffer, offset, trajSize); offset += trajSize;
     }}
 
-    // 5. 初始化视图索引
     presordered = new Int32Array(_N);
     for(let i=0; i<_N; i++) presordered[i] = i;
     filtered = presordered;
@@ -523,6 +559,8 @@ function drawChart(idx) {{
   }});
 }}
 
-// 执行数据绑定
 loadBinaryData();
 </script></body></html>"""
+
+if __name__ == "__main__":
+    main()
