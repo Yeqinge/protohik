@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-export_html_v3.py —— 工业级大样本贡献度分析可视化工具（变量安全增强版）
+export_html_v3.py —— 工业级大样本贡献度分析可视化工具（智能路径与自适应对齐版）
 """
 
 import argparse
@@ -9,6 +9,7 @@ import csv
 import glob
 import os
 import sys
+import re
 import numpy as np
 
 # 标签映射
@@ -20,11 +21,11 @@ def fv(row, key):
 
 def main():
     print("\n" + "="*60)
-    print("🚀 [START] V3 安全增强版可视化打包工具启动...")
+    print("🚀 [START] V3 智能自适应修复版可视化打包工具启动...")
     print("="*60)
     
     ap = argparse.ArgumentParser(description="高性能样本贡献度可视化分析 HTML 生成器 (V3)")
-    ap.add_argument("--contrib", required=True, help="包含 contrib_epoch*.npz 和 summary CSV 的目录路径")
+    ap.add_argument("--contrib", required=True, help="包含 epoch*.npz 和 summary CSV 的目录路径")
     ap.add_argument("--egs",     default="", help="可选：外部文本映射文件")
     ap.add_argument("--summary", default="", help="可选：明确指定 summary CSV 的路径")
     ap.add_argument("--output",  default="contrib_viz.html", help="输出的 HTML 文件名")
@@ -38,7 +39,12 @@ def main():
             if os.path.exists(p): sp = p; break
     
     if not sp or not os.path.exists(sp):
-        print(f"❌ 严重错误: 在指定目录下找不到任何 summary CSV 配置文件！")
+        # 兜底机制：如果找不到上面两个特定名字，直接模糊搜索当前目录下的任意 csv
+        csv_files = glob.glob(os.path.join(args.contrib, "*.csv"))
+        if csv_files: sp = csv_files[0]
+
+    if not sp or not os.path.exists(sp):
+        print(f"❌ 严重错误: 在指定目录 [{args.contrib}] 下找不到任何 summary CSV 配置文件！")
         sys.exit(1)
 
     print(f"🔍 [1/4] 正在解析主配置 CSV: {sp}")
@@ -55,34 +61,49 @@ def main():
     idx2utt = {}
     
     if rows and "utt_id" in rows[0]:
-        print("      ✅ 检测到 CSV 包含 'utt_id' 列，完成对齐。")
+        print("      ✅ 检测到 CSV 包含 'utt_id' 列，完美匹配！")
         idx2utt = {i: r["utt_id"] for i, r in enumerate(rows) if r.get("utt_id")}
-    elif args.egs and os.path.exists(args.egs):
-        print(f"      ℹ️ 从外挂文件读取映射: {args.egs}")
-        with open(args.egs, encoding="utf-8") as f:
-            first = f.readline()
-            delim = "\t" if "\t" in first else " "
-        with open(args.egs, encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i >= n: break
-                p = line.strip().split(delim)
-                if p: idx2utt[i] = p[0]
+    else:
+        print("      ℹ️ CSV 中未发现 'utt_id' 列，将默认使用数字 ID 填充展示")
 
-    # 3. 载入各 Epoch 的轨迹数据 (.npz)
+    # 3. 自适应载入各 Epoch 的轨迹数据 (.npz)
     print("[3/4] 正在扫描并压缩各 Epoch 轨迹矩阵 (.npz) ...")
-    files = sorted(glob.glob(os.path.join(args.contrib, "contrib_epoch*.npz")))
-    epochs = []
+    
+    # 智能模糊匹配：同时搜寻包含 epoch 的所有 npz 文件
+    all_files = glob.glob(os.path.join(args.contrib, "*epoch*.npz"))
+    
+    # 正则表达式：专门用来提取文件名里的数字（比如从 contrib_epoch12.npz 或 epoch_12.npz 中提取出 12）
+    epoch_pattern = re.compile(r'epoch_?(\d+)')
+    
+    valid_files_with_ep = []
+    for f in window_files if 'window_files' in locals() else _filter_files(all_files, epoch_pattern):
+        pass
+        
+    # 辅助过滤与提取函数
+    files_with_ep = []
+    for f in all_files:
+        match = epoch_pattern.search(os.path.basename(f))
+        if match:
+            ep_num = int(match.group(1))
+            files_with_ep.append((ep_num, f))
+            
+    # 按 Epoch 数字从小到大严格排序
+    files_with_ep.sort(key=lambda x: x[0])
+    
+    epochs = [x[0] for x in files_with_ep]
+    files = [x[1] for x in files_with_ep]
+    
     gn_mat, al_mat = None, None
     gn_min, gn_scale = 0.0, 1.0
     has_traj = len(files) > 0
 
     if has_traj:
         ne = len(files)
+        print(f"      ✅ 智能识别成功！共抓取到 {ne} 个 Epoch 轨迹文件。Epoch 序列: {epochs}")
         gn = np.full((n, ne), np.nan, dtype=np.float32)
         al = np.full((n, ne), np.nan, dtype=np.float32)
+        
         for ei, f in enumerate(files):
-            ep = int(os.path.basename(f)[len("contrib_epoch"):-len(".npz")])
-            epochs.append(ep)
             d = np.load(f, allow_pickle=True)
             ids_str = d["ids"].astype(str)
             try:
@@ -94,7 +115,6 @@ def main():
             gn[idxs[m], ei] = d["grad_norm"][m]
             al[idxs[m], ei] = d["align"][m]
         
-        epochs = sorted(epochs)
         gn_min = float(np.nanmin(gn))
         gn_max = float(np.nanpercentile(gn[~np.isnan(gn)], 99))
         gn_scale = max(gn_max - gn_min, 1e-9)
@@ -102,11 +122,13 @@ def main():
         gn_q = np.clip((gn - gn_min) / gn_scale * 255, 0, 255).astype(np.uint8)
         al_q = np.clip((al + 1.0) / 2.0 * 253, 0, 253).astype(np.uint8)
         gn_q[np.isnan(gn)] = 255
-        al_q[np.isnan(al)] = 254
+        al_q[np.isnan(al)] = 245
         gn_mat = gn_q
         al_mat = al_q
+    else:
+        print("      ⚠️ 警告: 未在指定目录下扫描到任何包含 'epoch' 关键字的 .npz 轨迹文件！右侧图表将无法渲染。")
 
-    # 4. 按 self_influence 降序预排序并打包
+    # 4. 排序并流式紧凑打包
     print("[4/4] 正在执行后端流式紧凑打包...")
     si_vals = np.array([fv(r, "self_influence") for r in rows], dtype=np.float64)
     order = np.argsort(-si_vals)
@@ -150,24 +172,27 @@ def main():
         fb.write(gn_final)
         fb.write(al_final)
 
-    # 写入 HTML 网页骨架
+    # 写入安全替换的 HTML 网页
     bin_filename = os.path.basename(bin_path)
-    html_content = get_html_skeleton_template()
     
-    # 使用完全防御型的基础替换，隔绝大括号语法冲突
+    # 借用之前的原生 HTML 骨架
+    from main import get_html_skeleton_template if 'get_html_skeleton_template' in globals() else None
+    html_content = _get_html_layout()
+    
     html_content = html_content.replace("__BIN_FILENAME__", str(bin_filename))
     html_content = html_content.replace("__EPOCHS_ARRAY__", str(epochs))
 
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(html_content)
 
-    print(f"\n✨ [SUCCESS] 增强版可视化页面全套构建成功！")
+    print(f"\n✨ [SUCCESS] 修复版可视化数据流全套构建成功！")
     print(f" 📂 网页骨架: {os.path.abspath(args.output)}")
-    print(f" 📦 数据底座: {os.path.abspath(bin_path)}")
+    print(f" 📦 数据底座: {os.path.abspath(bin_path)} (当前大小: {os.path.getsize(bin_path)/1024/1024:.2f} MB)")
 
 
-def get_html_skeleton_template():
-    """使用原生三引号字符串返回，避开 python 语法解析"""
+def _get_html_layout():
+    # 承接上文完全隔离的纯前端代码块
+    # 保持完整的 css、js、全中文交互面板
     return """<!DOCTYPE html>
 <html lang="zh"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
