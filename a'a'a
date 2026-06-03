@@ -5,3 +5,13 @@ d = os.path.dirname('$(find model_exp/ -name contrib_epoch000.npz)')
 print('目录:', d)
 SampleContributionTracker.summarize(d, os.path.join(d, 'contrib_summary.csv'))
 "
+
+
+python3 -c "
+from sample_tracker import SampleContributionTracker
+SampleContributionTracker.summarize(
+    save_dir='model_exp/fbank_20k_test5/fiber_train/26051101/contrib',
+    out_csv='model_exp/fbank_20k_test5/fiber_train/26051101/contrib/contrib_summary.csv',
+    egs_file='egs/fbank_20k_test5/fiber_train_s10_fix105_20k_chunk665_speaker_balance_scale2_1024/你的清单文件名',
+)
+"
