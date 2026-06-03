@@ -27,6 +27,36 @@ def sf(v, default=0):
         return default
 
 
+class SafeEncoder(json.JSONEncoder):
+    """NaN/Inf → null, numpy 类型 → Python 原生"""
+    def default(self, o):
+        if isinstance(o, (np.integer,)):
+            return int(o)
+        if isinstance(o, (np.floating,)):
+            v = float(o)
+            return None if (math.isnan(v) or math.isinf(v)) else v
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return super().default(o)
+
+    def encode(self, o):
+        return super().encode(self._clean(o))
+
+    def _clean(self, o):
+        if isinstance(o, float):
+            return None if (math.isnan(o) or math.isinf(o)) else o
+        if isinstance(o, dict):
+            return {k: self._clean(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            return [self._clean(v) for v in o]
+        if isinstance(o, (np.floating,)):
+            v = float(o)
+            return None if (math.isnan(v) or math.isinf(v)) else v
+        if isinstance(o, (np.integer,)):
+            return int(o)
+        return o
+
+
 def collect_data(contrib_dir, summary_csv, max_rows):
     with open(summary_csv) as f:
         all_rows = list(csv.DictReader(f))
@@ -87,8 +117,7 @@ def collect_data(contrib_dir, summary_csv, max_rows):
         "total": total, "exported": len(samples), "tag_counts": tag_counts,
         "epochs": epochs, "has_utt": has_utt, "samples": samples,
     }
-    # 确保输出合法 JSON（无 NaN/Infinity）
-    return json.dumps(data, ensure_ascii=False, allow_nan=False)
+    return json.dumps(data, ensure_ascii=False, cls=SafeEncoder)
 
 
 HTML_TEMPLATE = """<!DOCTYPE html>
