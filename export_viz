@@ -1,0 +1,121 @@
+# -*- coding: utf-8 -*-
+"""
+export_viz.py
+把 contrib 数据导出为浏览器可视化用的 JSON。
+
+用法:
+  python export_viz.py \
+    --contrib-dir  model_exp/.../contrib \
+    --summary-csv  model_exp/.../contrib/contrib_summary_with_uttid.csv \
+    --output       model_exp/.../contrib/viz_data.json \
+    --max-rows     10000
+
+说明：
+  - 优先选入所有 harmful_suspect / hard / high_influence 样本
+  - 剩余名额按 self_influence 从高到低填 normal / easy_redundant
+  - 每个被选中的样本都带完整 10 epoch 轨迹（grad_norm + align）
+  - 同时输出全量的标签分布统计（不受 max-rows 限制）
+"""
+
+import argparse, os, glob, json, csv
+import numpy as np
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--contrib-dir", required=True, help="含 contrib_epochNNN.npz 的目录")
+    parser.add_argument("--summary-csv", required=True, help="contrib_summary_with_uttid.csv 或 contrib_summary.csv")
+    parser.add_argument("--output", default=None, help="输出 JSON 路径（默认 contrib-dir/viz_data.json）")
+    parser.add_argument("--max-rows", type=int, default=10000, help="最多导出多少样本（默认 10000）")
+    args = parser.parse_args()
+
+    out_path = args.output or os.path.join(args.contrib_dir, "viz_data.json")
+
+    # ---- 1) 读 summary CSV ----
+    print("[export] 读取 summary CSV ...")
+    with open(args.summary_csv) as f:
+        reader = csv.DictReader(f)
+        all_rows = list(reader)
+    print(f"  共 {len(all_rows)} 行")
+
+    has_utt = "utt_id" in all_rows[0] if all_rows else False
+
+    # 全量标签统计
+    from collections import Counter
+    tag_counts = dict(Counter(r.get("tag", "normal") for r in all_rows))
+    total = len(all_rows)
+
+    # ---- 2) 选出要导出的样本 ----
+    priority = {"harmful_suspect": 0, "hard": 1, "high_influence": 2, "normal": 3, "easy_redundant": 4}
+    all_rows.sort(key=lambda r: (priority.get(r.get("tag","normal"), 9), -float(r.get("self_influence", 0))))
+    selected = all_rows[:args.max_rows]
+    selected_ids = set(r["id"] for r in selected)
+    print(f"  选出 {len(selected)} 个样本导出")
+
+    # ---- 3) 读 npz 轨迹 ----
+    print("[export] 读取 epoch npz 文件 ...")
+    files = sorted(glob.glob(os.path.join(args.contrib_dir, "contrib_epoch*.npz")))
+    epochs = []
+    traj = {}  # id -> {ep: {gn, al}}
+    for f in files:
+        ep = int(os.path.basename(f)[len("contrib_epoch"):-len(".npz")])
+        epochs.append(ep)
+        d = np.load(f, allow_pickle=True)
+        ids_arr = d["ids"].astype(str)
+        for k in range(len(ids_arr)):
+            sid = ids_arr[k]
+            if sid in selected_ids:
+                traj.setdefault(sid, {})[ep] = {
+                    "gn": round(float(d["grad_norm"][k]), 4),
+                    "al": round(float(d["align"][k]), 4),
+                }
+        print(f"  epoch {ep}: done")
+    epochs.sort()
+
+    # ---- 4) 组装 JSON ----
+    print("[export] 组装 JSON ...")
+    samples = []
+    for r in selected:
+        sid = r["id"]
+        ep_data = traj.get(sid, {})
+        traj_gn = [ep_data.get(e, {}).get("gn", None) for e in epochs]
+        traj_al = [ep_data.get(e, {}).get("al", None) for e in epochs]
+        entry = {
+            "id": sid,
+            "tag": r.get("tag", "normal"),
+            "mgn": round(float(r.get("mean_grad_norm", 0)), 4),
+            "si": round(float(r.get("self_influence", 0)), 2),
+            "ma": round(float(r.get("mean_align", 0)), 4),
+            "fna": round(float(r.get("frac_neg_align", 0)), 3),
+            "fe": int(r.get("forget_events", 0)),
+            "fc": int(r.get("final_correct", -1)),
+            "tgn": traj_gn,
+            "tal": traj_al,
+        }
+        if has_utt:
+            entry["utt"] = r.get("utt_id", "")
+        ml = r.get("mean_loss", "nan")
+        if ml != "nan" and ml != "":
+            try:
+                entry["ml"] = round(float(ml), 4)
+            except:
+                pass
+        samples.append(entry)
+
+    result = {
+        "total": total,
+        "exported": len(samples),
+        "tag_counts": tag_counts,
+        "epochs": epochs,
+        "has_utt": has_utt,
+        "samples": samples,
+    }
+
+    with open(out_path, "w") as f:
+        json.dump(result, f, ensure_ascii=False)
+    size_mb = os.path.getsize(out_path) / 1024 / 1024
+    print(f"[export] 已写出 {out_path}  ({size_mb:.1f} MB, {len(samples)} 样本)")
+
+
+if __name__ == "__main__":
+    main()
