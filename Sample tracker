@@ -1,19 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 sample_tracker.py
-逐样本贡献的「存储 + 聚合」。被 contrib_hook.py 调用，按 epoch 落盘，
-训练结束聚成「一个样本一行」的 CSV。
-
-逐 epoch 记录（每个样本每个 epoch 一条；缺的字段记为 NaN/未知）：
-  grad_norm : ||dL/dX_i||   —— 真实的逐样本梯度范数（对损失模块输入的梯度）= 贡献大小/难易
-  align     : cos(dL/dX_i, Σ_j dL/dX_j) —— 与本 batch 共识方向是否一致（负=有害嫌疑）
-  loss      : 该样本的代理交叉熵（仅当能自动定位分类头时才有）
-  correct   : 是否预测正确（同上，可选）
-
-聚合（summarize -> CSV，一行一个样本）：
-  mean_grad_norm / early_grad_norm / self_influence(Σ grad_norm^2) /
-  mean_align / frac_neg_align / mean_loss / last_loss / forget_events /
-  final_correct / tag（按全体样本分位数给的启发式标签）
+逐样本贡献的「存储 + 聚合」。被 contrib_hook.py 调用。
+summarize 已改为 numpy 向量化，73 万样本 × 10 epoch 几秒内完成。
 """
 
 import os
@@ -40,14 +29,12 @@ class SampleContributionTracker:
         })
 
     def update_grad(self, ids, grad_norm, align):
-        """梯度路径：grad_norm/align 为长度 B 的 numpy 数组。"""
         for i, sid in enumerate(ids):
             e = self._ent(str(sid))
             e["gn"] += float(grad_norm[i]); e["gn_n"] += 1
             e["al"] += float(align[i]);     e["al_n"] += 1
 
     def update_pred(self, ids, loss, correct):
-        """可选预测路径：loss/correct 为长度 B 的 numpy 数组。"""
         for i, sid in enumerate(ids):
             e = self._ent(str(sid))
             e["loss"] += float(loss[i]); e["loss_n"] += 1
@@ -67,91 +54,120 @@ class SampleContributionTracker:
             loss=col(lambda e: e["loss"] / e["loss_n"] if e["loss_n"] else np.nan),
             correct=np.array([self._buf[i]["correct"] for i in ids], dtype=np.int8),
         )
+        print(f"[contrib] epoch {self._epoch} 已保存 ({len(ids)} 样本)")
 
-    # ---------- 训练结束后离线聚合 ----------
+    # ==================== 向量化 summarize ====================
     @staticmethod
     def summarize(save_dir, out_csv):
         files = sorted(glob.glob(os.path.join(save_dir, "contrib_epoch*.npz")))
         if not files:
             raise FileNotFoundError(f"在 {save_dir} 没找到 contrib_epoch*.npz")
+        n_epochs = len(files)
+        print(f"[contrib] 读取 {n_epochs} 个 epoch ...")
 
-        traj = {}  # sid -> list[(epoch, gn, al, loss, correct)]
-        for f in files:
-            ep = int(os.path.basename(f)[len("contrib_epoch"):-len(".npz")])
+        # ---- 第一步：收集所有 id 并建立 id->行号 映射 ----
+        d0 = np.load(files[0], allow_pickle=True)
+        all_ids = list(d0["ids"].astype(str))
+        id2idx = {sid: i for i, sid in enumerate(all_ids)}
+
+        for f in files[1:]:
             d = np.load(f, allow_pickle=True)
-            for k in range(len(d["ids"])):
-                sid = str(d["ids"][k])
-                traj.setdefault(sid, []).append(
-                    (ep, float(d["grad_norm"][k]), float(d["align"][k]),
-                     float(d["loss"][k]), int(d["correct"][k])))
+            for sid in d["ids"].astype(str):
+                if sid not in id2idx:
+                    id2idx[sid] = len(all_ids)
+                    all_ids.append(sid)
 
-        rows = []
-        for sid, recs in traj.items():
-            recs.sort(key=lambda x: x[0])
-            gn = np.array([r[1] for r in recs]); al = np.array([r[2] for r in recs])
-            ls = np.array([r[3] for r in recs]); co = [r[4] for r in recs]
-            co_known = [c for c in co if c in (0, 1)]
+        n_samples = len(all_ids)
+        print(f"[contrib] 共 {n_samples} 个样本，开始向量化聚合 ...")
 
-            forget = sum(1 for a, b in zip(co[:-1], co[1:])
-                         if a == 1 and b == 0)
-            row = {
-                "id": sid,
-                "n_epochs": len(recs),
-                "mean_grad_norm": _nanmean(gn),
-                "early_grad_norm": float(gn[0]) if len(gn) else np.nan,
-                "self_influence": float(np.nansum(gn ** 2)),
-                "mean_align": _nanmean(al),
-                "frac_neg_align": _frac(al < 0, al),
-                "mean_loss": _nanmean(ls),
-                "last_loss": float(ls[-1]) if len(ls) else np.nan,
-                "forget_events": int(forget),
-                "final_correct": (co_known[-1] if co_known else -1),
-            }
-            rows.append(row)
+        # ---- 第二步：分配 (n_samples, n_epochs) 矩阵，填入数据 ----
+        gn = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
+        al = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
+        ls = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
+        co = np.full((n_samples, n_epochs), -1, dtype=np.int8)
 
-        # 用全体样本的分位数定阈值，比绝对阈值稳
-        inf = np.array([r["self_influence"] for r in rows])
-        alm = np.array([r["mean_align"] for r in rows])
-        hi_inf = np.nanpercentile(inf, 90) if len(inf) else np.inf
-        lo_aln = np.nanpercentile(alm, 10) if np.any(~np.isnan(alm)) else -np.inf
-        for r in rows:
-            r["tag"] = SampleContributionTracker._tag(r, hi_inf, lo_aln)
+        for ei, f in enumerate(files):
+            d = np.load(f, allow_pickle=True)
+            ids_str = d["ids"].astype(str)
+            # 快速路径：如果 id 是纯数字（真实下标模式），直接转 int 当索引
+            try:
+                idxs = ids_str.astype(np.int64)
+                if idxs.max() >= n_samples or idxs.min() < 0:
+                    raise ValueError
+            except (ValueError, OverflowError):
+                idxs = np.array([id2idx[s] for s in ids_str], dtype=np.int64)
+            gn[idxs, ei] = d["grad_norm"]
+            al[idxs, ei] = d["align"]
+            ls[idxs, ei] = d["loss"]
+            co[idxs, ei] = d["correct"]
+            print(f"  epoch {ei}: {len(ids_str)} 样本已加载")
 
-        rows.sort(key=lambda r: r["self_influence"], reverse=True)
+        # ---- 第三步：全量向量化计算 ----
+        print("[contrib] 计算统计量 ...")
+        with np.errstate(all="ignore"):
+            mean_gn    = np.nanmean(gn, axis=1)
+            early_gn   = gn[:, 0]
+            self_inf   = np.nansum(gn ** 2, axis=1)
+            mean_al    = np.nanmean(al, axis=1)
+            mean_ls    = np.nanmean(ls, axis=1)
+            last_ls    = ls[:, -1]
+            n_ep_valid = np.sum(~np.isnan(gn), axis=1)
+
+            # frac_neg_align
+            valid_al = ~np.isnan(al)
+            neg_al   = (al < 0) & valid_al
+            n_val_al = valid_al.sum(axis=1).astype(np.float32)
+            frac_neg = np.where(n_val_al > 0, neg_al.sum(axis=1) / n_val_al, np.nan)
+
+            # forget events: correct[t]==1 → correct[t+1]==0
+            forget = np.zeros(n_samples, dtype=np.int32)
+            if n_epochs > 1:
+                forget = ((co[:, :-1] == 1) & (co[:, 1:] == 0)).sum(axis=1)
+            final_co = co[:, -1]
+
+        # ---- 第四步：按全体分位数打标签 ----
+        print("[contrib] 打标签 ...")
+        hi_inf = np.nanpercentile(self_inf, 90)
+        valid_ma = mean_al[~np.isnan(mean_al)]
+        lo_aln = np.nanpercentile(valid_ma, 10) if len(valid_ma) else -np.inf
+
+        tags = np.full(n_samples, 4, dtype=np.int8)  # 4=normal
+        # 按优先级从低到高覆盖（后写的覆盖前写的）
+        easy_mask = (~np.isnan(mean_ls)) & (mean_ls < 1e-2) & (forget == 0)
+        tags[easy_mask] = 0                            # easy_redundant
+        tags[self_inf >= hi_inf] = 1                   # high_influence
+        tags[(forget >= 2) | (final_co == 0)] = 2      # hard
+        harmful = (~np.isnan(mean_al)) & (mean_al < 0) & (mean_al <= lo_aln) & \
+                  ((final_co == 0) | (final_co == -1))
+        tags[harmful] = 3                              # harmful_suspect
+
+        tag_names = {0: "easy_redundant", 1: "high_influence",
+                     2: "hard", 3: "harmful_suspect", 4: "normal"}
+
+        # ---- 第五步：按 self_influence 降序写 CSV ----
+        print("[contrib] 写 CSV ...")
+        order = np.argsort(-self_inf)
+
         fields = ["id", "tag", "n_epochs", "mean_grad_norm", "early_grad_norm",
                   "self_influence", "mean_align", "frac_neg_align",
                   "mean_loss", "last_loss", "forget_events", "final_correct"]
         with open(out_csv, "w", newline="") as fh:
-            w = csv.DictWriter(fh, fieldnames=fields)
-            w.writeheader()
-            for r in rows:
-                w.writerow({k: r[k] for k in fields})
-        print(f"[contrib] 已写出 {len(rows)} 个样本 -> {out_csv}")
+            w = csv.writer(fh)
+            w.writerow(fields)
+            for i in order:
+                w.writerow([
+                    all_ids[i],
+                    tag_names[int(tags[i])],
+                    int(n_ep_valid[i]),
+                    f"{mean_gn[i]:.6f}",
+                    f"{early_gn[i]:.6f}",
+                    f"{self_inf[i]:.4f}",
+                    f"{mean_al[i]:.6f}",
+                    f"{frac_neg[i]:.4f}",
+                    f"{mean_ls[i]:.6f}",
+                    f"{last_ls[i]:.6f}",
+                    int(forget[i]),
+                    int(final_co[i]),
+                ])
+        print(f"[contrib] 已写出 {n_samples} 个样本 -> {out_csv}")
         return out_csv
-
-    @staticmethod
-    def _tag(r, hi_inf, lo_aln):
-        ma = r["mean_align"]
-        # 方向常与共识相反（且末期没学会，若已知）-> 有害/可能标错
-        if not np.isnan(ma) and ma < 0 and ma <= lo_aln:
-            if r["final_correct"] == 0 or r["final_correct"] == -1:
-                return "harmful_suspect"
-        if r["forget_events"] >= 2 or r["final_correct"] == 0:
-            return "hard"
-        if r["self_influence"] >= hi_inf:
-            return "high_influence"      # 模型从中学得最多（多为关键难样本）
-        if (not np.isnan(r["mean_loss"]) and r["mean_loss"] < 1e-2
-                and r["forget_events"] == 0):
-            return "easy_redundant"
-        return "normal"
-
-
-def _nanmean(a):
-    a = a[~np.isnan(a)]
-    return float(a.mean()) if a.size else np.nan
-
-
-def _frac(mask, ref):
-    valid = ~np.isnan(ref)
-    n = int(valid.sum())
-    return float((mask & valid).sum() / n) if n else np.nan
