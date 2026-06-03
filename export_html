@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+export_html.py — 把 contrib 数据全部打包进一个自包含 HTML
+用法:
+  python export_html.py \
+      --contrib model_exp/.../contrib/ \
+      --egs     egs/.../train.csv \
+      [--output contrib_viz.html]
+"""
+import argparse, base64, csv, glob, os, sys
+import numpy as np
+
+def load_summary(path):
+    rows = []
+    with open(path, newline='') as f:
+        for r in csv.DictReader(f):
+            rows.append(r)
+    print(f"  summary: {len(rows)} 样本")
+    return rows
+
+def load_npz(contrib_dir, n_samples, id2idx):
+    files = sorted(glob.glob(os.path.join(contrib_dir, "contrib_epoch*.npz")))
+    if not files:
+        print("  警告: 没找到 npz 文件，轨迹将不可用")
+        return [], np.array([]), np.array([]), np.array([])
+    epochs = []
+    n_ep = len(files)
+    gn = np.full((n_samples, n_ep), np.nan, dtype=np.float32)
+    al = np.full((n_samples, n_ep), np.nan, dtype=np.float32)
+    ls = np.full((n_samples, n_ep), np.nan, dtype=np.float32)
+    for ei, f in enumerate(files):
+        ep = int(os.path.basename(f)[len("contrib_epoch"):-len(".npz")])
+        epochs.append(ep)
+        d  = np.load(f, allow_pickle=True)
+        ids_str = d["ids"].astype(str)
+        try:
+            idxs = ids_str.astype(np.int64)
+            if idxs.max() >= n_samples or idxs.min() < 0:
+                raise ValueError
+        except (ValueError, OverflowError):
+            idxs = np.array([id2idx.get(s, -1) for s in ids_str], dtype=np.int64)
+            mask = idxs >= 0
+            valid_idxs = idxs[mask]
+            gn[valid_idxs, ei] = d["grad_norm"][mask]
+            al[valid_idxs, ei] = d["align"][mask]
+            ls[valid_idxs, ei] = d["loss"][mask]
+            print(f"  epoch {ep:03d} loaded")
+            continue
+        gn[idxs, ei] = d["grad_norm"]
+        al[idxs, ei] = d["align"]
+        ls[idxs, ei] = d["loss"]
+        print(f"  epoch {ep:03d} loaded")
+    return sorted(epochs), gn.flatten(), al.flatten(), ls.flatten()
+
+def b64(arr):
+    return base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode()
+
+TAG_MAP = {"harmful_suspect":0,"hard":1,"high_influence":2,"easy_redundant":3,"normal":4}
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--contrib",  required=True)
+    ap.add_argument("--egs",      default="")
+    ap.add_argument("--summary",  default="")
+    ap.add_argument("--output",   default="contrib_viz.html")
+    args = ap.parse_args()
+
+    # find summary
+    sp = args.summary
+    if not sp:
+        for n in ("contrib_summary_with_uttid.csv","contrib_summary.csv"):
+            p = os.path.join(args.contrib, n)
+            if os.path.exists(p): sp = p; break
+    if not sp or not os.path.exists(sp):
+        print("错误: 找不到 summary CSV，用 --summary 指定"); sys.exit(1)
+    print(f"读取数据...")
+    rows = load_summary(sp)
+    n = len(rows)
+
+    # load egs utt-ids if summary doesn't have them
+    if rows and "utt_id" not in rows[0] and args.egs and os.path.exists(args.egs):
+        print("  读取 egs utt-id ...")
+        delim = None
+        with open(args.egs) as f:
+            first = f.readline()
+            delim = '\t' if '\t' in first else ' '
+        with open(args.egs) as f:
+            for i, line in enumerate(f):
+                if i >= n: break
+                parts = line.strip().split(delim)
+                if parts: rows[i]["utt_id"] = parts[0]
+
+    # build id → row index map
+    id2idx = {r["id"]: i for i, r in enumerate(rows)}
+
+    print("读取轨迹 npz ...")
+    epochs, gn_flat, al_flat, ls_flat = load_npz(args.contrib, n, id2idx)
+
+    print("编码数据 ...")
+    FNAN = float("nan")
+    def fv(r, k):
+        try: return float(r.get(k,"nan"))
+        except: return FNAN
+
+    ids_arr     = np.array([int(r["id"]) if r["id"].isdigit() else i
+                            for i, r in enumerate(rows)], dtype=np.int32)
+    tags_arr    = np.array([TAG_MAP.get(r.get("tag","normal"),4) for r in rows], dtype=np.uint8)
+    self_inf    = np.array([fv(r,"self_influence")  for r in rows], dtype=np.float32)
+    mean_gn     = np.array([fv(r,"mean_grad_norm")  for r in rows], dtype=np.float32)
+    early_gn    = np.array([fv(r,"early_grad_norm") for r in rows], dtype=np.float32)
+    mean_al     = np.array([fv(r,"mean_align")      for r in rows], dtype=np.float32)
+    frac_neg    = np.array([fv(r,"frac_neg_align")  for r in rows], dtype=np.float32)
+    forget      = np.array([fv(r,"forget_events")   for r in rows], dtype=np.int16)
+    final_co    = np.array([fv(r,"final_correct")   for r in rows], dtype=np.int8)
+
+    utt_ids = "\n".join(r.get("utt_id", r.get("id","")) for r in rows)
+
+    data_js = f"""
+const _N={n}, _NE={len(epochs)};
+const EPOCHS={epochs};
+const TAG_NAMES=["harmful_suspect","hard","high_influence","easy_redundant","normal"];
+const TAG_CLR={{"harmful_suspect":"#f87171","hard":"#fb923c","high_influence":"#818cf8","easy_redundant":"#34d399","normal":"#4a5270"}};
+
+function _f32(b64){{const b=atob(b64),buf=new ArrayBuffer(b.length),u=new Uint8Array(buf);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return new Float32Array(buf);}}
+function _i32(b64){{const b=atob(b64),buf=new ArrayBuffer(b.length),u=new Uint8Array(buf);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return new Int32Array(buf);}}
+function _u8(b64) {{const b=atob(b64),buf=new ArrayBuffer(b.length),u=new Uint8Array(buf);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return new Uint8Array(buf);}}
+function _i16(b64){{const b=atob(b64),buf=new ArrayBuffer(b.length),u=new Uint8Array(buf);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return new Int16Array(buf);}}
+function _i8(b64) {{const b=atob(b64),buf=new ArrayBuffer(b.length),u=new Uint8Array(buf);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return new Int8Array(buf);}}
+
+const IDS     = _i32("{b64(ids_arr)}");
+const TAGS    = _u8 ("{b64(tags_arr)}");
+const SELF_INF= _f32("{b64(self_inf)}");
+const MEAN_GN = _f32("{b64(mean_gn)}");
+const EARLY_GN= _f32("{b64(early_gn)}");
+const MEAN_AL = _f32("{b64(mean_al)}");
+const FRAC_NEG= _f32("{b64(frac_neg)}");
+const FORGET  = _i16("{b64(forget)}");
+const FINAL_CO= _i8 ("{b64(final_co)}");
+const GN_TRAJ = _f32("{b64(gn_flat) if len(gn_flat) else ''}");
+const AL_TRAJ = _f32("{b64(al_flat) if len(al_flat) else ''}");
+const LS_TRAJ = _f32("{b64(ls_flat) if len(ls_flat) else ''}");
+const UTT_IDS = `{utt_ids}`.split("\\n");
+"""
+
+    html = build_html(data_js, n)
+    with open(args.output, "w", encoding="utf-8") as f:
+        f.write(html)
+    size_mb = os.path.getsize(args.output) / 1024 / 1024
+    print(f"\n完成 → {args.output}  ({size_mb:.1f} MB)")
+    print("浏览器直接打开该文件即可。")
+
+def build_html(data_js, n):
+    return f"""<!DOCTYPE html>
+<html lang="zh"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sample Contribution Analyzer</title>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{{--bg:#090b11;--surf:#0f1219;--surf2:#141820;--bdr:#1e2333;--bdr2:#252b3d;
+  --tx:#c8d0e0;--mt:#4a5270;--ac:#f59e0b;--harmful:#f87171;--hard:#fb923c;
+  --inf:#818cf8;--easy:#34d399;--mono:'Fira Code',monospace;--sans:'DM Sans',sans-serif;}}
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0;}}
+html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sans);overflow:hidden;}}
+body::before{{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+  background-image:linear-gradient(var(--bdr) 1px,transparent 1px),
+    linear-gradient(90deg,var(--bdr) 1px,transparent 1px);
+  background-size:40px 40px;opacity:.25;}}
+.layout{{position:relative;z-index:1;display:grid;grid-template-columns:420px 1fr;
+  grid-template-rows:56px 1fr;height:100vh;}}
+.header{{grid-column:1/-1;display:flex;align-items:center;padding:0 20px;gap:14px;
+  border-bottom:1px solid var(--bdr);background:var(--surf);font-family:var(--mono);font-size:13px;}}
+.htitle{{font-size:14px;font-weight:600;color:var(--ac);letter-spacing:.05em;}}
+.hmeta{{color:var(--mt);font-size:11px;}}
+.hloading{{color:var(--mt);font-size:10px;font-family:var(--mono);margin-left:auto;}}
+.tag-badge{{display:inline-flex;align-items:center;padding:2px 7px;border-radius:2px;
+  font-size:10px;font-family:var(--mono);font-weight:500;border:1px solid;}}
+.tag-badge.harmful_suspect{{color:var(--harmful);border-color:var(--harmful);background:rgba(248,113,113,.08);}}
+.tag-badge.hard{{color:var(--hard);border-color:var(--hard);background:rgba(251,146,60,.08);}}
+.tag-badge.high_influence{{color:var(--inf);border-color:var(--inf);background:rgba(129,140,248,.08);}}
+.tag-badge.easy_redundant{{color:var(--easy);border-color:var(--easy);background:rgba(52,211,153,.08);}}
+.tag-badge.normal{{color:var(--mt);border-color:var(--bdr2);background:transparent;}}
+.panel-left{{border-right:1px solid var(--bdr);display:flex;flex-direction:column;background:var(--surf);overflow:hidden;}}
+.controls{{padding:10px 12px;border-bottom:1px solid var(--bdr);display:flex;flex-direction:column;gap:8px;}}
+.controls input,.controls select{{width:100%;padding:6px 10px;background:var(--bg);border:1px solid var(--bdr2);
+  color:var(--tx);font-family:var(--mono);font-size:11px;outline:none;border-radius:2px;}}
+.controls input:focus,.controls select:focus{{border-color:var(--ac);}}
+.ctrl-row{{display:flex;gap:6px;}}.ctrl-row select{{flex:1;}}
+.list-wrap{{flex:1;overflow:hidden;position:relative;}}
+.list-scroll{{height:100%;overflow-y:auto;}}
+.list-scroll::-webkit-scrollbar{{width:4px;}}
+.list-scroll::-webkit-scrollbar-track{{background:var(--surf);}}
+.list-scroll::-webkit-scrollbar-thumb{{background:var(--bdr2);border-radius:2px;}}
+.list-spacer-top,.list-spacer-bot{{pointer-events:none;}}
+.srow{{display:grid;grid-template-columns:1fr 58px 58px 88px;align-items:center;
+  padding:7px 12px;cursor:pointer;gap:6px;border-bottom:1px solid var(--bdr);
+  transition:background .1s;height:34px;}}
+.srow:hover{{background:var(--surf2);}}
+.srow.sel{{background:rgba(245,158,11,.06);border-left:2px solid var(--ac);padding-left:10px;}}
+.sid{{color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10.5px;font-family:var(--mono);}}
+.sgn{{text-align:right;color:var(--mt);font-size:10px;font-family:var(--mono);}}
+.sal{{text-align:right;font-size:10px;font-family:var(--mono);}}
+.sal.pos{{color:var(--easy);}}.sal.neg{{color:var(--harmful);}}
+.col-tag{{justify-self:end;}}
+.pagination{{padding:8px 12px;border-top:1px solid var(--bdr);display:flex;align-items:center;
+  gap:8px;font-family:var(--mono);font-size:10px;color:var(--mt);}}
+.pagination button{{padding:3px 10px;background:var(--surf2);border:1px solid var(--bdr2);
+  color:var(--tx);font-family:var(--mono);font-size:10px;cursor:pointer;border-radius:2px;}}
+.pagination button:disabled{{opacity:.3;cursor:default;}}
+.pagination button:not(:disabled):hover{{border-color:var(--ac);color:var(--ac);}}
+.pginfo{{flex:1;text-align:center;}}
+.panel-right{{display:flex;flex-direction:column;overflow:hidden;}}
+.chart-hdr{{padding:14px 20px 10px;border-bottom:1px solid var(--bdr);background:var(--surf);
+  display:flex;align-items:flex-start;gap:16px;}}
+.ctitle{{font-family:var(--mono);font-size:12px;color:var(--ac);font-weight:600;}}
+.csub{{font-family:var(--mono);font-size:10px;color:var(--mt);margin-top:2px;}}
+.stat-grid{{margin-left:auto;display:flex;gap:20px;}}
+.stat-item{{text-align:right;}}
+.stat-lbl{{font-size:9px;color:var(--mt);font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em;}}
+.stat-val{{font-size:16px;font-family:var(--mono);font-weight:500;color:var(--tx);margin-top:2px;}}
+.chart-area{{flex:1;padding:20px 24px 16px;display:flex;flex-direction:column;gap:14px;overflow:hidden;}}
+.chart-wrap{{flex:1;position:relative;min-height:0;}}.chart-wrap canvas{{position:absolute;inset:0;}}
+.placeholder{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:12px;color:var(--mt);font-family:var(--mono);}}
+.placeholder-icon{{font-size:36px;opacity:.2;}}.placeholder p{{font-size:11px;}}
+.metric-legend{{display:flex;gap:20px;font-family:var(--mono);font-size:10px;color:var(--mt);}}
+.legend-item{{display:flex;align-items:center;gap:6px;}}
+.ldot{{width:8px;height:8px;border-radius:50%;flex-shrink:0;}}
+.ldot.gn{{background:var(--ac);}}.ldot.al{{background:var(--inf);}}.ldot.ls{{background:var(--easy);}}
+.correct-strip{{display:flex;gap:3px;align-items:center;}}
+.ccell{{width:22px;height:14px;border-radius:2px;display:flex;align-items:center;justify-content:center;font-size:9px;}}
+.ccell.c1{{background:rgba(52,211,153,.25);color:var(--easy);}}
+.ccell.c0{{background:rgba(248,113,113,.25);color:var(--harmful);}}
+.ccell.cm{{background:var(--bdr);color:var(--mt);}}
+</style></head><body>
+<div class="layout">
+  <header class="header">
+    <span class="htitle">SAMPLE CONTRIBUTION ANALYZER</span>
+    <span class="hmeta" id="hmeta"></span>
+    <span class="hloading" id="hloading">⏳ 解码数据中...</span>
+  </header>
+  <div class="panel-left">
+    <div class="controls">
+      <input id="search" placeholder="搜索 utt-id / 样本 id ..." oninput="onSearch()">
+      <div class="ctrl-row">
+        <select id="tag-filter" onchange="rebuild()">
+          <option value="-1">所有标签</option>
+          <option value="0">⚠ harmful_suspect</option>
+          <option value="1">hard</option>
+          <option value="2">↑ high_influence</option>
+          <option value="3">easy_redundant</option>
+          <option value="4">normal</option>
+        </select>
+        <select id="sort-field" onchange="rebuild()">
+          <option value="si-d">self_influence ↓</option>
+          <option value="gn-d">mean_grad_norm ↓</option>
+          <option value="al-a">mean_align ↑</option>
+          <option value="fn-d">frac_neg_align ↓</option>
+          <option value="fo-d">forget_events ↓</option>
+        </select>
+      </div>
+    </div>
+    <div class="list-wrap">
+      <div class="list-scroll" id="list-scroll" onscroll="onScroll()">
+        <div id="spacer-top" class="list-spacer-top"></div>
+        <div id="list-rows"></div>
+        <div id="spacer-bot" class="list-spacer-bot"></div>
+      </div>
+    </div>
+    <div class="pagination">
+      <button id="btn-p" onclick="prevPage()">◀</button>
+      <span class="pginfo" id="pginfo">—</span>
+      <button id="btn-n" onclick="nextPage()">▶</button>
+    </div>
+  </div>
+  <div class="panel-right">
+    <div class="chart-hdr">
+      <div><div class="ctitle" id="ctitle">— SELECT A SAMPLE —</div>
+           <div class="csub" id="csub"></div></div>
+      <div class="stat-grid" id="stat-grid"></div>
+    </div>
+    <div class="chart-area">
+      <div id="placeholder" class="placeholder">
+        <div class="placeholder-icon">◈</div>
+        <p>从左侧点击一个样本，查看梯度随 epoch 的变化轨迹</p>
+      </div>
+      <div id="chart-content" style="display:none;flex:1;flex-direction:column;gap:12px;">
+        <div class="chart-wrap"><canvas id="myChart"></canvas></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div class="metric-legend">
+            <div class="legend-item"><div class="ldot gn"></div>grad_norm</div>
+            <div class="legend-item"><div class="ldot al"></div>align</div>
+            <div class="legend-item"><div class="ldot ls"></div>loss (proxy)</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:10px;color:var(--mt);">
+            <span>correct:</span><div class="correct-strip" id="correct-strip"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+{data_js}
+
+// ── init ──────────────────────────────────────────────────
+const ROW_H = 34, PAGE = 100;
+let filtered = null;  // Int32Array of indices into base arrays
+let pageStart = 0;
+let selIdx = -1;
+let chart = null;
+let searchTimer = null;
+
+window.addEventListener('load', () => {{
+  document.getElementById('hloading').textContent = '';
+  buildTagStats();
+  rebuild();
+}});
+
+function buildTagStats() {{
+  const cnt = [0,0,0,0,0];
+  for(let i=0;i<_N;i++) cnt[TAGS[i]]++;
+  document.getElementById('hmeta').textContent =
+    `${{_N.toLocaleString()}} samples · ${{_NE}} epochs`;
+  // small tag badges in header
+  const hdr = document.getElementById('hloading');
+  hdr.style.marginLeft='auto';
+  hdr.style.display='flex'; hdr.style.gap='6px'; hdr.style.flexWrap='wrap';
+  hdr.innerHTML = [0,1,2,3].map(t => cnt[t]>0 ?
+    `<span class="tag-badge ${{TAG_NAMES[t]}}">${{TAG_NAMES[t].replace('_',' ')}} ${{cnt[t].toLocaleString()}}</span>` : ''
+  ).join('');
+}}
+
+function rebuild() {{
+  const tagF = parseInt(document.getElementById('tag-filter').value);
+  const sortK = document.getElementById('sort-field').value;
+  const q = document.getElementById('search').value.trim().toLowerCase();
+
+  // collect matching indices
+  let arr = [];
+  for(let i=0;i<_N;i++) {{
+    if(tagF >= 0 && TAGS[i] !== tagF) continue;
+    if(q) {{
+      const uid = UTT_IDS[i].toLowerCase();
+      const id  = String(IDS[i]);
+      if(!uid.includes(q) && !id.includes(q)) continue;
+    }}
+    arr.push(i);
+  }}
+
+  // sort
+  const [key, dir] = sortK.split('-');
+  const desc = dir==='d';
+  const getV = key==='si'? i=>SELF_INF[i]
+              :key==='gn'? i=>MEAN_GN[i]
+              :key==='al'? i=>MEAN_AL[i]
+              :key==='fn'? i=>FRAC_NEG[i]
+              :key==='fo'? i=>FORGET[i]
+              : i=>SELF_INF[i];
+  arr.sort((a,b) => desc ? getV(b)-getV(a) : getV(a)-getV(b));
+
+  filtered = arr;
+  pageStart = 0;
+  renderPage();
+}}
+
+function renderPage() {{
+  const total = filtered.length;
+  const pages = Math.max(1, Math.ceil(total/PAGE));
+  const page  = Math.floor(pageStart/PAGE)+1;
+  const slice = filtered.slice(pageStart, pageStart+PAGE);
+
+  document.getElementById('pginfo').textContent = `${{page}} / ${{pages}}  (${{total.toLocaleString()}})`;
+  document.getElementById('btn-p').disabled = pageStart <= 0;
+  document.getElementById('btn-n').disabled = pageStart + PAGE >= total;
+
+  const container = document.getElementById('list-rows');
+  container.innerHTML = '';
+  slice.forEach(i => container.appendChild(makeRow(i)));
+  document.getElementById('list-scroll').scrollTop = 0;
+}}
+
+function makeRow(i) {{
+  const d = document.createElement('div');
+  d.className = 'srow' + (i===selIdx?' sel':'');
+  d.dataset.idx = i;
+  d.onclick = () => selectSample(i, d);
+  const tag = TAG_NAMES[TAGS[i]];
+  const gn  = MEAN_GN[i];
+  const al  = MEAN_AL[i];
+  const alCls = isNaN(al)?'':al>=0?'pos':'neg';
+  const label = UTT_IDS[i] || String(IDS[i]);
+  d.innerHTML =
+    `<div class="sid" title="${{label}}">${{label}}</div>`+
+    `<div class="sgn">${{isNaN(gn)?'—':gn.toFixed(3)}}</div>`+
+    `<div class="sal ${{alCls}}">${{isNaN(al)?'—':al.toFixed(3)}}</div>`+
+    `<div class="col-tag"><span class="tag-badge ${{tag}}">${{tag.replace('_',' ')}}</span></div>`;
+  return d;
+}}
+
+function prevPage() {{ if(pageStart>0){{pageStart=Math.max(0,pageStart-PAGE);renderPage();}} }}
+function nextPage() {{ if(pageStart+PAGE<filtered.length){{pageStart+=PAGE;renderPage();}} }}
+function onSearch()  {{ clearTimeout(searchTimer); searchTimer=setTimeout(rebuild,300); }}
+
+function selectSample(idx, el) {{
+  selIdx = idx;
+  document.querySelectorAll('.srow').forEach(r=>r.classList.remove('sel'));
+  el.classList.add('sel');
+
+  const label = UTT_IDS[idx] || `id: ${{IDS[idx]}}`;
+  const tag   = TAG_NAMES[TAGS[idx]];
+  document.getElementById('ctitle').textContent = label;
+  document.getElementById('csub').textContent =
+    `tag: ${{tag}}  ·  self_influence: ${{SELF_INF[idx].toFixed(2)}}  ·  forget: ${{FORGET[idx]}}`;
+
+  const stats = [
+    {{l:'SELF INFLUENCE',v: SELF_INF[idx].toFixed(1)}},
+    {{l:'MEAN GRAD NORM',v: MEAN_GN[idx].toFixed(4)}},
+    {{l:'MEAN ALIGN',    v: MEAN_AL[idx].toFixed(4)}},
+    {{l:'NEG ALIGN %',  v: (FRAC_NEG[idx]*100).toFixed(0)+'%'}},
+  ];
+  document.getElementById('stat-grid').innerHTML = stats.map(s=>
+    `<div class="stat-item"><div class="stat-lbl">${{s.l}}</div><div class="stat-val">${{s.v}}</div></div>`
+  ).join('');
+
+  drawChart(idx);
+}}
+
+function getTraj(idx) {{
+  const gn=[], al=[], ls=[];
+  for(let e=0;e<_NE;e++) {{
+    const base = idx*_NE+e;
+    gn.push(GN_TRAJ.length? (isNaN(GN_TRAJ[base])?null:GN_TRAJ[base]) : null);
+    al.push(AL_TRAJ.length? (isNaN(AL_TRAJ[base])?null:AL_TRAJ[base]) : null);
+    ls.push(LS_TRAJ.length? (isNaN(LS_TRAJ[base])?null:LS_TRAJ[base]) : null);
+  }}
+  return {{gn,al,ls}};
+}}
+
+function drawChart(idx) {{
+  const t = getTraj(idx);
+  const labels = EPOCHS.map(e=>`ep${{e}}`);
+  document.getElementById('placeholder').style.display='none';
+  const cc=document.getElementById('chart-content'); cc.style.display='flex';
+  const ctx=document.getElementById('myChart').getContext('2d');
+  if(chart) chart.destroy();
+  chart = new Chart(ctx,{{
+    type:'line',
+    data:{{labels,datasets:[
+      {{label:'grad_norm',data:t.gn,borderColor:'#f59e0b',backgroundColor:'rgba(245,158,11,.1)',
+        borderWidth:2,pointRadius:4,pointBackgroundColor:'#f59e0b',tension:.3,yAxisID:'y'}},
+      {{label:'align',    data:t.al,borderColor:'#818cf8',backgroundColor:'rgba(129,140,248,.1)',
+        borderWidth:2,pointRadius:4,pointBackgroundColor:'#818cf8',tension:.3,yAxisID:'y2'}},
+      {{label:'loss',     data:t.ls,borderColor:'#34d399',backgroundColor:'rgba(52,211,153,.07)',
+        borderWidth:1.5,pointRadius:3,pointBackgroundColor:'#34d399',tension:.3,
+        borderDash:[4,3],yAxisID:'y'}},
+    ]}},
+    options:{{
+      responsive:true,maintainAspectRatio:false,animation:{{duration:250}},
+      interaction:{{mode:'index',intersect:false}},
+      plugins:{{legend:{{display:false}},
+        tooltip:{{backgroundColor:'#141820',borderColor:'#252b3d',borderWidth:1,
+          titleColor:'#c8d0e0',bodyColor:'#7a8299',
+          titleFont:{{family:'Fira Code',size:11}},bodyFont:{{family:'Fira Code',size:10}},
+          callbacks:{{label:c=>`  ${{c.dataset.label}}: ${{c.parsed.y?.toFixed(5)??'—'}}`}}}}}},
+      scales:{{
+        x:{{grid:{{color:'#1e2333'}},ticks:{{color:'#4a5270',font:{{family:'Fira Code',size:10}}}}}},
+        y:{{grid:{{color:'#1e2333'}},ticks:{{color:'#f59e0b',font:{{family:'Fira Code',size:9}}}},
+          title:{{display:true,text:'grad_norm / loss',color:'#4a5270',font:{{family:'Fira Code',size:9}}}}}},
+        y2:{{position:'right',grid:{{display:false}},ticks:{{color:'#818cf8',font:{{family:'Fira Code',size:9}}}},
+          title:{{display:true,text:'align',color:'#4a5270',font:{{family:'Fira Code',size:9}}}}}}
+      }}
+    }}
+  }});
+  // correct strip
+  const co=document.getElementById('correct-strip');
+  co.innerHTML=''; // no correct data available when proto loss used
+}}
+</script></body></html>"""
+
+if __name__ == "__main__":
+    main()
