@@ -1,5 +1,8 @@
-import { useState, useMemo, useCallback } from "react";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar, Cell, ScatterChart, Scatter } from "recharts";
+import { useState, useMemo, useCallback, useRef } from "react";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, BarChart, Bar, Cell, ScatterChart, Scatter,
+} from "recharts";
 
 const TAG_COLORS = {
   harmful_suspect: "#ef4444",
@@ -18,90 +21,53 @@ const TAG_LABELS = {
 };
 
 const SORT_KEYS = [
-  { key: "si", label: "Self Influence ↓" },
-  { key: "mgn", label: "Grad Norm ↓" },
-  { key: "ma", label: "Align ↑" },
+  { key: "si",     label: "Self Influence ↓" },
+  { key: "mgn",    label: "Grad Norm ↓" },
+  { key: "ma",     label: "Align ↑" },
   { key: "ma_asc", label: "Align ↓ (最负)" },
-  { key: "fna", label: "负对齐占比 ↓" },
-  { key: "fe", label: "遗忘次数 ↓" },
+  { key: "fna",    label: "负对齐占比 ↓" },
+  { key: "fe",     label: "遗忘次数 ↓" },
 ];
+
+const btnStyle = {
+  background: "#1e1e2a",
+  color: "#aaa",
+  border: "1px solid #333",
+  borderRadius: "4px",
+  padding: "5px 14px",
+  fontSize: "11px",
+  cursor: "pointer",
+};
 
 function TagBadge({ tag }) {
   return (
-    <span
-      style={{
-        background: TAG_COLORS[tag] || "#6b7280",
-        color: "#fff",
-        padding: "2px 8px",
-        borderRadius: "4px",
-        fontSize: "11px",
-        fontWeight: 600,
-        letterSpacing: "0.5px",
-        whiteSpace: "nowrap",
-      }}
-    >
+    <span style={{
+      background: TAG_COLORS[tag] || "#6b7280",
+      color: "#fff",
+      padding: "2px 8px",
+      borderRadius: "4px",
+      fontSize: "11px",
+      fontWeight: 600,
+      letterSpacing: "0.5px",
+      whiteSpace: "nowrap",
+    }}>
       {TAG_LABELS[tag] || tag}
     </span>
   );
 }
 
-function FileUpload({ onLoad }) {
-  const handleFile = useCallback((e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      try {
-        const data = JSON.parse(ev.target.result);
-        onLoad(data);
-      } catch (err) {
-        alert("JSON 解析失败: " + err.message);
-      }
-    };
-    reader.readAsText(file);
-  }, [onLoad]);
-
-  return (
-    <div style={{
-      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-      height: "100vh", background: "#0a0a0f", color: "#e2e2e8", fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-    }}>
-      <div style={{
-        border: "2px dashed #333", borderRadius: "12px", padding: "60px 80px",
-        textAlign: "center", background: "#12121a",
-      }}>
-        <div style={{ fontSize: "42px", marginBottom: "16px", opacity: 0.6 }}>📊</div>
-        <div style={{ fontSize: "18px", fontWeight: 700, marginBottom: "8px", color: "#c0c0d0" }}>
-          加载可视化数据
-        </div>
-        <div style={{ fontSize: "12px", color: "#666", marginBottom: "24px" }}>
-          上传 export_viz.py 生成的 viz_data.json
-        </div>
-        <label style={{
-          display: "inline-block", padding: "10px 28px", background: "#8b5cf6",
-          borderRadius: "6px", cursor: "pointer", fontSize: "13px", fontWeight: 600,
-          transition: "background 0.2s",
-        }}>
-          选择文件
-          <input type="file" accept=".json" onChange={handleFile} style={{ display: "none" }} />
-        </label>
-      </div>
-    </div>
-  );
-}
-
 function Overview({ data }) {
   const tagData = useMemo(() =>
-    Object.entries(data.tag_counts).map(([tag, count]) => ({
-      tag, count, label: TAG_LABELS[tag] || tag, fill: TAG_COLORS[tag] || "#6b7280",
-    })).sort((a, b) => b.count - a.count),
+    Object.entries(data.tag_counts)
+      .map(([tag, count]) => ({
+        tag, count, label: TAG_LABELS[tag] || tag, fill: TAG_COLORS[tag] || "#6b7280",
+      }))
+      .sort((a, b) => b.count - a.count),
     [data]
   );
 
   const scatterData = useMemo(() =>
-    data.samples.slice(0, 3000).map((s) => ({
-      x: s.mgn, y: s.ma, tag: s.tag, id: s.id,
-    })),
+    data.samples.slice(0, 3000).map((s) => ({ x: s.mgn, y: s.ma, tag: s.tag, id: s.id })),
     [data]
   );
 
@@ -126,6 +92,7 @@ function Overview({ data }) {
           </BarChart>
         </ResponsiveContainer>
       </div>
+
       <div style={{ background: "#16161e", borderRadius: "8px", padding: "20px" }}>
         <div style={{ fontSize: "13px", fontWeight: 700, marginBottom: "12px", color: "#a0a0b0" }}>
           Grad Norm vs Align（前 3000 样本）
@@ -133,20 +100,17 @@ function Overview({ data }) {
         <ResponsiveContainer width="100%" height={200}>
           <ScatterChart margin={{ bottom: 5 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-            <XAxis dataKey="x" name="grad_norm" tick={{ fill: "#666", fontSize: 10 }} label={{ value: "grad_norm", position: "bottom", fill: "#666", fontSize: 10 }} />
-            <YAxis dataKey="y" name="align" tick={{ fill: "#666", fontSize: 10 }} label={{ value: "align", angle: -90, position: "insideLeft", fill: "#666", fontSize: 10 }} />
+            <XAxis dataKey="x" name="grad_norm" tick={{ fill: "#666", fontSize: 10 }}
+              label={{ value: "grad_norm", position: "bottom", fill: "#666", fontSize: 10 }} />
+            <YAxis dataKey="y" name="align" tick={{ fill: "#666", fontSize: 10 }}
+              label={{ value: "align", angle: -90, position: "insideLeft", fill: "#666", fontSize: 10 }} />
             <Tooltip
               contentStyle={{ background: "#1e1e2a", border: "1px solid #333", fontSize: 11, borderRadius: 6 }}
               formatter={(v, name) => [v.toFixed(4), name]}
             />
             {Object.keys(TAG_COLORS).map((tag) => (
-              <Scatter
-                key={tag}
-                data={scatterData.filter((d) => d.tag === tag)}
-                fill={TAG_COLORS[tag]}
-                opacity={0.5}
-                r={2}
-              />
+              <Scatter key={tag} data={scatterData.filter((d) => d.tag === tag)}
+                fill={TAG_COLORS[tag]} opacity={0.5} r={2} />
             ))}
           </ScatterChart>
         </ResponsiveContainer>
@@ -192,10 +156,12 @@ function TrajectoryChart({ sample, epochs }) {
           <ResponsiveContainer width="100%" height={180}>
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-              <XAxis dataKey="epoch" tick={{ fill: "#666", fontSize: 10 }} label={{ value: "epoch", position: "bottom", fill: "#555", fontSize: 10 }} />
+              <XAxis dataKey="epoch" tick={{ fill: "#666", fontSize: 10 }}
+                label={{ value: "epoch", position: "bottom", fill: "#555", fontSize: 10 }} />
               <YAxis tick={{ fill: "#666", fontSize: 10 }} />
               <Tooltip contentStyle={{ background: "#1e1e2a", border: "1px solid #333", fontSize: 11, borderRadius: 6 }} />
-              <Line type="monotone" dataKey="grad_norm" stroke="#f59e0b" strokeWidth={2} dot={{ fill: "#f59e0b", r: 3 }} connectNulls />
+              <Line type="monotone" dataKey="grad_norm" stroke="#f59e0b" strokeWidth={2}
+                dot={{ fill: "#f59e0b", r: 3 }} connectNulls />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -206,11 +172,14 @@ function TrajectoryChart({ sample, epochs }) {
           <ResponsiveContainer width="100%" height={180}>
             <LineChart data={chartData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#222" />
-              <XAxis dataKey="epoch" tick={{ fill: "#666", fontSize: 10 }} label={{ value: "epoch", position: "bottom", fill: "#555", fontSize: 10 }} />
+              <XAxis dataKey="epoch" tick={{ fill: "#666", fontSize: 10 }}
+                label={{ value: "epoch", position: "bottom", fill: "#555", fontSize: 10 }} />
               <YAxis tick={{ fill: "#666", fontSize: 10 }} />
               <Tooltip contentStyle={{ background: "#1e1e2a", border: "1px solid #333", fontSize: 11, borderRadius: 6 }} />
-              <Line type="monotone" dataKey="align" stroke="#3b82f6" strokeWidth={2} dot={{ fill: "#3b82f6", r: 3 }} connectNulls />
-              <Line type="monotone" dataKey={() => 0} stroke="#ef4444" strokeWidth={1} strokeDasharray="4 4" dot={false} />
+              <Line type="monotone" dataKey="align" stroke="#3b82f6" strokeWidth={2}
+                dot={{ fill: "#3b82f6", r: 3 }} connectNulls />
+              <Line type="monotone" dataKey={() => 0} stroke="#ef4444" strokeWidth={1}
+                strokeDasharray="4 4" dot={false} />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -231,7 +200,9 @@ function SampleTable({ data, onSelect, selected }) {
     if (tagFilter !== "all") rows = rows.filter((s) => s.tag === tagFilter);
     if (search.trim()) {
       const q = search.trim().toLowerCase();
-      rows = rows.filter((s) => (s.utt || s.id).toLowerCase().includes(q) || s.id.includes(q));
+      rows = rows.filter((s) =>
+        (s.utt || s.id).toLowerCase().includes(q) || s.id.toString().includes(q)
+      );
     }
     const sorted = [...rows];
     if (sortKey === "ma_asc") sorted.sort((a, b) => a.ma - b.ma);
@@ -248,42 +219,27 @@ function SampleTable({ data, onSelect, selected }) {
     color: "#666", textTransform: "uppercase", letterSpacing: "1px",
     borderBottom: "1px solid #222", position: "sticky", top: 0, background: "#12121a",
   };
-  const tdStyle = { padding: "6px 10px", fontSize: "12px", color: "#c8c8d4", borderBottom: "1px solid #1a1a24" };
+  const tdStyle = {
+    padding: "6px 10px", fontSize: "12px", color: "#c8c8d4", borderBottom: "1px solid #1a1a24",
+  };
 
   return (
     <div style={{ background: "#16161e", borderRadius: "8px", padding: "16px" }}>
       <div style={{ display: "flex", gap: "10px", marginBottom: "12px", flexWrap: "wrap", alignItems: "center" }}>
-        <select
-          value={tagFilter}
-          onChange={(e) => { setTagFilter(e.target.value); setPage(0); }}
-          style={{
-            background: "#1e1e2a", color: "#ccc", border: "1px solid #333", borderRadius: "4px",
-            padding: "6px 10px", fontSize: "12px", outline: "none",
-          }}
-        >
+        <select value={tagFilter} onChange={(e) => { setTagFilter(e.target.value); setPage(0); }}
+          style={{ background: "#1e1e2a", color: "#ccc", border: "1px solid #333", borderRadius: "4px", padding: "6px 10px", fontSize: "12px", outline: "none" }}>
           <option value="all">全部标签</option>
           {Object.keys(TAG_COLORS).map((t) => (
             <option key={t} value={t}>{TAG_LABELS[t]} ({data.tag_counts[t] || 0})</option>
           ))}
         </select>
-        <select
-          value={sortKey}
-          onChange={(e) => { setSortKey(e.target.value); setPage(0); }}
-          style={{
-            background: "#1e1e2a", color: "#ccc", border: "1px solid #333", borderRadius: "4px",
-            padding: "6px 10px", fontSize: "12px", outline: "none",
-          }}
-        >
+        <select value={sortKey} onChange={(e) => { setSortKey(e.target.value); setPage(0); }}
+          style={{ background: "#1e1e2a", color: "#ccc", border: "1px solid #333", borderRadius: "4px", padding: "6px 10px", fontSize: "12px", outline: "none" }}>
           {SORT_KEYS.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
         </select>
-        <input
-          placeholder="搜索 utt-id / sample id ..."
-          value={search}
-          onChange={(e) => { setSearch(e.target.value); setPage(0); }}
-          style={{
-            background: "#1e1e2a", color: "#ccc", border: "1px solid #333", borderRadius: "4px",
-            padding: "6px 12px", fontSize: "12px", flex: 1, minWidth: "180px", outline: "none",
-          }}
+        <input placeholder="搜索 utt-id / sample id ..."
+          value={search} onChange={(e) => { setSearch(e.target.value); setPage(0); }}
+          style={{ background: "#1e1e2a", color: "#ccc", border: "1px solid #333", borderRadius: "4px", padding: "6px 12px", fontSize: "12px", flex: 1, minWidth: "180px", outline: "none" }}
         />
         <span style={{ fontSize: "11px", color: "#555" }}>
           {filtered.length.toLocaleString()} 条 · 第 {page + 1}/{totalPages || 1} 页
@@ -294,8 +250,10 @@ function SampleTable({ data, onSelect, selected }) {
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead>
             <tr>
+              {/* 序号列 */}
+              <th style={{ ...thStyle, width: "48px" }}>#</th>
               {data.has_utt && <th style={thStyle}>UTT-ID</th>}
-              <th style={thStyle}>ID</th>
+              <th style={thStyle}>Sample ID</th>
               <th style={thStyle}>标签</th>
               <th style={thStyle}>Self Inf</th>
               <th style={thStyle}>Grad Norm</th>
@@ -306,29 +264,31 @@ function SampleTable({ data, onSelect, selected }) {
             </tr>
           </thead>
           <tbody>
-            {pageRows.map((s) => {
+            {pageRows.map((s, localIdx) => {
+              const globalIdx = page * pageSize + localIdx + 1; // 1-based 全局序号
               const isSelected = selected?.id === s.id;
               return (
-                <tr
-                  key={s.id}
-                  onClick={() => onSelect(s)}
-                  style={{
-                    cursor: "pointer",
-                    background: isSelected ? "#1e1e3a" : "transparent",
-                    transition: "background 0.15s",
-                  }}
+                <tr key={s.id} onClick={() => onSelect(s)}
+                  style={{ cursor: "pointer", background: isSelected ? "#1e1e3a" : "transparent", transition: "background 0.15s" }}
                   onMouseEnter={(e) => { if (!isSelected) e.currentTarget.style.background = "#1a1a28"; }}
                   onMouseLeave={(e) => { if (!isSelected) e.currentTarget.style.background = "transparent"; }}
                 >
-                  {data.has_utt && <td style={{ ...tdStyle, maxWidth: "220px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.utt}</td>}
-                  <td style={{ ...tdStyle, color: "#888" }}>{s.id}</td>
+                  {/* 序号 */}
+                  <td style={{ ...tdStyle, color: "#444", fontSize: "11px", textAlign: "right", paddingRight: "14px" }}>
+                    {globalIdx}
+                  </td>
+                  {data.has_utt && (
+                    <td style={{ ...tdStyle, maxWidth: "220px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {s.utt}
+                    </td>
+                  )}
+                  <td style={{ ...tdStyle, color: "#888", fontVariantNumeric: "tabular-nums" }}>{s.id}</td>
                   <td style={tdStyle}><TagBadge tag={s.tag} /></td>
                   <td style={{ ...tdStyle, fontVariantNumeric: "tabular-nums" }}>{s.si.toFixed(1)}</td>
                   <td style={{ ...tdStyle, fontVariantNumeric: "tabular-nums" }}>{s.mgn.toFixed(4)}</td>
-                  <td style={{
-                    ...tdStyle, fontVariantNumeric: "tabular-nums",
-                    color: s.ma < 0 ? "#ef4444" : "#22c55e",
-                  }}>{s.ma.toFixed(4)}</td>
+                  <td style={{ ...tdStyle, fontVariantNumeric: "tabular-nums", color: s.ma < 0 ? "#ef4444" : "#22c55e" }}>
+                    {s.ma.toFixed(4)}
+                  </td>
                   <td style={{ ...tdStyle, fontVariantNumeric: "tabular-nums" }}>{(s.fna * 100).toFixed(0)}%</td>
                   <td style={{ ...tdStyle, color: s.fe >= 2 ? "#f59e0b" : "#666" }}>{s.fe}</td>
                   <td style={{ ...tdStyle, color: s.fc === 1 ? "#22c55e" : s.fc === 0 ? "#ef4444" : "#444" }}>
@@ -342,57 +302,104 @@ function SampleTable({ data, onSelect, selected }) {
       </div>
 
       <div style={{ display: "flex", justifyContent: "center", gap: "6px", marginTop: "12px" }}>
-        <button
-          onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0}
-          style={{ ...btnStyle, opacity: page === 0 ? 0.3 : 1 }}
-        >← 上一页</button>
-        <button
-          onClick={() => setPage(Math.min(totalPages - 1, page + 1))} disabled={page >= totalPages - 1}
-          style={{ ...btnStyle, opacity: page >= totalPages - 1 ? 0.3 : 1 }}
-        >下一页 →</button>
+        <button onClick={() => setPage(Math.max(0, page - 1))} disabled={page === 0}
+          style={{ ...btnStyle, opacity: page === 0 ? 0.3 : 1 }}>← 上一页</button>
+        <button onClick={() => setPage(Math.min(totalPages - 1, page + 1))} disabled={page >= totalPages - 1}
+          style={{ ...btnStyle, opacity: page >= totalPages - 1 ? 0.3 : 1 }}>下一页 →</button>
       </div>
     </div>
   );
 }
 
-const btnStyle = {
-  background: "#1e1e2a", color: "#aaa", border: "1px solid #333", borderRadius: "4px",
-  padding: "5px 14px", fontSize: "11px", cursor: "pointer",
-};
-
 export default function App() {
   const [data, setData] = useState(null);
   const [selected, setSelected] = useState(null);
+  const [fileName, setFileName] = useState(null);
+  const fileInputRef = useRef(null);
 
-  if (!data) return <FileUpload onLoad={setData} />;
+  const handleFile = useCallback((e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const parsed = JSON.parse(ev.target.result);
+        setData(parsed);
+        setSelected(null);
+      } catch (err) {
+        alert("JSON 解析失败: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    // reset input so re-selecting same file still triggers onChange
+    e.target.value = "";
+  }, []);
 
   return (
     <div style={{
-      background: "#0a0a0f", color: "#e2e2e8", minHeight: "100vh", padding: "20px 24px",
+      background: "#0a0a0f", color: "#e2e2e8", minHeight: "100vh",
       fontFamily: "'JetBrains Mono', 'Fira Code', 'SF Mono', monospace",
     }}>
-      <div style={{ maxWidth: "1200px", margin: "0 auto" }}>
-        <div style={{ display: "flex", alignItems: "baseline", gap: "16px", marginBottom: "20px" }}>
-          <h1 style={{ fontSize: "20px", fontWeight: 800, color: "#e0e0ef", margin: 0, letterSpacing: "-0.5px" }}>
-            Sample Contribution Tracker
-          </h1>
-          <span style={{ fontSize: "11px", color: "#555" }}>
+      {/* ── Top header / toolbar ── */}
+      <div style={{
+        position: "sticky", top: 0, zIndex: 100,
+        background: "#0d0d14", borderBottom: "1px solid #1e1e2a",
+        padding: "10px 24px",
+        display: "flex", alignItems: "center", gap: "16px",
+      }}>
+        <h1 style={{ fontSize: "16px", fontWeight: 800, color: "#e0e0ef", margin: 0, letterSpacing: "-0.5px", whiteSpace: "nowrap" }}>
+          Sample Contribution Tracker
+        </h1>
+
+        {/* File picker — always visible */}
+        <label style={{
+          display: "inline-flex", alignItems: "center", gap: "6px",
+          padding: "5px 14px", background: "#8b5cf6", borderRadius: "5px",
+          cursor: "pointer", fontSize: "12px", fontWeight: 600, whiteSpace: "nowrap",
+          transition: "background 0.2s",
+        }}
+          onMouseEnter={(e) => e.currentTarget.style.background = "#7c3aed"}
+          onMouseLeave={(e) => e.currentTarget.style.background = "#8b5cf6"}
+        >
+          📂 {fileName ? "重新加载" : "选择 viz_data.json"}
+          <input ref={fileInputRef} type="file" accept=".json" onChange={handleFile} style={{ display: "none" }} />
+        </label>
+
+        {data && (
+          <span style={{ fontSize: "11px", color: "#555", whiteSpace: "nowrap" }}>
+            {fileName && <span style={{ color: "#888", marginRight: "10px" }}>{fileName}</span>}
             {data.total.toLocaleString()} total · {data.exported.toLocaleString()} exported · {data.epochs.length} epochs
           </span>
-          <button
-            onClick={() => { setData(null); setSelected(null); }}
-            style={{ ...btnStyle, marginLeft: "auto" }}
-          >重新加载</button>
-        </div>
+        )}
+      </div>
 
-        <Overview data={data} />
+      {/* ── Main content ── */}
+      <div style={{ maxWidth: "1200px", margin: "0 auto", padding: "20px 24px" }}>
+        {!data ? (
+          /* Empty state — subtle, not a full-page gate */
+          <div style={{
+            marginTop: "80px", textAlign: "center", color: "#444",
+            fontSize: "13px", lineHeight: "2",
+          }}>
+            <div style={{ fontSize: "36px", marginBottom: "12px", opacity: 0.4 }}>📊</div>
+            <div>点击上方「选择 viz_data.json」加载数据</div>
+            <div style={{ fontSize: "11px", color: "#333", marginTop: "4px" }}>
+              由 export_viz.py 生成的 viz_data.json
+            </div>
+          </div>
+        ) : (
+          <>
+            <Overview data={data} />
 
-        {selected && <TrajectoryChart sample={selected} epochs={data.epochs} />}
+            {selected && <TrajectoryChart sample={selected} epochs={data.epochs} />}
 
-        <div style={{ fontSize: "12px", color: "#555", marginBottom: "8px" }}>
-          👆 点击表格中的样本查看梯度随 epoch 的变化轨迹
-        </div>
-        <SampleTable data={data} onSelect={setSelected} selected={selected} />
+            <div style={{ fontSize: "12px", color: "#555", marginBottom: "8px" }}>
+              👆 点击表格中的样本查看梯度随 epoch 的变化轨迹
+            </div>
+            <SampleTable data={data} onSelect={setSelected} selected={selected} />
+          </>
+        )}
       </div>
     </div>
   );
