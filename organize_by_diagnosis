@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+organize_by_diagnosis.py
+
+读取 model_comparison.xlsx 里每条样本的 diagnosis，
+结合 FiberBench-V1.1.json → audio_info.json 查出真实 wav 路径，
+输出一份 Excel 报告（按数据集分 sheet，按 diagnosis 分组排序）。
+
+依赖: pandas, openpyxl
+用法: 改 CONFIG 区, python3 organize_by_diagnosis.py
+"""
+
+import os, json
+import pandas as pd
+from openpyxl.styles import PatternFill, Font
+
+# ===================== CONFIG =====================
+FIBERBENCH_JSON = "/data1/Archive/FiberArchive/codes/ModelTraining/subtools-resnet-v1.0.0/conf/test_conf/FiberBench-V1.1.json"
+XLSX_PATH       = "model_comparison.xlsx"   # compare_models.py 的输出
+OUTPUT_REPORT   = "diagnosis_paths.xlsx"    # 输出报告
+# ==================================================
+
+DIAG_ORDER = ["all_wrong", "disagree", "all_correct", "no_data"]
+
+
+def load_fiberbench(path):
+    with open(path, encoding="utf-8") as f:
+        fb = json.load(f)
+    result = {}
+    for items in fb.get("datasets", {}).values():
+        for item in items:
+            ds, jp = item.get("dataset"), item.get("json_file_path")
+            if ds and jp:
+                result[ds] = jp
+    return result
+
+
+def load_audio_info(json_path):
+    with open(json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    items = data.get("datas", []) if isinstance(data, dict) else data
+    return {item["ID"]: item["file_path"]
+            for item in items if "ID" in item and "file_path" in item}
+
+
+def match_full_name(sheet_name, fb_datasets):
+    if sheet_name in fb_datasets:
+        return sheet_name
+    for full in fb_datasets:
+        if full[:31] == sheet_name:
+            return full
+    return None
+
+
+def safe_sheet_name(name, used):
+    name = str(name)[:31]
+    base, i = name, 1
+    while name in used:
+        sfx = f"_{i}"
+        name = base[:31 - len(sfx)] + sfx
+        i += 1
+    used.add(name)
+    return name
+
+
+def apply_styles(ws, df):
+    RED  = PatternFill("solid", fgColor="FFC7CE")
+    YEL  = PatternFill("solid", fgColor="FFEB9C")
+    GRN  = PatternFill("solid", fgColor="C6EFCE")
+    HEAD = PatternFill("solid", fgColor="305496")
+    HFNT = Font(color="FFFFFF", bold=True)
+    ncols = len(df.columns)
+    # 表头
+    for c in range(1, ncols + 1):
+        ws.cell(1, c).fill = HEAD
+        ws.cell(1, c).font = HFNT
+    # 行着色（仅含 diagnosis 列的 sheet）
+    if "diagnosis" not in df.columns:
+        return
+    dcol = list(df.columns).index("diagnosis") + 1
+    for r in range(2, len(df) + 2):
+        v = ws.cell(r, dcol).value
+        fill = (RED if v == "all_wrong" else
+                YEL if v == "disagree"  else
+                GRN if v == "all_correct" else None)
+        if fill:
+            for c in range(1, ncols + 1):
+                ws.cell(r, c).fill = fill
+
+
+def main():
+    print(f"加载 FiberBench: {FIBERBENCH_JSON}")
+    fb_datasets = load_fiberbench(FIBERBENCH_JSON)
+    print(f"  共 {len(fb_datasets)} 个数据集条目")
+
+    print(f"读取 xlsx: {XLSX_PATH}")
+    xl = pd.ExcelFile(XLSX_PATH)
+    sheets = [s for s in xl.sheet_names if s.lower() != "summary"]
+
+    all_records  = []
+    summary_rows = []
+    order_map    = {d: i for i, d in enumerate(DIAG_ORDER)}
+
+    for sheet in sheets:
+        df = xl.parse(sheet)
+        if "filename" not in df.columns or "diagnosis" not in df.columns:
+            print(f"  [skip] {sheet}: 缺 filename/diagnosis 列")
+            continue
+
+        full_name = match_full_name(sheet, fb_datasets)
+        if full_name is None:
+            print(f"  [info] {sheet}: FiberBench 无此条目，file_path 留空")
+            id_to_path = {}
+        else:
+            jp = fb_datasets[full_name]
+            if not os.path.isfile(jp):
+                print(f"  [warn] audio_info.json 不存在: {jp}")
+                id_to_path = {}
+            else:
+                id_to_path = load_audio_info(jp)
+
+        ds_label = full_name or sheet
+        stat = {"dataset": ds_label, "total": len(df)}
+        stat.update({d: 0 for d in DIAG_ORDER})
+        stat["path_not_found"] = 0
+
+        for _, row in df.iterrows():
+            filename   = str(row["filename"])
+            diagnosis  = str(row.get("diagnosis",  "no_data"))
+            true_label = str(row.get("true_label", ""))
+            detector   = str(row.get("detector",   ""))
+            file_path  = id_to_path.get(filename, "")
+
+            if not file_path:
+                stat["path_not_found"] += 1
+            stat[diagnosis] = stat.get(diagnosis, 0) + 1
+
+            all_records.append({
+                "dataset"   : ds_label,
+                "filename"  : filename,
+                "detector"  : detector,
+                "true_label": true_label,
+                "diagnosis" : diagnosis,
+                "file_path" : file_path,
+            })
+
+        summary_rows.append(stat)
+        print(f"  {ds_label}: {stat['total']} 条 | "
+              + " | ".join(f"{d}:{stat[d]}" for d in DIAG_ORDER)
+              + (f" | 路径缺失:{stat['path_not_found']}" if stat["path_not_found"] else ""))
+
+    if not all_records:
+        print("[错误] 没处理任何数据，检查 XLSX_PATH 和列名")
+        return
+
+    records_df = pd.DataFrame(all_records)
+    stats_df   = pd.DataFrame(summary_rows)
+    used       = set()
+
+    with pd.ExcelWriter(OUTPUT_REPORT, engine="openpyxl") as w:
+        stats_df.to_excel(w, sheet_name="summary", index=False)
+        apply_styles(w.sheets["summary"], stats_df)
+
+        for ds_name in records_df["dataset"].unique():
+            sub = (records_df[records_df["dataset"] == ds_name]
+                   .assign(_o=lambda d: d["diagnosis"].map(order_map).fillna(99))
+                   .sort_values(["_o", "detector", "filename"])
+                   .drop(columns="_o"))
+            sname = safe_sheet_name(ds_name, used)
+            sub.to_excel(w, sheet_name=sname, index=False)
+            apply_styles(w.sheets[sname], sub)
+
+    total   = len(records_df)
+    missing = (records_df["file_path"] == "").sum()
+    print(f"\n完成: 共 {total} 条 | 路径缺失 {missing} 条")
+    print(f"报告: {os.path.abspath(OUTPUT_REPORT)}")
+
+
+if __name__ == "__main__":
+    main()
