@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-export_html_utt.py —— Utterance 级样本贡献度分析可视化工具 v2
-修复：搜索可用、排序升降序可选、导出 utterance 级 CSV、明亮配色
+export_html_utt.py —— Utterance 级样本贡献度分析可视化工具 v3
+去掉 dup_ratio，修复搜索，列头点击排序升降序，导出 CSV，亮色主题
 """
 
 import argparse
@@ -14,7 +14,7 @@ import sys
 import numpy as np
 from collections import defaultdict
 
-TAG_MAP = {"harmful_suspect": 0, "hard": 1, "high_influence": 2, "easy_redundant": 3, "normal": 4}
+TAG_MAP   = {"harmful_suspect": 0, "hard": 1, "high_influence": 2, "easy_redundant": 3, "normal": 4}
 TAG_NAMES = ["harmful_suspect", "hard", "high_influence", "easy_redundant", "normal"]
 
 def fv(row, key):
@@ -26,10 +26,10 @@ def strip_chunk_suffix(utt_id):
 
 def main():
     print("\n" + "="*60)
-    print("🚀 [START] Utterance 级聚合分析脚本 v2 启动...")
+    print("🚀 [START] Utterance 级聚合分析脚本 v3 启动...")
     print("="*60)
 
-    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v2")
+    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v3")
     ap.add_argument("--contrib", required=True, help="包含 contrib_epoch*.npz 和 summary CSV 的目录")
     ap.add_argument("--egs",     default="", help="可选：train.egs.csv 路径")
     ap.add_argument("--summary", default="", help="可选：明确指定 summary CSV 路径")
@@ -120,21 +120,20 @@ def main():
     utt_data = []
     for utt_id in utt_ids_list:
         idxs = utt2chunks[utt_id]
-        nc = len(idxs)
+        nc   = len(idxs)
 
         def arr(key): return [fv(egs_rows[i], key) for i in idxs]
-        def sm(lst): v=[x for x in lst if not np.isnan(x)]; return float(np.mean(v)) if v else float("nan")
-        def sx(lst): v=[x for x in lst if not np.isnan(x)]; return float(np.max(v))  if v else float("nan")
-        def sd(lst): v=[x for x in lst if not np.isnan(x)]; return float(np.std(v))  if len(v)>1 else 0.0
+        def sm(lst):  v=[x for x in lst if not np.isnan(x)]; return float(np.mean(v)) if v else float("nan")
+        def sx(lst):  v=[x for x in lst if not np.isnan(x)]; return float(np.max(v))  if v else float("nan")
+        def sd(lst):  v=[x for x in lst if not np.isnan(x)]; return float(np.std(v))  if len(v)>1 else 0.0
 
-        si  = arr("self_influence"); gn = arr("mean_grad_norm")
-        al  = arr("mean_align");     fn = arr("frac_neg_align")
-        fo  = arr("forget_events");  fc = arr("final_correct")
+        si = arr("self_influence"); gn = arr("mean_grad_norm")
+        al = arr("mean_align");     fn = arr("frac_neg_align")
+        fo = arr("forget_events");  fc = arr("final_correct")
 
-        gn_std = sd(gn); gn_mean = sm(gn)
-        dup = 1.0 - min(gn_std / (abs(gn_mean) + 1e-9), 1.0)
+        gn_std = sd(gn)
 
-        tags = [TAG_MAP.get(egs_rows[i].get("tag","normal"), 4) for i in idxs]
+        tags      = [TAG_MAP.get(egs_rows[i].get("tag", "normal"), 4) for i in idxs]
         worst_tag = min(tags)
 
         gn_traj = al_traj = None
@@ -143,9 +142,9 @@ def main():
             al_traj = np.nanmean(al_egs[idxs, :], axis=0)
 
         utt_data.append(dict(
-            utt_id=utt_id, n_chunks=nc, dup_ratio=dup,
+            utt_id=utt_id, n_chunks=nc,
             mean_si=sm(si), max_si=sx(si),
-            mean_gn=gn_mean, max_gn=sx(gn), gn_std=gn_std,
+            mean_gn=sm(gn), max_gn=sx(gn), gn_std=gn_std,
             mean_al=sm(al), mean_fn=sm(fn),
             mean_fo=sm(fo), mean_fc=sm(fc),
             worst_tag=worst_tag, gn_traj=gn_traj, al_traj=al_traj,
@@ -156,14 +155,14 @@ def main():
     # ── 导出 utterance 级 CSV ──
     csv_out = os.path.splitext(args.output)[0] + "_utt_summary.csv"
     print(f"\n   导出 utterance CSV → {csv_out}")
-    fieldnames = ["utt_id","n_chunks","dup_ratio","mean_si","max_si",
-                  "mean_gn","max_gn","gn_std","mean_al","mean_fn",
-                  "mean_fo","mean_fc","worst_tag"]
+    fieldnames = ["utt_id", "n_chunks", "mean_si", "max_si",
+                  "mean_gn", "max_gn", "gn_std", "mean_al", "mean_fn",
+                  "mean_fo", "mean_fc", "worst_tag"]
     with open(csv_out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for d in utt_data:
-            w.writerow({k: (TAG_NAMES[d[k]] if k=="worst_tag" else
+            w.writerow({k: (TAG_NAMES[d[k]] if k == "worst_tag" else
                             ("" if isinstance(d[k], float) and np.isnan(d[k]) else
                              round(d[k], 6) if isinstance(d[k], float) else d[k]))
                         for k in fieldnames})
@@ -174,16 +173,16 @@ def main():
     n_u = len(utt_data)
     ne  = len(epochs)
 
-    n_chunks_arr = np.array([d["n_chunks"]  for d in utt_data], dtype=np.int16)
-    dup_arr      = np.array([d["dup_ratio"] for d in utt_data], dtype=np.float32)
-    mean_si_arr  = np.array([d["mean_si"]   for d in utt_data], dtype=np.float32)
-    max_si_arr   = np.array([d["max_si"]    for d in utt_data], dtype=np.float32)
-    mean_gn_arr  = np.array([d["mean_gn"]   for d in utt_data], dtype=np.float32)
-    max_gn_arr   = np.array([d["max_gn"]    for d in utt_data], dtype=np.float32)
-    gn_std_arr   = np.array([d["gn_std"]    for d in utt_data], dtype=np.float32)
-    mean_al_arr  = np.array([d["mean_al"]   for d in utt_data], dtype=np.float32)
-    mean_fn_arr  = np.array([d["mean_fn"]   for d in utt_data], dtype=np.float32)
-    tags_arr     = np.array([d["worst_tag"] for d in utt_data], dtype=np.uint8)
+    # 二进制数组（无 dup_arr）
+    n_chunks_arr = np.array([d["n_chunks"] for d in utt_data], dtype=np.int16)
+    mean_si_arr  = np.array([d["mean_si"]  for d in utt_data], dtype=np.float32)
+    max_si_arr   = np.array([d["max_si"]   for d in utt_data], dtype=np.float32)
+    mean_gn_arr  = np.array([d["mean_gn"]  for d in utt_data], dtype=np.float32)
+    max_gn_arr   = np.array([d["max_gn"]   for d in utt_data], dtype=np.float32)
+    gn_std_arr   = np.array([d["gn_std"]   for d in utt_data], dtype=np.float32)
+    mean_al_arr  = np.array([d["mean_al"]  for d in utt_data], dtype=np.float32)
+    mean_fn_arr  = np.array([d["mean_fn"]  for d in utt_data], dtype=np.float32)
+    tags_arr     = np.array([d["worst_tag"]for d in utt_data], dtype=np.uint8)
 
     gn_mat_u8 = al_mat_u8 = None
     gn_min = 0.0; gn_scale = 1.0
@@ -192,10 +191,10 @@ def main():
         al_s = np.stack([d["al_traj"] for d in utt_data])
         valid = gn_s[~np.isnan(gn_s)]
         if len(valid):
-            gn_min  = float(np.nanmin(gn_s))
-            gn_scale= max(float(np.nanpercentile(valid,99)) - gn_min, 1e-9)
-        gq = np.clip((gn_s - gn_min)/gn_scale*255,0,255); gq[np.isnan(gn_s)]=255
-        aq = np.clip((al_s+1.0)/2.0*253,0,253);            aq[np.isnan(al_s)]=254
+            gn_min   = float(np.nanmin(gn_s))
+            gn_scale = max(float(np.nanpercentile(valid, 99)) - gn_min, 1e-9)
+        gq = np.clip((gn_s - gn_min) / gn_scale * 255, 0, 255); gq[np.isnan(gn_s)] = 255
+        aq = np.clip((al_s + 1.0) / 2.0 * 253, 0, 253);          aq[np.isnan(al_s)] = 254
         gn_mat_u8 = gq.astype(np.uint8)
         al_mat_u8 = aq.astype(np.uint8)
 
@@ -206,10 +205,11 @@ def main():
     with open(bin_path, "wb") as fb:
         fb.write(np.array([n_u, ne, utt_len, 1 if has_traj else 0], dtype=np.int32).tobytes())
         fb.write(np.array([gn_min, gn_scale], dtype=np.float32).tobytes())
-        fb.write(b"\x00" * 40)
-        for arr in [n_chunks_arr, dup_arr, mean_si_arr, max_si_arr,
-                    mean_gn_arr, max_gn_arr, gn_std_arr, mean_al_arr, mean_fn_arr, tags_arr]:
-            fb.write(arr.tobytes())
+        fb.write(b"\x00" * 40)   # padding → header 共 64 bytes
+        for a in [n_chunks_arr, mean_si_arr, max_si_arr,
+                  mean_gn_arr, max_gn_arr, gn_std_arr,
+                  mean_al_arr, mean_fn_arr, tags_arr]:
+            fb.write(a.tobytes())
         fb.write(utt_bytes)
         if has_traj and gn_mat_u8 is not None:
             fb.write(gn_mat_u8.flatten().tobytes())
@@ -220,17 +220,15 @@ def main():
         f.write(make_html(os.path.basename(bin_path), epochs, n_u))
     print(f"   ✅ .html {os.path.getsize(args.output)/1024:.1f} KB → {os.path.abspath(args.output)}")
 
-    high_dup    = sum(1 for d in utt_data if d["dup_ratio"] > 0.9)
-    single_chunk= sum(1 for d in utt_data if d["n_chunks"] == 1)
+    single_chunk = sum(1 for d in utt_data if d["n_chunks"] == 1)
     print(f"\n{'='*60}")
     print(f"✨ 完成！utterance 数: {n_utt}")
     print(f"   单 chunk（短语音）: {single_chunk} ({100*single_chunk/max(n_utt,1):.1f}%)")
-    print(f"   高重复度 (>0.9):    {high_dup}  ({100*high_dup/max(n_utt,1):.1f}%)")
     print(f"{'='*60}\n")
 
 
 # ─────────────────────────────────────────────────────────────────
-#  HTML  (亮色主题 · 搜索实时过滤 · 列头点击排序 · 导出 CSV)
+#  HTML
 # ─────────────────────────────────────────────────────────────────
 def make_html(bin_filename, epochs, n_u):
     return f"""<!DOCTYPE html>
@@ -243,16 +241,15 @@ def make_html(bin_filename, epochs, n_u):
 :root{{
   --bg:#f4f6fa; --surf:#ffffff; --surf2:#f0f3f8; --surf3:#e8edf5;
   --bdr:#dde3ee; --bdr2:#c8d0e0;
-  --tx:#1a2035; --mt:#6b7a99; --mt2:#9aa3ba;
-  --ac:#2563eb; --ac2:#1d4ed8; --ac-bg:#eff4ff;
+  --tx:#1a2035;  --mt:#6b7a99;  --mt2:#9aa3ba;
+  --ac:#2563eb;  --ac2:#1d4ed8; --ac-bg:#eff4ff;
   --harmful:#dc2626; --harmful-bg:#fef2f2;
-  --hard:#ea580c;   --hard-bg:#fff7ed;
-  --inf:#7c3aed;    --inf-bg:#f5f3ff;
-  --easy:#16a34a;   --easy-bg:#f0fdf4;
-  --dup:#c026d3;    --dup-bg:#fdf4ff;
+  --hard:#ea580c;    --hard-bg:#fff7ed;
+  --inf:#7c3aed;     --inf-bg:#f5f3ff;
+  --easy:#16a34a;    --easy-bg:#f0fdf4;
   --mono:'IBM Plex Mono',monospace; --sans:'Inter',sans-serif;
-  --radius:6px; --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
-  --shadow-md:0 4px 12px rgba(0,0,0,.10),0 2px 4px rgba(0,0,0,.06);
+  --radius:6px;
+  --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
 }}
 *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0;}}
 html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sans);overflow:hidden;font-size:13px;}}
@@ -278,18 +275,20 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .badge.high_influence{{color:var(--inf);border-color:#c4b5fd;background:var(--inf-bg);}}
 .badge.easy_redundant{{color:var(--easy);border-color:#86efac;background:var(--easy-bg);}}
 .badge.normal{{color:var(--mt);border-color:var(--bdr2);background:var(--surf2);}}
-.badge.dup{{color:var(--dup);border-color:#e879f9;background:var(--dup-bg);}}
 
 /* ── Left panel ── */
 .panel-left{{display:flex;flex-direction:column;background:var(--surf);
   border-right:1px solid var(--bdr);overflow:hidden;}}
 
 /* ── Controls ── */
-.controls{{padding:10px 12px;border-bottom:1px solid var(--bdr);display:flex;flex-direction:column;gap:7px;background:var(--surf2);}}
+.controls{{padding:10px 12px;border-bottom:1px solid var(--bdr);
+  display:flex;flex-direction:column;gap:7px;background:var(--surf2);}}
 .search-wrap{{position:relative;display:flex;align-items:center;}}
-.search-wrap svg{{position:absolute;left:9px;width:14px;height:14px;color:var(--mt2);pointer-events:none;flex-shrink:0;}}
-#search{{width:100%;padding:7px 32px 7px 30px;background:var(--surf);border:1px solid var(--bdr2);
-  color:var(--tx);font-family:var(--mono);font-size:11px;outline:none;border-radius:var(--radius);
+.search-wrap svg{{position:absolute;left:9px;width:14px;height:14px;
+  color:var(--mt2);pointer-events:none;flex-shrink:0;}}
+#search{{width:100%;padding:7px 32px 7px 30px;background:var(--surf);
+  border:1px solid var(--bdr2);color:var(--tx);font-family:var(--mono);
+  font-size:11px;outline:none;border-radius:var(--radius);
   transition:border-color .15s,box-shadow .15s;}}
 #search:focus{{border-color:var(--ac);box-shadow:0 0 0 3px rgba(37,99,235,.12);}}
 #search-clear{{position:absolute;right:8px;cursor:pointer;background:none;border:none;
@@ -297,19 +296,20 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 #search-clear:hover{{color:var(--tx);}}
 .filter-row{{display:flex;gap:6px;}}
 .filter-row select{{flex:1;padding:5px 8px;background:var(--surf);border:1px solid var(--bdr2);
-  color:var(--tx);font-family:var(--mono);font-size:11px;outline:none;border-radius:var(--radius);cursor:pointer;}}
+  color:var(--tx);font-family:var(--mono);font-size:11px;outline:none;
+  border-radius:var(--radius);cursor:pointer;}}
 .filter-row select:focus{{border-color:var(--ac);}}
-.export-btn{{padding:5px 12px;background:var(--ac);color:#fff;border:none;border-radius:var(--radius);
-  font-family:var(--mono);font-size:10px;font-weight:500;cursor:pointer;letter-spacing:.02em;
-  transition:background .15s;white-space:nowrap;}}
+.export-btn{{padding:5px 12px;background:var(--ac);color:#fff;border:none;
+  border-radius:var(--radius);font-family:var(--mono);font-size:10px;font-weight:500;
+  cursor:pointer;letter-spacing:.02em;transition:background .15s;white-space:nowrap;}}
 .export-btn:hover{{background:var(--ac2);}}
 
-/* ── Table header (clickable sort) ── */
-.list-header{{display:grid;grid-template-columns:38px 1fr 50px 64px 64px 80px;
+/* ── Table header ── */
+.list-header{{display:grid;grid-template-columns:38px 1fr 50px 64px 64px 110px;
   align-items:center;padding:0 12px;gap:4px;height:28px;
   border-bottom:2px solid var(--bdr);background:var(--surf3);
-  font-family:var(--mono);font-size:9px;color:var(--mt);text-transform:uppercase;
-  letter-spacing:.05em;user-select:none;}}
+  font-family:var(--mono);font-size:9px;color:var(--mt);
+  text-transform:uppercase;letter-spacing:.05em;user-select:none;}}
 .th{{cursor:pointer;display:flex;align-items:center;gap:3px;padding:2px 3px;
   border-radius:3px;transition:background .1s,color .1s;white-space:nowrap;}}
 .th:hover{{background:var(--bdr);color:var(--tx);}}
@@ -326,7 +326,7 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .vlist::-webkit-scrollbar-thumb:hover{{background:var(--mt2);}}
 #vinner{{position:relative;}}
 
-.srow{{display:grid;grid-template-columns:38px 1fr 50px 64px 64px 80px;
+.srow{{display:grid;grid-template-columns:38px 1fr 50px 64px 64px 110px;
   align-items:center;padding:0 12px;cursor:pointer;gap:4px;
   border-bottom:1px solid var(--bdr);height:36px;
   position:absolute;width:100%;transition:background .08s;}}
@@ -337,7 +337,6 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .s-uid mark{{background:rgba(37,99,235,.15);color:var(--ac);border-radius:2px;padding:0 1px;}}
 .s-nc{{text-align:center;font-size:10px;font-family:var(--mono);color:var(--mt);}}
-.s-nc.dup-high{{color:var(--dup);font-weight:600;}}
 .s-gn,.s-al{{text-align:right;font-size:10px;font-family:var(--mono);color:var(--mt);}}
 .s-al.pos{{color:var(--easy);}} .s-al.neg{{color:var(--harmful);}}
 .col-tag{{justify-self:end;}}
@@ -346,8 +345,7 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .pagination{{padding:6px 12px;border-top:1px solid var(--bdr);display:flex;align-items:center;
   gap:8px;font-family:var(--mono);font-size:10px;color:var(--mt);background:var(--surf2);}}
 .pagination button{{padding:3px 10px;background:var(--surf);border:1px solid var(--bdr2);
-  color:var(--tx);font-family:var(--mono);font-size:10px;cursor:pointer;border-radius:4px;
-  transition:all .1s;}}
+  color:var(--tx);font-family:var(--mono);font-size:10px;cursor:pointer;border-radius:4px;transition:all .1s;}}
 .pagination button:disabled{{opacity:.35;cursor:default;}}
 .pagination button:not(:disabled):hover{{border-color:var(--ac);color:var(--ac);background:var(--ac-bg);}}
 .pginfo{{flex:1;text-align:center;}}
@@ -362,9 +360,6 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .ctitle{{font-family:var(--mono);font-size:12px;color:var(--tx);font-weight:600;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .csub{{font-family:var(--mono);font-size:10px;color:var(--mt);}}
-.dup-bar-wrap{{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:9px;color:var(--mt);}}
-.dup-bar-bg{{width:160px;height:5px;background:var(--bdr);border-radius:3px;overflow:hidden;}}
-.dup-bar-fill{{height:100%;border-radius:3px;transition:width .3s;}}
 .stat-grid{{display:flex;gap:18px;flex-shrink:0;flex-wrap:wrap;}}
 .stat-item{{text-align:right;}}
 .slbl{{font-size:9px;color:var(--mt);font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em;}}
@@ -382,10 +377,6 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .li{{display:flex;align-items:center;gap:6px;}}
 .ld{{width:8px;height:8px;border-radius:50%;}}
 .ld.gn{{background:#2563eb;}} .ld.al{{background:#7c3aed;}}
-
-/* ── Dup warning banner ── */
-.dup-warn{{display:none;padding:4px 12px;background:var(--dup-bg);
-  border-bottom:1px solid #e879f9;font-family:var(--mono);font-size:10px;color:var(--dup);}}
 </style>
 </head><body>
 <div class="layout">
@@ -397,16 +388,13 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
     </div>
   </header>
 
-  <!-- ── LEFT PANEL ── -->
   <div class="panel-left">
     <div class="controls">
-      <!-- 搜索框 -->
       <div class="search-wrap">
         <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" clip-rule="evenodd"/></svg>
         <input id="search" placeholder="搜索 utt_id（实时过滤）..." autocomplete="off">
         <button id="search-clear" onclick="clearSearch()" title="清除">✕</button>
       </div>
-      <!-- 过滤行 -->
       <div class="filter-row">
         <select id="tag-f" onchange="rebuild()">
           <option value="-1">全部 Tag</option>
@@ -416,22 +404,13 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
           <option value="3">↓ easy_redundant</option>
           <option value="4">· normal</option>
         </select>
-        <select id="dup-f" onchange="rebuild()">
-          <option value="-1">全部重复度</option>
-          <option value="0.9">高重复 &gt;90%</option>
-          <option value="0.7">中重复 &gt;70%</option>
-          <option value="0.5">低重复 &gt;50%</option>
-        </select>
         <button class="export-btn" onclick="exportCSV()">⬇ CSV</button>
       </div>
     </div>
 
-    <div class="dup-warn" id="dup-warn">⚠ 当前视图含高重复度 utterance，训练贡献可能被高估</div>
-
-    <!-- 列头（点击排序） -->
     <div class="list-header">
       <span class="th" onclick="setSort('rank')" id="th-rank">#<span class="arrow"></span></span>
-      <span class="th" onclick="setSort('uid')">utt_id<span class="arrow"></span></span>
+      <span class="th" onclick="setSort('uid')" id="th-uid">utt_id<span class="arrow"></span></span>
       <span class="th th-c" onclick="setSort('nc')" id="th-nc">chunks<span class="arrow"></span></span>
       <span class="th th-r" onclick="setSort('gn')" id="th-gn">mean_gn<span class="arrow"></span></span>
       <span class="th th-r" onclick="setSort('al')" id="th-al">mean_al<span class="arrow"></span></span>
@@ -449,17 +428,11 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
     </div>
   </div>
 
-  <!-- ── RIGHT PANEL ── -->
   <div class="panel-right">
     <div class="chart-hdr">
       <div class="chdr-left">
         <div class="ctitle" id="ctitle">— 点击左侧选择一条 utterance —</div>
-        <div class="csub" id="csub"></div>
-        <div class="dup-bar-wrap" id="dup-bar-wrap" style="display:none">
-          <span id="dup-lbl">重复度</span>
-          <div class="dup-bar-bg"><div class="dup-bar-fill" id="dup-bar-fill"></div></div>
-          <span id="dup-pct" style="font-weight:600"></span>
-        </div>
+        <div class="csub"   id="csub"></div>
       </div>
       <div class="stat-grid" id="stat-grid"></div>
     </div>
@@ -480,21 +453,22 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 </div>
 
 <script>
-const DATA_URL = "{bin_filename}";
-const EPOCHS   = {epochs};
-const TAG_NAMES= ["harmful_suspect","hard","high_influence","easy_redundant","normal"];
-const SORT_KEYS= ["si","maxsi","gn","al","dup","nc","uid","tag","rank"];
+const DATA_URL  = "{bin_filename}";
+const EPOCHS    = {epochs};
+const TAG_NAMES = ["harmful_suspect","hard","high_influence","easy_redundant","normal"];
 
-// ── 全局数据 ──
+// ── 全局数据（无 DUP）──
 let _N, _NE, HAS_TRAJ, _GN_MIN, _GN_SC;
-let N_CHUNKS, DUP, MEAN_SI, MAX_SI, MEAN_GN, MAX_GN, GN_STD, MEAN_AL, MEAN_FN, TAGS, UTT_IDS;
+let N_CHUNKS, MEAN_SI, MAX_SI, MEAN_GN, MAX_GN, GN_STD, MEAN_AL, MEAN_FN, TAGS, UTT_IDS;
 let GN_U8=null, AL_U8=null;
 
 // ── 状态 ──
 const PAGE=100, ROW_H=36;
 let filtered=null, pageStart=0, selIdx=-1, chart=null, stimer=null;
-let sortKey='si', sortAsc=false;   // 默认按 mean_si 降序
-const sortCache={{}};
+let sortKey='si', sortAsc=false;
+
+// ── 列头 id 映射 ──
+const TH_IDS={{rank:'th-rank',uid:'th-uid',nc:'th-nc',gn:'th-gn',al:'th-al',tag:'th-tag'}};
 
 // ── 数据加载 ──
 async function loadBinaryData(){{
@@ -503,24 +477,24 @@ async function loadBinaryData(){{
     if(!res.ok) throw new Error("无法读取 .bin，请用 Web Server 打开（python -m http.server）");
     const buf = await res.arrayBuffer();
 
-    const mi = new Int32Array(buf,0,4);
+    const mi=new Int32Array(buf,0,4);
     _N=mi[0]; _NE=mi[1]; const uttLen=mi[2]; HAS_TRAJ=mi[3]===1;
-    const mf = new Float32Array(buf,16,2);
+    const mf=new Float32Array(buf,16,2);
     _GN_MIN=mf[0]; _GN_SC=mf[1];
 
     document.getElementById('hmeta').textContent=`${{_N.toLocaleString()}} utterances · ${{_NE}} epochs`;
 
+    // 偏移顺序与 Python 写入完全一致（无 DUP）
     let o=64;
-    N_CHUNKS=new Int16Array(buf,o,_N);   o+=_N*2;
-    DUP     =new Float32Array(buf,o,_N); o+=_N*4;
-    MEAN_SI =new Float32Array(buf,o,_N); o+=_N*4;
-    MAX_SI  =new Float32Array(buf,o,_N); o+=_N*4;
-    MEAN_GN =new Float32Array(buf,o,_N); o+=_N*4;
-    MAX_GN  =new Float32Array(buf,o,_N); o+=_N*4;
-    GN_STD  =new Float32Array(buf,o,_N); o+=_N*4;
-    MEAN_AL =new Float32Array(buf,o,_N); o+=_N*4;
-    MEAN_FN =new Float32Array(buf,o,_N); o+=_N*4;
-    TAGS    =new Uint8Array(buf,o,_N);   o+=_N*1;
+    N_CHUNKS=new Int16Array(buf,o,_N);    o+=_N*2;
+    MEAN_SI =new Float32Array(buf,o,_N);  o+=_N*4;
+    MAX_SI  =new Float32Array(buf,o,_N);  o+=_N*4;
+    MEAN_GN =new Float32Array(buf,o,_N);  o+=_N*4;
+    MAX_GN  =new Float32Array(buf,o,_N);  o+=_N*4;
+    GN_STD  =new Float32Array(buf,o,_N);  o+=_N*4;
+    MEAN_AL =new Float32Array(buf,o,_N);  o+=_N*4;
+    MEAN_FN =new Float32Array(buf,o,_N);  o+=_N*4;
+    TAGS    =new Uint8Array(buf,o,_N);    o+=_N*1;
 
     UTT_IDS=new TextDecoder("utf-8").decode(new Uint8Array(buf,o,uttLen)).split('\\n'); o+=uttLen;
 
@@ -530,8 +504,7 @@ async function loadBinaryData(){{
       AL_U8=new Uint8Array(buf,o,ts);
     }}
 
-    // 默认按 mean_si 降序（数据已预排好）
-    filtered = Int32Array.from({{length:_N}},(_,i)=>i);
+    filtered=Int32Array.from({{length:_N}},(_,i)=>i);
     buildTagBadges();
     renderPage();
     document.getElementById('hstatus').style.display='none';
@@ -543,8 +516,8 @@ async function loadBinaryData(){{
 
 // ── Tag 统计徽章 ──
 function buildTagBadges(){{
-  const cnt=[0,0,0,0,0]; let dupCnt=0;
-  for(let i=0;i<_N;i++){{ cnt[TAGS[i]]++; if(DUP[i]>0.9) dupCnt++; }}
+  const cnt=[0,0,0,0,0];
+  for(let i=0;i<_N;i++) cnt[TAGS[i]]++;
   const el=document.getElementById('hbadges'); el.innerHTML='';
   [0,1,2,3].forEach(t=>{{
     if(!cnt[t]) return;
@@ -553,47 +526,40 @@ function buildTagBadges(){{
     b.textContent=`${{TAG_NAMES[t].replace(/_/g,' ')}} ${{cnt[t].toLocaleString()}}`;
     el.appendChild(b);
   }});
-  if(dupCnt){{
-    const b=document.createElement('span');
-    b.className='badge dup'; b.textContent=`high-dup ${{dupCnt.toLocaleString()}}`;
-    el.appendChild(b);
-  }}
 }}
 
 // ── 排序值 ──
 function getVal(sk,i){{
-  if(sk==='si')   return MEAN_SI[i];
-  if(sk==='maxsi')return MAX_SI[i];
-  if(sk==='gn')   return MEAN_GN[i];
-  if(sk==='al')   return MEAN_AL[i];
-  if(sk==='dup')  return DUP[i];
-  if(sk==='nc')   return N_CHUNKS[i];
-  if(sk==='tag')  return TAGS[i];
-  if(sk==='uid')  return UTT_IDS[i]||'';
+  if(sk==='si'||sk==='rank') return MEAN_SI[i];
+  if(sk==='maxsi') return MAX_SI[i];
+  if(sk==='gn')    return MEAN_GN[i];
+  if(sk==='al')    return MEAN_AL[i];
+  if(sk==='nc')    return N_CHUNKS[i];
+  if(sk==='tag')   return TAGS[i];
   return 0;
 }}
 
-// ── 点击列头排序 ──
-const TH_MAP={{nc:'th-nc',gn:'th-gn',al:'th-al',tag:'th-tag',rank:'th-rank'}};
+// ── 列头点击排序 ──
 function setSort(key){{
-  // rank = 按 mean_si 降序（默认顺序）
-  const realKey = key==='rank' ? 'si' : key;
+  const realKey=key==='rank'?'si':key;
   if(sortKey===realKey){{ sortAsc=!sortAsc; }}
-  else{{ sortKey=realKey; sortAsc=(realKey==='al'); }} // align 默认升序（高=好），其余降序
-  Object.values(TH_MAP).forEach(id=>{{
+  else{{ sortKey=realKey; sortAsc=(realKey==='al'); }}
+  // 更新列头样式
+  Object.entries(TH_IDS).forEach(([k,id])=>{{
     const el=document.getElementById(id);
-    if(el){{ el.classList.remove('active'); el.querySelector('.arrow').textContent=''; }}
+    if(!el) return;
+    el.classList.remove('active');
+    el.querySelector('.arrow').textContent='';
   }});
-  const thId=TH_MAP[key];
-  if(thId){{
-    const el=document.getElementById(thId);
+  const activeId=TH_IDS[key];
+  if(activeId){{
+    const el=document.getElementById(activeId);
     if(el){{ el.classList.add('active'); el.querySelector('.arrow').textContent=sortAsc?' ↑':' ↓'; }}
   }}
-  sortCache['__sorted__']=null;
   rebuild();
 }}
 
-// ── 搜索框 ──
+// ── 搜索框初始化 ──
 document.addEventListener('DOMContentLoaded',()=>{{
   const inp=document.getElementById('search');
   const clr=document.getElementById('search-clear');
@@ -608,28 +574,24 @@ function clearSearch(){{
   rebuild();
 }}
 
-// ── 重建过滤+排序结果 ──
+// ── 重建过滤+排序 ──
 function rebuild(){{
   const tagF=parseInt(document.getElementById('tag-f').value);
-  const dupF=parseFloat(document.getElementById('dup-f').value);
   const q=document.getElementById('search').value.trim().toLowerCase();
 
-  // 过滤
   let arr=[];
   for(let i=0;i<_N;i++){{
     if(tagF>=0 && TAGS[i]!==tagF) continue;
-    if(!isNaN(dupF) && dupF>0 && DUP[i]<dupF) continue;
     if(q && !((UTT_IDS[i]||'').toLowerCase().includes(q))) continue;
     arr.push(i);
   }}
 
-  // 排序（uid 字符串单独处理）
   if(sortKey==='uid'){{
     arr.sort((a,b)=>{{
       const r=(UTT_IDS[a]||'').localeCompare(UTT_IDS[b]||'');
       return sortAsc?r:-r;
     }});
-  }} else {{
+  }}else{{
     arr.sort((a,b)=>{{
       const va=getVal(sortKey,a), vb=getVal(sortKey,b);
       if(isNaN(va)&&isNaN(vb)) return 0;
@@ -639,20 +601,18 @@ function rebuild(){{
   }}
 
   filtered=arr;
-  const hasDup=arr.some(i=>DUP[i]>0.9);
-  document.getElementById('dup-warn').style.display=hasDup?'block':'none';
   pageStart=0;
   renderPage();
 }}
 
 // ── 渲染列表 ──
-function highlight(text, q){{
+function escH(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+function highlight(text,q){{
   if(!q) return escH(text);
   const idx=text.toLowerCase().indexOf(q);
   if(idx<0) return escH(text);
   return escH(text.slice(0,idx))+'<mark>'+escH(text.slice(idx,idx+q.length))+'</mark>'+escH(text.slice(idx+q.length));
 }}
-function escH(s){{return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
 
 function renderPage(){{
   const total=filtered.length;
@@ -675,15 +635,13 @@ function renderPage(){{
     row.className='srow'+(i===selIdx?' sel':'');
     row.style.top=(vi*ROW_H)+'px';
     const uid=UTT_IDS[i]||String(i);
-    const nc=N_CHUNKS[i], dup=DUP[i];
     const gn=MEAN_GN[i], al=MEAN_AL[i];
     const tag=TAG_NAMES[TAGS[i]];
     const alc=isNaN(al)?'':(al>=0?'pos':'neg');
-    const ncCls=dup>0.9?' dup-high':'';
     row.innerHTML=
       `<div class="s-rank">${{pageStart+vi+1}}</div>`+
       `<div class="s-uid" title="${{escH(uid)}}">${{highlight(uid,q)}}</div>`+
-      `<div class="s-nc${{ncCls}}" title="重复度: ${{(dup*100).toFixed(0)}}%">${{nc}}</div>`+
+      `<div class="s-nc">${{N_CHUNKS[i]}}</div>`+
       `<div class="s-gn">${{isNaN(gn)?'—':gn.toFixed(3)}}</div>`+
       `<div class="s-al ${{alc}}">${{isNaN(al)?'—':al.toFixed(3)}}</div>`+
       `<div class="col-tag"><span class="badge ${{tag}}">${{tag.replace(/_/g,' ')}}</span></div>`;
@@ -703,19 +661,10 @@ function selectSample(idx,el){{
   el.classList.add('sel');
 
   const uid=UTT_IDS[idx]||String(idx);
-  const nc=N_CHUNKS[idx], dup=DUP[idx], tag=TAG_NAMES[TAGS[idx]];
+  const tag=TAG_NAMES[TAGS[idx]];
   document.getElementById('ctitle').textContent=uid;
   document.getElementById('csub').textContent=
-    `tag: ${{tag}}  ·  chunks: ${{nc}}  ·  dup: ${{(dup*100).toFixed(0)}}%  ·  mean_si: ${{MEAN_SI[idx].toFixed(2)}}`;
-
-  // 重复度条
-  document.getElementById('dup-bar-wrap').style.display='flex';
-  const pct=(dup*100).toFixed(0);
-  const fill=document.getElementById('dup-bar-fill');
-  fill.style.width=pct+'%';
-  fill.style.background=dup>0.9?'var(--dup)':dup>0.7?'var(--hard)':'var(--easy)';
-  document.getElementById('dup-pct').textContent=pct+'%';
-  document.getElementById('dup-lbl').textContent=dup>0.9?'⚠ 重复度':'重复度';
+    `tag: ${{tag}}  ·  chunks: ${{N_CHUNKS[idx]}}  ·  mean_si: ${{MEAN_SI[idx].toFixed(2)}}  ·  max_si: ${{MAX_SI[idx].toFixed(2)}}`;
 
   const stats=[
     {{l:'MEAN SI',    v:MEAN_SI[idx].toFixed(2)}},
@@ -736,7 +685,7 @@ function selectSample(idx,el){{
 function drawChart(idx){{
   if(!HAS_TRAJ||!GN_U8){{
     document.getElementById('ph').style.display='flex';
-    document.getElementById('ph').querySelector('p').textContent='无轨迹数据';
+    document.getElementById('ph').querySelector('p').textContent='无轨迹数据（未找到 .npz 文件）';
     document.getElementById('cc').style.display='none';
     return;
   }}
@@ -785,16 +734,15 @@ function drawChart(idx){{
   }});
 }}
 
-// ── 导出当前视图为 CSV ──
+// ── 导出当前视图 CSV ──
 function exportCSV(){{
   if(!filtered||!UTT_IDS) return;
-  const rows=[['utt_id','n_chunks','dup_ratio','mean_si','max_si','mean_gn','gn_std','mean_al','mean_fn','tag']];
+  const rows=[['utt_id','n_chunks','mean_si','max_si','mean_gn','gn_std','mean_al','mean_fn','tag']];
   for(let i=0;i<filtered.length;i++){{
     const idx=filtered[i];
     rows.push([
       UTT_IDS[idx]||idx,
       N_CHUNKS[idx],
-      DUP[idx].toFixed(4),
       MEAN_SI[idx].toFixed(4),
       MAX_SI[idx].toFixed(4),
       MEAN_GN[idx].toFixed(4),
