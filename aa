@@ -11,24 +11,27 @@ for items in json.load(open(FB))["datasets"].values():
 
 xl = pd.ExcelFile(XLSX)
 for sheet in [s for s in xl.sheet_names if s != "summary"]:
-    match  = next((f for f in fb_datasets if f==sheet or f[:31]==sheet), None)
-    jp     = fb_datasets.get(match, "")
-    exists = os.path.isfile(jp) if jp else False
+    match = next((f for f in fb_datasets if f==sheet or f[:31]==sheet), None)
+    if not match: continue
+    data = json.load(open(fb_datasets[match]))
+    id_to_path = {x["ID"]: x["file_path"] for x in data.get("datas",[]) if "ID" in x}
 
-    id_to_path, items = {}, []
-    if exists:
-        data  = json.load(open(jp))
-        items = data.get("datas", [])
-        id_to_path = {x["ID"]: x["file_path"] for x in items if "ID" in x}
+    test_fn = str(xl.parse(sheet)["filename"].iloc[0])
+    if test_fn in id_to_path:
+        continue   # 这个数据集没问题，跳过
 
-    df      = xl.parse(sheet)
-    test_fn = str(df["filename"].iloc[0])
-    hit     = id_to_path.get(test_fn, "MISS")
-
-    print(f"\n[{sheet}]")
-    print(f"  FiberBench匹配: {match}")
-    print(f"  json路径存在:   {exists}  ({jp})")
-    print(f"  json加载ID数:   {len(id_to_path)}")
-    print(f"  xlsx首条文件名: {test_fn!r}")
-    print(f"  直接查询结果:   {hit[:80] if hit!='MISS' else 'MISS ← 这里断了'}")
+    # ← 断了的数据集，精确对比
+    json_key = list(id_to_path.keys())[0]
+    print(f"\n[{sheet}]  ← MISS")
+    print(f"  xlsx filename : {repr(test_fn)}")
+    print(f"  json  ID      : {repr(json_key)}")
+    # 逐字符比长度和内容
+    print(f"  xlsx len={len(test_fn)}  json len={len(json_key)}")
+    for i,(a,b) in enumerate(zip(test_fn, json_key)):
+        if a != b:
+            print(f"  第{i}位不同: xlsx={repr(a)}  json={repr(b)}")
+            break
+    else:
+        if len(test_fn) != len(json_key):
+            print(f"  前缀相同但长度不一致")
 PY
