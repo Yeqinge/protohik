@@ -40,7 +40,10 @@ def load_audio_info(json_path):
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
     items = data.get("datas", []) if isinstance(data, dict) else data
-    return {item["ID"]: item["file_path"]
+    # 统一补 .wav 后缀：兼容 ID 有/无后缀两种写法
+    def norm(s):
+        return s if s.endswith(".wav") else s + ".wav"
+    return {norm(item["ID"]): item["file_path"]
             for item in items if "ID" in item and "file_path" in item}
 
 
