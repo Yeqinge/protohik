@@ -1,0 +1,34 @@
+python3 - << 'PY'
+import json, os, pandas as pd
+
+FB   = "/data1/Archive/FiberArchive/codes/ModelTraining/subtools-resnet-v1.0.0/conf/test_conf/FiberBench-V1.1.json"
+XLSX = "model_comparison.xlsx"
+
+fb_datasets = {}
+for items in json.load(open(FB))["datasets"].values():
+    for item in items:
+        fb_datasets[item["dataset"]] = item["json_file_path"]
+
+xl = pd.ExcelFile(XLSX)
+for sheet in [s for s in xl.sheet_names if s != "summary"]:
+    match  = next((f for f in fb_datasets if f==sheet or f[:31]==sheet), None)
+    jp     = fb_datasets.get(match, "")
+    exists = os.path.isfile(jp) if jp else False
+
+    id_to_path, items = {}, []
+    if exists:
+        data  = json.load(open(jp))
+        items = data.get("datas", [])
+        id_to_path = {x["ID"]: x["file_path"] for x in items if "ID" in x}
+
+    df      = xl.parse(sheet)
+    test_fn = str(df["filename"].iloc[0])
+    hit     = id_to_path.get(test_fn, "MISS")
+
+    print(f"\n[{sheet}]")
+    print(f"  FiberBench匹配: {match}")
+    print(f"  json路径存在:   {exists}  ({jp})")
+    print(f"  json加载ID数:   {len(id_to_path)}")
+    print(f"  xlsx首条文件名: {test_fn!r}")
+    print(f"  直接查询结果:   {hit[:80] if hit!='MISS' else 'MISS ← 这里断了'}")
+PY
