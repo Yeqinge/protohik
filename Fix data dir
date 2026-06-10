@@ -276,15 +276,53 @@ n_removed=$(wc -l < $tmpdir/utts_removed)
 echo "fix_data_dir.sh: $n_removed utterance(s) were removed in total."
 
 if [ $n_removed -gt 0 ]; then
-  # Write removed_utts.scp in the same "key value" format as wav.scp.
+  # Write removed_utts.scp in the same "key value" format as wav.scp,
+  # with the removal reason(s) appended as a comment at the end of each line.
+  # Example:
+  #   utt001 /data/utt001.wav  # missing or invalid in feats.scp
   removed_scp=$data/removed_utts.scp
+
+  # Build a lookup: utt_id -> deduplicated reason string
+  # removed_reasons has lines: "utt_id<TAB>reason" (may repeat for same utt)
+  # We collapse multiple reasons with " | " as separator.
+  awk -F'\t' '{
+    if ($1 in reasons) reasons[$1] = reasons[$1] " | " $2
+    else               reasons[$1] = $2
+  }
+  END { for (u in reasons) print u "\t" reasons[u] }
+  ' $removed_reasons | sort > $tmpdir/utt_reasons_collapsed
+
   if [ -f $data/.backup/wav.scp ]; then
-    subtools/kaldi/utils/filter_scp.pl $tmpdir/utts_removed $data/.backup/wav.scp \
-      > $removed_scp
+    # Join wav.scp entries with their reasons on utt_id (field 1 in both files)
+    join -1 1 -2 1 \
+      <(subtools/kaldi/utils/filter_scp.pl $tmpdir/utts_removed $data/.backup/wav.scp | sort -k1,1) \
+      <(sort -k1,1 $tmpdir/utt_reasons_collapsed) | \
+      awk '{
+        utt=$1; path=$2
+        reason=""
+        for(i=3;i<=NF;i++) reason=(i==3)?$i:reason" "$i
+        print utt, path, " # " reason
+      }' > $removed_scp
+    # Utts with no reason recorded (edge case) fall through without a comment
+    join -1 1 -2 1 -v1 \
+      <(subtools/kaldi/utils/filter_scp.pl $tmpdir/utts_removed $data/.backup/wav.scp | sort -k1,1) \
+      <(sort -k1,1 $tmpdir/utt_reasons_collapsed) >> $removed_scp
   else
-    awk '{print $1, $1}' $tmpdir/utts_removed > $removed_scp
+    # No wav.scp: emit "utt_id utt_id  # reason"
+    join -1 1 -2 1 \
+      <(awk '{print $1, $1}' $tmpdir/utts_removed | sort -k1,1) \
+      <(sort -k1,1 $tmpdir/utt_reasons_collapsed) | \
+      awk '{
+        utt=$1; path=$2
+        reason=""
+        for(i=3;i<=NF;i++) reason=(i==3)?$i:reason" "$i
+        print utt, path, " # " reason
+      }' > $removed_scp
+    join -1 1 -2 1 -v1 \
+      <(awk '{print $1, $1}' $tmpdir/utts_removed | sort -k1,1) \
+      <(sort -k1,1 $tmpdir/utt_reasons_collapsed) >> $removed_scp
   fi
-  echo "fix_data_dir.sh: removed utterances written to $removed_scp (wav.scp format)"
+  echo "fix_data_dir.sh: removed utterances written to $removed_scp (wav.scp format with reasons)"
 
   # ------------------------------------------------------------------
   # If --json-file was supplied, extract matching entries, attach the
