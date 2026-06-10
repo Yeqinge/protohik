@@ -1,0 +1,345 @@
+#!/bin/bash
+
+# This script makes sure that only the segments present in
+# all of "feats.scp", "wav.scp" [if present], segments [if present]
+# text, and utt2spk are present in any of them.
+# It puts the original contents of data-dir into
+# data-dir/.backup
+
+cmd="$@"
+
+utt_extra_files=
+spk_extra_files=
+# [NEW] JSON file containing sample metadata; when set, removed samples
+# will be written to <data-dir>/removed_samples.json in wav.scp style
+json_file=
+
+. subtools/kaldi/utils/parse_options.sh
+
+if [ $# != 1 ]; then
+  echo "Usage: subtools/kaldi/utils/data/fix_data_dir.sh [options] <data-dir>"
+  echo "  --json-file <path>   JSON file with sample metadata; removed samples"
+  echo "                       will be written to <data-dir>/removed_samples.json"
+  echo "e.g.: subtools/kaldi/utils/data/fix_data_dir.sh data/train"
+  echo "e.g.: subtools/kaldi/utils/data/fix_data_dir.sh --json-file meta.json data/train"
+  echo "This script helps ensure that the various files in a data directory"
+  echo "are correctly sorted and filtered, for example removing utterances"
+  echo "that have no features (if feats.scp is present)"
+  exit 1
+fi
+
+data=$1
+
+if [ -f $data/images.scp ]; then
+  image/fix_data_dir.sh $cmd
+  exit $?
+fi
+
+mkdir -p $data/.backup
+
+[ ! -d $data ] && echo "$0: no such directory $data" && exit 1;
+
+[ ! -f $data/utt2spk ] && echo "$0: no such file $data/utt2spk" && exit 1;
+
+set -e -o pipefail -u
+
+tmpdir=$(mktemp -d /tmp/kaldi.XXXX);
+trap 'rm -rf "$tmpdir"' EXIT HUP INT PIPE TERM
+
+export LC_ALL=C
+
+# [NEW] Save original utt list right at the start, before any filtering.
+#       This is the ground-truth set of utterances we started with.
+awk '{print $1}' < $data/utt2spk | sort > $tmpdir/utts_original
+
+function check_sorted {
+  file=$1
+  sort -k1,1 -u <$file >$file.tmp
+  if ! cmp -s $file $file.tmp; then
+    echo "$0: file $1 is not in sorted order or not unique, sorting it"
+    mv $file.tmp $file
+  else
+    rm $file.tmp
+  fi
+}
+
+for x in utt2spk spk2utt feats.scp text segments wav.scp cmvn.scp vad.scp \
+    reco2file_and_channel spk2gender utt2lang utt2uniq utt2dur reco2dur utt2num_frames; do
+  if [ -f $data/$x ]; then
+    cp $data/$x $data/.backup/$x
+    check_sorted $data/$x
+  fi
+done
+
+function filter_file {
+  filter=$1
+  file_to_filter=$2
+  cp $file_to_filter ${file_to_filter}.tmp
+  subtools/kaldi/utils/filter_scp.pl $filter ${file_to_filter}.tmp > $file_to_filter
+  if ! cmp ${file_to_filter}.tmp  $file_to_filter >&/dev/null; then
+    length1=$(cat ${file_to_filter}.tmp | wc -l)
+    length2=$(cat ${file_to_filter} | wc -l)
+    if [ $length1 -ne $length2 ]; then
+      echo "$0: filtered $file_to_filter from $length1 to $length2 lines based on filter $filter."
+    fi
+  fi
+  rm $file_to_filter.tmp
+}
+
+function filter_recordings {
+  # We call this once before the stage when we filter on utterance-id, and once
+  # after.
+
+  if [ -f $data/segments ]; then
+  # We have a segments file -> we need to filter this and the file wav.scp, and
+  # reco2file_and_utt, if it exists, to make sure they have the same list of
+  # recording-ids.
+
+    if [ ! -f $data/wav.scp ]; then
+      echo "$0: $data/segments exists but not $data/wav.scp"
+      exit 1;
+    fi
+    awk '{print $2}' < $data/segments | sort | uniq > $tmpdir/recordings
+    n1=$(cat $tmpdir/recordings | wc -l)
+    [ ! -s $tmpdir/recordings ] && \
+      echo "Empty list of recordings (bad file $data/segments)?" && exit 1;
+    subtools/kaldi/utils/filter_scp.pl $data/wav.scp $tmpdir/recordings > $tmpdir/recordings.tmp
+    mv $tmpdir/recordings.tmp $tmpdir/recordings
+
+
+    cp $data/segments{,.tmp}; awk '{print $2, $1, $3, $4}' <$data/segments.tmp >$data/segments
+    filter_file $tmpdir/recordings $data/segments
+    cp $data/segments{,.tmp}; awk '{print $2, $1, $3, $4}' <$data/segments.tmp >$data/segments
+    rm $data/segments.tmp
+
+    filter_file $tmpdir/recordings $data/wav.scp
+    [ -f $data/reco2file_and_channel ] && filter_file $tmpdir/recordings $data/reco2file_and_channel
+    [ -f $data/reco2dur ] && filter_file $tmpdir/recordings $data/reco2dur
+    true
+  fi
+}
+
+function filter_speakers {
+  # throughout this program, we regard utt2spk as primary and spk2utt as derived, so...
+  subtools/kaldi/utils/utt2spk_to_spk2utt.pl $data/utt2spk > $data/spk2utt
+
+  cat $data/spk2utt | awk '{print $1}' > $tmpdir/speakers
+  for s in cmvn.scp spk2gender; do
+    f=$data/$s
+    if [ -f $f ]; then
+      filter_file $f $tmpdir/speakers
+    fi
+  done
+
+  filter_file $tmpdir/speakers $data/spk2utt
+  subtools/kaldi/utils/spk2utt_to_utt2spk.pl $data/spk2utt > $data/utt2spk
+
+  for s in cmvn.scp spk2gender $spk_extra_files; do
+    f=$data/$s
+    if [ -f $f ]; then
+      filter_file $tmpdir/speakers $f
+    fi
+  done
+}
+
+function filter_utts {
+  cat $data/utt2spk | awk '{print $1}' > $tmpdir/utts
+
+  ! cat $data/utt2spk | sort | cmp - $data/utt2spk && \
+    echo "utt2spk is not in sorted order (fix this yourself)" && exit 1;
+
+  ! cat $data/utt2spk | sort -k2 | cmp - $data/utt2spk && \
+    echo "utt2spk is not in sorted order when sorted first on speaker-id " && \
+    echo "(fix this by making speaker-ids prefixes of utt-ids)" && exit 1;
+
+  ! cat $data/spk2utt | sort | cmp - $data/spk2utt && \
+    echo "spk2utt is not in sorted order (fix this yourself)" && exit 1;
+
+  if [ -f $data/utt2uniq ]; then
+    ! cat $data/utt2uniq | sort | cmp - $data/utt2uniq && \
+      echo "utt2uniq is not in sorted order (fix this yourself)" && exit 1;
+  fi
+
+  maybe_wav=
+  maybe_reco2dur=
+  [ ! -f $data/segments ] && maybe_wav=wav.scp # wav indexed by utts only if segments does not exist.
+  [ -s $data/reco2dur ] && [ ! -f $data/segments ] && maybe_reco2dur=reco2dur # reco2dur indexed by utts
+
+  maybe_utt2dur=
+  if [ -f $data/utt2dur ]; then
+    cat $data/utt2dur | \
+      awk '{ if (NF == 2 && $2 > 0) { print }}' > $data/utt2dur.ok || exit 1
+    maybe_utt2dur=utt2dur.ok
+  fi
+
+
+  maybe_utt2num_frames=
+  if [ -f $data/utt2num_frames ]; then
+    cat $data/utt2num_frames | \
+      awk '{ if (NF == 2 && $2 > 0) { print }}' > $data/utt2num_frames.ok || exit 1
+    maybe_utt2num_frames=utt2num_frames.ok
+  fi
+
+  for x in feats.scp text segments utt2lang $maybe_wav $maybe_utt2dur $maybe_utt2num_frames; do
+    if [ -f $data/$x ]; then
+      subtools/kaldi/utils/filter_scp.pl $data/$x $tmpdir/utts > $tmpdir/utts.tmp
+      mv $tmpdir/utts.tmp $tmpdir/utts
+    fi
+  done
+  rm $data/utt2dur.ok 2>/dev/null || true
+  rm $data/utt2num_frames.ok 2>/dev/null || true
+
+  [ ! -s $tmpdir/utts ] && echo "fix_data_dir.sh: no utterances remained: not proceeding further." && \
+    rm $tmpdir/utts && exit 1;
+
+
+  if [ -f $data/utt2spk ]; then
+    new_nutts=$(cat $tmpdir/utts | wc -l)
+    old_nutts=$(cat $data/utt2spk | wc -l)
+    if [ $new_nutts -ne $old_nutts ]; then
+      echo "fix_data_dir.sh: kept $new_nutts utterances out of $old_nutts"
+    else
+      echo "fix_data_dir.sh: kept all $old_nutts utterances."
+    fi
+  fi
+
+  for x in utt2spk utt2uniq feats.scp vad.scp text segments utt2lang utt2dur utt2num_frames $maybe_wav $maybe_reco2dur $utt_extra_files; do
+    if [ -f $data/$x ]; then
+      cp $data/$x $data/.backup/$x
+      if ! cmp -s $data/$x <( subtools/kaldi/utils/filter_scp.pl $tmpdir/utts $data/$x ) ; then
+        subtools/kaldi/utils/filter_scp.pl $tmpdir/utts $data/.backup/$x > $data/$x
+      fi
+    fi
+  done
+
+}
+
+
+filter_recordings
+filter_speakers
+filter_utts
+filter_speakers
+filter_recordings
+
+subtools/kaldi/utils/utt2spk_to_spk2utt.pl $data/utt2spk > $data/spk2utt
+
+# wav-to-duration scp:$data/wav.scp ark,t:$data/utt2dur
+
+echo "fix_data_dir.sh: old files are kept in $data/.backup"
+
+# ============================================================
+# [NEW] Collect removed utterances and dump their JSON entries
+# ============================================================
+
+# Build the final kept-utt list from the updated utt2spk
+awk '{print $1}' < $data/utt2spk | sort > $tmpdir/utts_final
+
+# Diff: lines in original but not in final → removed utts
+comm -23 $tmpdir/utts_original $tmpdir/utts_final > $tmpdir/utts_removed
+
+n_removed=$(wc -l < $tmpdir/utts_removed)
+echo "fix_data_dir.sh: $n_removed utterance(s) were removed in total."
+
+if [ $n_removed -gt 0 ]; then
+  # Write a removed_utts.scp in the same "key value" format as wav.scp.
+  # We use the backup wav.scp (or utt2spk if wav.scp is absent) as the
+  # value source, mirroring exactly what wav.scp looks like.
+  removed_scp=$data/removed_utts.scp
+  if [ -f $data/.backup/wav.scp ]; then
+    subtools/kaldi/utils/filter_scp.pl $tmpdir/utts_removed $data/.backup/wav.scp \
+      > $removed_scp
+  else
+    # Fallback: emit "utt_id utt_id" lines when wav.scp is unavailable
+    awk '{print $1, $1}' $tmpdir/utts_removed > $removed_scp
+  fi
+  echo "fix_data_dir.sh: removed utterances written to $removed_scp (wav.scp format)"
+
+  # ------------------------------------------------------------------
+  # If --json-file was supplied, extract matching entries and write
+  # <data-dir>/removed_samples.json.
+  # Expected JSON format: a list of objects, each containing a field
+  # whose value matches the utterance-id (key in wav.scp).
+  # The script tries common id field names: "utt_id", "uttid",
+  # "utt", "id", "key", "wav_id".  If none match, it falls back to
+  # scanning all string values in each object.
+  # ------------------------------------------------------------------
+  if [ -n "$json_file" ]; then
+    if [ ! -f "$json_file" ]; then
+      echo "$0: WARNING: --json-file $json_file not found, skipping JSON extraction."
+    else
+      removed_json=$data/removed_samples.json
+      python3 - "$json_file" "$tmpdir/utts_removed" "$removed_json" <<'PYEOF'
+import sys
+import json
+
+json_file   = sys.argv[1]
+utts_file   = sys.argv[2]
+output_file = sys.argv[3]
+
+# Load the set of removed utterance-ids
+with open(utts_file) as f:
+    removed_utts = set(line.strip() for line in f if line.strip())
+
+# Load sample metadata
+with open(json_file) as f:
+    samples = json.load(f)
+
+# Fields to probe for the utterance-id, in priority order
+ID_FIELDS = ["utt_id", "uttid", "utt", "id", "key", "wav_id"]
+
+def get_utt_id(obj):
+    """Return the utterance-id string from a JSON object, or None."""
+    if not isinstance(obj, dict):
+        return None
+    # 1. Check known field names first
+    for field in ID_FIELDS:
+        if field in obj:
+            val = obj[field]
+            if isinstance(val, str):
+                return val
+    # 2. Fallback: scan all string values
+    for val in obj.values():
+        if isinstance(val, str) and val in removed_utts:
+            return val
+    return None
+
+removed_samples = []
+matched_ids     = set()
+
+if isinstance(samples, list):
+    for item in samples:
+        uid = get_utt_id(item)
+        if uid and uid in removed_utts:
+            removed_samples.append(item)
+            matched_ids.add(uid)
+elif isinstance(samples, dict):
+    # Support dict-of-dicts keyed by utt_id
+    for key, item in samples.items():
+        if key in removed_utts:
+            removed_samples.append(item)
+            matched_ids.add(key)
+        else:
+            uid = get_utt_id(item)
+            if uid and uid in removed_utts:
+                removed_samples.append(item)
+                matched_ids.add(uid)
+else:
+    print(f"WARNING: unrecognised JSON structure in {json_file}, skipping.", file=sys.stderr)
+    sys.exit(0)
+
+unmatched = removed_utts - matched_ids
+if unmatched:
+    print(f"WARNING: {len(unmatched)} removed utt(s) had no matching entry in JSON:", file=sys.stderr)
+    for u in sorted(unmatched)[:10]:
+        print(f"  {u}", file=sys.stderr)
+    if len(unmatched) > 10:
+        print(f"  ... (and {len(unmatched)-10} more)", file=sys.stderr)
+
+with open(output_file, "w") as f:
+    json.dump(removed_samples, f, ensure_ascii=False, indent=2)
+
+print(f"fix_data_dir.sh: wrote {len(removed_samples)} removed sample(s) to {output_file}")
+PYEOF
+    fi
+  fi
+fi
