@@ -49,8 +49,23 @@ trap 'rm -rf "$tmpdir"' EXIT HUP INT PIPE TERM
 export LC_ALL=C
 
 # [NEW] Save original utt list right at the start, before any filtering.
-#       This is the ground-truth set of utterances we started with.
 awk '{print $1}' < $data/utt2spk | sort > $tmpdir/utts_original
+
+# [NEW] File to accumulate "utt_id<TAB>reason" lines throughout filtering.
+#       Multiple reasons for the same utt are all appended (one line each).
+removed_reasons=$tmpdir/removed_reasons
+touch $removed_reasons
+
+# [NEW] Helper: diff the utt list before/after a filter step and record reason.
+#   Usage: record_removed_reason <before_file> <after_file> <reason_string>
+function record_removed_reason {
+  local before=$1
+  local after=$2
+  local reason=$3
+  # utts that were in 'before' but not in 'after'
+  comm -23 <(sort "$before") <(sort "$after") | \
+    awk -v r="$reason" '{print $1 "\t" r}' >> $removed_reasons
+}
 
 function check_sorted {
   file=$1
@@ -172,7 +187,6 @@ function filter_utts {
     maybe_utt2dur=utt2dur.ok
   fi
 
-
   maybe_utt2num_frames=
   if [ -f $data/utt2num_frames ]; then
     cat $data/utt2num_frames | \
@@ -180,10 +194,19 @@ function filter_utts {
     maybe_utt2num_frames=utt2num_frames.ok
   fi
 
+  # [NEW] For each filter file, snapshot utts before → filter → record reason
   for x in feats.scp text segments utt2lang $maybe_wav $maybe_utt2dur $maybe_utt2num_frames; do
     if [ -f $data/$x ]; then
+      cp $tmpdir/utts $tmpdir/utts_before_filter   # [NEW] snapshot
       subtools/kaldi/utils/filter_scp.pl $data/$x $tmpdir/utts > $tmpdir/utts.tmp
       mv $tmpdir/utts.tmp $tmpdir/utts
+      # [NEW] record which utts were dropped and why
+      # utt2dur.ok / utt2num_frames.ok → map back to the real filename for the reason message
+      display_name=$x
+      [[ "$x" == "utt2dur.ok" ]]        && display_name="utt2dur (duration <= 0)"
+      [[ "$x" == "utt2num_frames.ok" ]] && display_name="utt2num_frames (num_frames <= 0)"
+      record_removed_reason $tmpdir/utts_before_filter $tmpdir/utts \
+        "missing or invalid in $display_name"
     fi
   done
   rm $data/utt2dur.ok 2>/dev/null || true
@@ -191,7 +214,6 @@ function filter_utts {
 
   [ ! -s $tmpdir/utts ] && echo "fix_data_dir.sh: no utterances remained: not proceeding further." && \
     rm $tmpdir/utts && exit 1;
-
 
   if [ -f $data/utt2spk ]; then
     new_nutts=$(cat $tmpdir/utts | wc -l)
@@ -211,15 +233,28 @@ function filter_utts {
       fi
     fi
   done
-
 }
 
 
 filter_recordings
 filter_speakers
 filter_utts
+# [NEW] After filter_utts, record utts dropped by the second filter_speakers pass
+#       (speakers whose cmvn/spk2gender went missing pull utterances with them).
+cp $tmpdir/utts_original $tmpdir/utts_before_spk2  # reuse original as reference base
+awk '{print $1}' < $data/utt2spk | sort > $tmpdir/utts_after_utts  # state after filter_utts
+
 filter_speakers
+awk '{print $1}' < $data/utt2spk | sort > $tmpdir/utts_after_spk2
+record_removed_reason $tmpdir/utts_after_utts $tmpdir/utts_after_spk2 \
+  "speaker dropped in second filter_speakers pass (cmvn.scp / spk2gender mismatch)"
+
 filter_recordings
+# [NEW] Record utts dropped by the second filter_recordings pass
+#       (segments whose recording vanished from wav.scp pull utterances with them).
+awk '{print $1}' < $data/utt2spk | sort > $tmpdir/utts_after_reco2
+record_removed_reason $tmpdir/utts_after_spk2 $tmpdir/utts_after_reco2 \
+  "recording dropped in second filter_recordings pass (wav.scp / segments mismatch)"
 
 subtools/kaldi/utils/utt2spk_to_spk2utt.pl $data/utt2spk > $data/spk2utt
 
@@ -241,44 +276,49 @@ n_removed=$(wc -l < $tmpdir/utts_removed)
 echo "fix_data_dir.sh: $n_removed utterance(s) were removed in total."
 
 if [ $n_removed -gt 0 ]; then
-  # Write a removed_utts.scp in the same "key value" format as wav.scp.
-  # We use the backup wav.scp (or utt2spk if wav.scp is absent) as the
-  # value source, mirroring exactly what wav.scp looks like.
+  # Write removed_utts.scp in the same "key value" format as wav.scp.
   removed_scp=$data/removed_utts.scp
   if [ -f $data/.backup/wav.scp ]; then
     subtools/kaldi/utils/filter_scp.pl $tmpdir/utts_removed $data/.backup/wav.scp \
       > $removed_scp
   else
-    # Fallback: emit "utt_id utt_id" lines when wav.scp is unavailable
     awk '{print $1, $1}' $tmpdir/utts_removed > $removed_scp
   fi
   echo "fix_data_dir.sh: removed utterances written to $removed_scp (wav.scp format)"
 
   # ------------------------------------------------------------------
-  # If --json-file was supplied, extract matching entries and write
-  # <data-dir>/removed_samples.json.
-  # Expected JSON format: a list of objects, each containing a field
-  # whose value matches the utterance-id (key in wav.scp).
-  # The script tries common id field names: "utt_id", "uttid",
-  # "utt", "id", "key", "wav_id".  If none match, it falls back to
-  # scanning all string values in each object.
+  # If --json-file was supplied, extract matching entries, attach the
+  # removal reason(s), and write <data-dir>/removed_samples.json.
   # ------------------------------------------------------------------
   if [ -n "$json_file" ]; then
     if [ ! -f "$json_file" ]; then
       echo "$0: WARNING: --json-file $json_file not found, skipping JSON extraction."
     else
       removed_json=$data/removed_samples.json
-      python3 - "$json_file" "$tmpdir/utts_removed" "$removed_json" <<'PYEOF'
+      python3 - "$json_file" "$tmpdir/utts_removed" "$removed_reasons" "$removed_json" <<'PYEOF'
 import sys
 import json
+from collections import defaultdict
 
-json_file   = sys.argv[1]
-utts_file   = sys.argv[2]
-output_file = sys.argv[3]
+json_file      = sys.argv[1]
+utts_file      = sys.argv[2]
+reasons_file   = sys.argv[3]
+output_file    = sys.argv[4]
 
 # Load the set of removed utterance-ids
 with open(utts_file) as f:
     removed_utts = set(line.strip() for line in f if line.strip())
+
+# Load reasons: each line is "utt_id<TAB>reason"
+# One utt may have multiple reason lines → collect all into a list
+utt_reasons = defaultdict(list)
+with open(reasons_file) as f:
+    for line in f:
+        line = line.rstrip("\n")
+        if "\t" in line:
+            uid, reason = line.split("\t", 1)
+            if uid in removed_utts:
+                utt_reasons[uid].append(reason)
 
 # Load sample metadata
 with open(json_file) as f:
@@ -288,16 +328,13 @@ with open(json_file) as f:
 ID_FIELDS = ["utt_id", "uttid", "utt", "id", "key", "wav_id"]
 
 def get_utt_id(obj):
-    """Return the utterance-id string from a JSON object, or None."""
     if not isinstance(obj, dict):
         return None
-    # 1. Check known field names first
     for field in ID_FIELDS:
         if field in obj:
             val = obj[field]
             if isinstance(val, str):
                 return val
-    # 2. Fallback: scan all string values
     for val in obj.values():
         if isinstance(val, str) and val in removed_utts:
             return val
@@ -306,22 +343,33 @@ def get_utt_id(obj):
 removed_samples = []
 matched_ids     = set()
 
+def attach_reason(item, uid):
+    """Return a copy of item with 'removed_reason' field added."""
+    reasons = utt_reasons.get(uid, [])
+    out = dict(item)
+    # Deduplicate while preserving order
+    seen = []
+    for r in reasons:
+        if r not in seen:
+            seen.append(r)
+    out["removed_reason"] = seen if len(seen) != 1 else seen[0]
+    return out
+
 if isinstance(samples, list):
     for item in samples:
         uid = get_utt_id(item)
         if uid and uid in removed_utts:
-            removed_samples.append(item)
+            removed_samples.append(attach_reason(item, uid))
             matched_ids.add(uid)
 elif isinstance(samples, dict):
-    # Support dict-of-dicts keyed by utt_id
     for key, item in samples.items():
         if key in removed_utts:
-            removed_samples.append(item)
+            removed_samples.append(attach_reason(item, key))
             matched_ids.add(key)
         else:
             uid = get_utt_id(item)
             if uid and uid in removed_utts:
-                removed_samples.append(item)
+                removed_samples.append(attach_reason(item, uid))
                 matched_ids.add(uid)
 else:
     print(f"WARNING: unrecognised JSON structure in {json_file}, skipping.", file=sys.stderr)
