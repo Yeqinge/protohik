@@ -291,8 +291,9 @@ if [ $n_removed -gt 0 ]; then
   # Collapse reason lines per utt, deduplicate, join with " | "
   awk -F'\t' '
     NF==2 {
-      if (!($2 in seen[$1])) {
-        seen[$1][$2] = 1
+      key = $1 SUBSEP $2
+      if (!(key in seen)) {
+        seen[key] = 1
         reasons[$1] = ($1 in reasons) ? reasons[$1] " | " $2 : $2
       }
     }
