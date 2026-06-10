@@ -1,0 +1,14 @@
+import json
+import sys
+
+def count_samples(json_path):
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    count = len(data.get('datas', []))
+    print(f"样本总数: {count}")
+    return count
+
+if __name__ == '__main__':
+    path = sys.argv[1] if len(sys.argv) > 1 else 'data.json'
+    count_samples(path)
