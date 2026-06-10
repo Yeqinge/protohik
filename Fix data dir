@@ -64,6 +64,10 @@ function record_removed_reason {
     awk -v r="$reason" '{print $1 "\t" r}' >> $removed_reasons
 }
 
+# [NEW] Save the FULL original utt list before check_sorted, duplicates included.
+#       This matches the JSON which may also contain duplicate utt_ids.
+awk '{print $1}' < $data/utt2spk | sort > $tmpdir/utts_original_raw
+
 function check_sorted {
   file=$1
   sort -k1,1 -u <$file >$file.tmp
@@ -83,9 +87,10 @@ for x in utt2spk spk2utt feats.scp text segments wav.scp cmvn.scp vad.scp \
   fi
 done
 
-# [NEW] Save original utt list AFTER check_sorted, so duplicates are already
-#       removed and the list is clean for later comm-based diffing.
+# [NEW] After check_sorted, save the deduplicated list and record dropped duplicates.
 awk '{print $1}' < $data/utt2spk | sort -u > $tmpdir/utts_original
+record_removed_reason $tmpdir/utts_original_raw $tmpdir/utts_original \
+  "duplicate utt_id in utt2spk (removed by check_sorted)"
 
 function filter_file {
   filter=$1
@@ -271,7 +276,7 @@ echo "fix_data_dir.sh: old files are kept in $data/.backup"
 awk '{print $1}' < $data/utt2spk | sort > $tmpdir/utts_final
 
 # Diff: lines in original but not in final → removed utts
-comm -23 $tmpdir/utts_original $tmpdir/utts_final > $tmpdir/utts_removed
+comm -23 $tmpdir/utts_original_raw $tmpdir/utts_final > $tmpdir/utts_removed
 
 n_removed=$(wc -l < $tmpdir/utts_removed)
 echo "fix_data_dir.sh: $n_removed utterance(s) were removed in total."
