@@ -48,9 +48,6 @@ trap 'rm -rf "$tmpdir"' EXIT HUP INT PIPE TERM
 
 export LC_ALL=C
 
-# [NEW] Save original utt list right at the start, before any filtering.
-awk '{print $1}' < $data/utt2spk | sort > $tmpdir/utts_original
-
 # [NEW] File to accumulate "utt_id<TAB>reason" lines throughout filtering.
 #       Multiple reasons for the same utt are all appended (one line each).
 removed_reasons=$tmpdir/removed_reasons
@@ -85,6 +82,10 @@ for x in utt2spk spk2utt feats.scp text segments wav.scp cmvn.scp vad.scp \
     check_sorted $data/$x
   fi
 done
+
+# [NEW] Save original utt list AFTER check_sorted, so duplicates are already
+#       removed and the list is clean for later comm-based diffing.
+awk '{print $1}' < $data/utt2spk | sort -u > $tmpdir/utts_original
 
 function filter_file {
   filter=$1
@@ -282,46 +283,40 @@ if [ $n_removed -gt 0 ]; then
   #   utt001 /data/utt001.wav  # missing or invalid in feats.scp
   removed_scp=$data/removed_utts.scp
 
-  # Build a lookup: utt_id -> deduplicated reason string
-  # removed_reasons has lines: "utt_id<TAB>reason" (may repeat for same utt)
-  # We collapse multiple reasons with " | " as separator.
-  awk -F'\t' '{
-    if ($1 in reasons) reasons[$1] = reasons[$1] " | " $2
-    else               reasons[$1] = $2
-  }
-  END { for (u in reasons) print u "\t" reasons[u] }
-  ' $removed_reasons | sort > $tmpdir/utt_reasons_collapsed
+  # Collapse reason lines per utt, deduplicate, join with " | "
+  awk -F'\t' '
+    NF==2 {
+      if (!($2 in seen[$1])) {
+        seen[$1][$2] = 1
+        reasons[$1] = ($1 in reasons) ? reasons[$1] " | " $2 : $2
+      }
+    }
+    END { for (u in reasons) print u "\t" reasons[u] }
+  ' $removed_reasons | sort -k1,1 > $tmpdir/utt_reasons_collapsed
 
+  # Prepare wav path source; fallback to utt_id when wav.scp is absent
   if [ -f $data/.backup/wav.scp ]; then
-    # Join wav.scp entries with their reasons on utt_id (field 1 in both files)
-    join -1 1 -2 1 \
-      <(subtools/kaldi/utils/filter_scp.pl $tmpdir/utts_removed $data/.backup/wav.scp | sort -k1,1) \
-      <(sort -k1,1 $tmpdir/utt_reasons_collapsed) | \
-      awk '{
-        utt=$1; path=$2
-        reason=""
-        for(i=3;i<=NF;i++) reason=(i==3)?$i:reason" "$i
-        print utt, path, " # " reason
-      }' > $removed_scp
-    # Utts with no reason recorded (edge case) fall through without a comment
-    join -1 1 -2 1 -v1 \
-      <(subtools/kaldi/utils/filter_scp.pl $tmpdir/utts_removed $data/.backup/wav.scp | sort -k1,1) \
-      <(sort -k1,1 $tmpdir/utt_reasons_collapsed) >> $removed_scp
+    subtools/kaldi/utils/filter_scp.pl $tmpdir/utts_removed $data/.backup/wav.scp \
+      | sort -k1,1 > $tmpdir/removed_wav
   else
-    # No wav.scp: emit "utt_id utt_id  # reason"
-    join -1 1 -2 1 \
-      <(awk '{print $1, $1}' $tmpdir/utts_removed | sort -k1,1) \
-      <(sort -k1,1 $tmpdir/utt_reasons_collapsed) | \
-      awk '{
-        utt=$1; path=$2
-        reason=""
-        for(i=3;i<=NF;i++) reason=(i==3)?$i:reason" "$i
-        print utt, path, " # " reason
-      }' > $removed_scp
-    join -1 1 -2 1 -v1 \
-      <(awk '{print $1, $1}' $tmpdir/utts_removed | sort -k1,1) \
-      <(sort -k1,1 $tmpdir/utt_reasons_collapsed) >> $removed_scp
+    awk '{print $1, $1}' $tmpdir/utts_removed | sort -k1,1 > $tmpdir/removed_wav
   fi
+
+  # Left join via awk: every utt gets a reason; missing reason → "unknown"
+  awk '
+    BEGIN { FS=" "; OFS=" " }
+    NR==FNR {
+      split($0, a, "\t")
+      reasons[a[1]] = a[2]
+      next
+    }
+    {
+      utt    = $1
+      path   = $2
+      reason = (utt in reasons) ? reasons[utt] : "unknown"
+      print utt, path, " # " reason
+    }
+  ' $tmpdir/utt_reasons_collapsed $tmpdir/removed_wav > $removed_scp
   echo "fix_data_dir.sh: removed utterances written to $removed_scp (wav.scp format with reasons)"
 
   # ------------------------------------------------------------------
