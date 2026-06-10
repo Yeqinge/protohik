@@ -27,8 +27,7 @@ _ACTIVE = None
 
 
 def capture(logits, targets):
-    if _ACTIVE is not None:
-        _ACTIVE._record_pred(logits, targets)
+    pass  # loss 采集已移除
 
 
 def _to_2d(t):
@@ -70,21 +69,6 @@ def _find_loss_module(model):
     return cand
 
 
-def _find_classifier(model, num_targets):
-    found = (None, None)
-    for name, m in model.named_modules():
-        out = None
-        if isinstance(m, torch.nn.Linear):
-            out = m.out_features
-        elif hasattr(m, "out_features"):
-            out = getattr(m, "out_features")
-        else:
-            w = getattr(m, "weight", None)
-            if isinstance(w, torch.Tensor) and w.dim() >= 2:
-                out = w.shape[0]
-        if out == num_targets:
-            found = (name, m)
-    return found
 
 
 def _get_dataloader_with_sampler(loader):
@@ -117,10 +101,10 @@ class _RecordingBatchSampler:
 
 
 class _Instrumenter:
-    def __init__(self, model, num_targets, save_dir, id_source):
+    def __init__(self, model, num_targets, save_dir, id_source, egs_file=None):
         self.model = model
         self.num_targets = num_targets
-        self.tracker = SampleContributionTracker(save_dir)
+        self.tracker = SampleContributionTracker(save_dir, egs_file=egs_file)
         self.save_dir = save_dir
         self.id_source = id_source       # None / list / dict / callable(idx)->str
         self._stash = None               # (ids, targets)
@@ -165,22 +149,6 @@ class _Instrumenter:
 
         holder["h"] = X.register_hook(_grad_cb)
 
-    # —— 可选：分类头 -> loss/正确性 ——
-    def _clf_hook(self, m, i, o):
-        self._record_pred(o, self._stash[1] if self._stash else None)
-
-    def _record_pred(self, logits, targets):
-        if not self.model.training or self._stash is None or targets is None:
-            return
-        ids = list(self._stash[0])
-        logits = _to_2d(logits.detach().float())
-        t = targets.detach().long().to(logits.device).reshape(-1)
-        if t.shape[0] != logits.shape[0]:
-            return
-        loss = F.cross_entropy(logits, t, reduction="none")
-        self.tracker.update_pred(ids, loss.cpu().numpy(),
-                                 (logits.argmax(1) == t).cpu().numpy())
-
     def attach_model(self):
         lname, lmod = _find_loss_module(self.model)
         if lmod is None:
@@ -188,12 +156,7 @@ class _Instrumenter:
         else:
             self._hooks.append(lmod.register_forward_pre_hook(self._loss_pre_hook))
             print(f"[contrib] 梯度采集已挂到损失模块: {lname}")
-        cname, cmod = _find_classifier(self.model, self.num_targets)
-        if cmod is not None:
-            self._hooks.append(cmod.register_forward_hook(self._clf_hook))
-            print(f"[contrib] 额外记录 loss/正确性，分类头: {cname}")
-        else:
-            print("[contrib] 未找到普通分类头（如原型损失），只记 grad_norm/align。")
+        print("[contrib] 只记录 grad_norm/align。")
 
     def attach_real_ids(self, loader):
         dl = _get_dataloader_with_sampler(loader)
@@ -253,23 +216,21 @@ class _LoaderWrapper:
 
 def instrument(model, bunch, num_targets, save_dir,
                loader_attr="train_loader", start_epoch=0,
-               real_ids=True, id_source=None):
+               real_ids=True, id_source=None, egs_file=None):
     """
     在 trainer_process.run() 之前调用；run() 之后调用 .finalize()。
 
     real_ids  : True 用 batch 采样器的真实数据集下标当 id（推荐）。
-    id_source : 想要可读的 utt/chunk 名时传入：
-                  - list/array：id_source[下标] -> 名字（顺序须与 egs 行序一致）
-                  - dict      ：id_source[下标] -> 名字
-                  - callable  ：id_source(下标) -> 名字
-                默认 None：直接用整数下标字符串（已是稳定真实 id）。
+    id_source : 可读名字映射（list/dict/callable），默认用整数下标。
+    egs_file  : egs 清单文件路径（第一列为 utt_id），用于在 npz/CSV 中
+                存入真实 utt_id，方便后续直接对应到具体音频。
     """
     global _ACTIVE
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
     if "RANK" in os.environ:
         save_dir = os.path.join(save_dir, f"rank{rank}")
 
-    inst = _Instrumenter(model, num_targets, save_dir, id_source)
+    inst = _Instrumenter(model, num_targets, save_dir, id_source, egs_file=egs_file)
     _ACTIVE = inst
     inst.attach_model()
 
