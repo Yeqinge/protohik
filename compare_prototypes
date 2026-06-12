@@ -1,0 +1,373 @@
+"""
+compare_prototypes.py
+对比多个 MXNet 训练好的 .params 文件中的 Prototype 参数
+
+MXNet params 文件通常成对出现：
+  best_model-0000.params  +  best_model-symbol.json
+或者单独一个 .params（用 HybridBlock.export() 导出）
+
+用法:
+    # 最常见：直接指定多个 params 文件
+    python compare_prototypes.py --ckpts model_a-0000.params model_b-0000.params
+
+    # 扫描整个目录
+    python compare_prototypes.py --ckpts_dir ./checkpoints/
+
+    # 加别名
+    python compare_prototypes.py \
+        --ckpts full-0000.params pruned-0000.params \
+        --names "完整数据" "精简数据"
+
+    # 不知道 key 叫什么，先打印所有 key
+    python compare_prototypes.py --ckpts model-0000.params --list_keys
+
+    # 手动指定 key（当自动搜索失败时）
+    python compare_prototypes.py --ckpts model-0000.params --proto_key prototypeloss0_prototypes
+"""
+
+import argparse
+import os
+import glob
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from itertools import combinations
+
+# ──────────────────────────────────────────────
+# 兼容性加载：优先用 mxnet，fallback 到 numpy
+# ──────────────────────────────────────────────
+
+def load_params_mxnet(path: str):
+    """用 MXNet 原生接口加载，返回 {str: np.ndarray}"""
+    import mxnet as mx
+    save_dict = mx.nd.load(path)
+    # key 形如 "arg:prototypeloss0_prototypes" 或 "prototypeloss0_prototypes"
+    result = {}
+    for k, v in save_dict.items():
+        clean_key = k.replace("arg:", "").replace("aux:", "")
+        result[clean_key] = v.asnumpy()
+    return result
+
+
+def load_params_numpy(path: str):
+    """fallback：当作 numpy .npz 尝试加载"""
+    data = np.load(path, allow_pickle=True)
+    if hasattr(data, "files"):          # npz
+        return {k: data[k] for k in data.files}
+    elif isinstance(data, np.ndarray):  # npy
+        return {"weight": data}
+    else:
+        return dict(data)
+
+
+def load_params(path: str):
+    """自动选择加载方式，返回 {str: np.ndarray}"""
+    try:
+        return load_params_mxnet(path)
+    except ImportError:
+        print("  [警告] 未安装 mxnet，尝试 numpy 加载...")
+        return load_params_numpy(path)
+    except Exception as e:
+        raise RuntimeError(f"MXNet 加载失败: {e}")
+
+
+# ──────────────────────────────────────────────
+# 提取原型
+# ──────────────────────────────────────────────
+
+def find_proto_key(param_dict: dict, proto_key: str = None):
+    """在 param_dict 中找原型对应的 key"""
+    if proto_key is not None:
+        candidates = [k for k in param_dict if proto_key in k]
+    else:
+        candidates = [k for k in param_dict if "prototype" in k.lower()]
+
+    if not candidates:
+        raise KeyError(
+            f"未找到含 'prototype' 的键。\n"
+            f"所有可用键:\n" +
+            "\n".join(f"  {k}  shape={param_dict[k].shape}" for k in param_dict) +
+            "\n请用 --proto_key 指定，或用 --list_keys 查看所有键。"
+        )
+
+    # 优先精确匹配以 prototypes 结尾的键
+    exact = [k for k in candidates if k.endswith("prototypes")]
+    return exact[0] if exact else candidates[0]
+
+
+def load_prototypes(path: str, proto_key: str = None):
+    """返回 (np.ndarray [num_classes, feat_dim], 实际 key)"""
+    param_dict = load_params(path)
+    key = find_proto_key(param_dict, proto_key)
+    proto = param_dict[key].astype(np.float32)
+
+    # 确保 shape 是 [num_classes, feat_dim]
+    if proto.ndim == 1:
+        proto = proto.reshape(1, -1)
+    elif proto.ndim > 2:
+        proto = proto.reshape(proto.shape[0], -1)
+
+    return proto, key, param_dict
+
+
+def list_all_keys(path: str):
+    """打印文件中所有参数键及 shape，用于排查"""
+    param_dict = load_params(path)
+    print(f"\n{'─'*60}")
+    print(f"文件: {path}")
+    print(f"共 {len(param_dict)} 个参数键:")
+    for k, v in sorted(param_dict.items()):
+        print(f"  {k:<50s}  shape={v.shape}")
+
+
+# ──────────────────────────────────────────────
+# 统计指标（纯 numpy，不依赖 torch）
+# ──────────────────────────────────────────────
+
+def normalize(x: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(x, axis=1, keepdims=True)
+    return x / (norms + 1e-8)
+
+
+def cosine_sim_matrix(proto: np.ndarray) -> np.ndarray:
+    n = normalize(proto)
+    return n @ n.T
+
+
+def inter_class_angle(proto: np.ndarray) -> dict:
+    sim = np.clip(cosine_sim_matrix(proto), -1, 1)
+    nc = proto.shape[0]
+    angles = []
+    for i in range(nc):
+        for j in range(i + 1, nc):
+            angles.append(np.degrees(np.arccos(sim[i, j])))
+    return {
+        "angles": angles,
+        "mean": float(np.mean(angles)),
+        "min":  float(np.min(angles)),
+        "max":  float(np.max(angles)),
+    }
+
+
+def norm_stats(proto: np.ndarray) -> dict:
+    norms = np.linalg.norm(proto, axis=1)
+    return {
+        "norms":     norms.tolist(),
+        "mean_norm": float(norms.mean()),
+        "std_norm":  float(norms.std()),
+    }
+
+
+def spread_stats(proto: np.ndarray) -> dict:
+    var = proto.var(axis=0)
+    return {
+        "total_var": float(var.sum()),
+        "mean_var":  float(var.mean()),
+    }
+
+
+def cross_model_sim(proto_a: np.ndarray, proto_b: np.ndarray) -> dict:
+    assert proto_a.shape[0] == proto_b.shape[0], "类别数不一致"
+    na, nb = normalize(proto_a), normalize(proto_b)
+    sims = (na * nb).sum(axis=1)
+    return {
+        "per_class": sims.tolist(),
+        "mean":      float(sims.mean()),
+        "min":       float(sims.min()),
+    }
+
+
+def analyze(name: str, proto: np.ndarray) -> dict:
+    return {
+        "name":    name,
+        "proto":   proto,
+        "shape":   proto.shape,
+        "angle":   inter_class_angle(proto),
+        "norm":    norm_stats(proto),
+        "spread":  spread_stats(proto),
+        "sim_mat": cosine_sim_matrix(proto),
+    }
+
+
+# ──────────────────────────────────────────────
+# 打印汇总
+# ──────────────────────────────────────────────
+
+def print_summary(results):
+    sep = "─" * 60
+    print(f"\n{'═'*60}")
+    print(f"  Prototype 分析汇总  ({len(results)} 个模型)")
+    print(f"{'═'*60}")
+
+    for r in results:
+        a, n, s = r["angle"], r["norm"], r["spread"]
+        nc, fd = r["shape"]
+        print(f"\n【{r['name']}】  num_classes={nc}  feat_dim={fd}")
+        print(sep)
+        print(f"  类间夹角(°)    均值={a['mean']:.2f}  最小={a['min']:.2f}  最大={a['max']:.2f}")
+        print(f"  原型L2范数     均值={n['mean_norm']:.4f}  std={n['std_norm']:.4f}")
+        print(f"  特征空间分散度  总方差={s['total_var']:.4f}  均方差={s['mean_var']:.6f}")
+
+        if nc == 2:
+            sim = r["sim_mat"][0, 1]
+            angle = a["angles"][0]
+            print(f"  ── 二分类专项 ──")
+            print(f"  类0 vs 类1  余弦相似度={sim:.4f}  夹角={angle:.2f}°")
+            quality = ("优秀 (>90°)" if angle > 90
+                       else ("良好 (60°~90°)" if angle > 60 else "⚠ 较差 (<60°，两类原型太近)"))
+            print(f"  分离质量: {quality}")
+
+    # 跨模型对比
+    pairs = [(a, b) for a, b in combinations(results, 2)
+             if a["shape"] == b["shape"]]
+    if pairs:
+        print(f"\n{'═'*60}")
+        print("  跨模型同类原型相似度对比")
+        print("  （越低说明两个模型学到了不同的表示；接近1说明几乎一样）")
+        print(f"{'═'*60}")
+        for a, b in pairs:
+            cs = cross_model_sim(a["proto"], b["proto"])
+            print(f"\n  {a['name']}  vs  {b['name']}")
+            for i, s in enumerate(cs["per_class"]):
+                print(f"    类{i}: 余弦相似度={s:.4f}")
+            print(f"    平均={cs['mean']:.4f}  最低={cs['min']:.4f}")
+
+
+# ──────────────────────────────────────────────
+# 可视化
+# ──────────────────────────────────────────────
+
+def plot_results(results, save_path="prototype_comparison.png"):
+    n = len(results)
+    fig = plt.figure(figsize=(max(6 * n, 10), 14))
+    gs = gridspec.GridSpec(3, n, figure=fig, hspace=0.5, wspace=0.35)
+
+    # 行0：余弦相似度热力图
+    for col, r in enumerate(results):
+        ax = fig.add_subplot(gs[0, col])
+        sim = r["sim_mat"]
+        nc = sim.shape[0]
+        im = ax.imshow(sim, cmap="coolwarm", vmin=-1, vmax=1)
+        ax.set_title(f"{r['name']}\n类间余弦相似度", fontsize=10)
+        ax.set_xticks(range(nc)); ax.set_yticks(range(nc))
+        ax.set_xticklabels([f"C{i}" for i in range(nc)])
+        ax.set_yticklabels([f"C{i}" for i in range(nc)])
+        for i in range(nc):
+            for j in range(nc):
+                ax.text(j, i, f"{sim[i,j]:.3f}", ha="center", va="center", fontsize=9)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # 行1：类间夹角极坐标图
+    for col, r in enumerate(results):
+        ax = fig.add_subplot(gs[1, col], projection="polar")
+        nc = r["shape"][0]
+        angles_deg = r["angle"]["angles"]
+        labels = [f"C{i}-C{j}" for i in range(nc) for j in range(i+1, nc)]
+        theta = np.linspace(0, 2*np.pi, len(angles_deg), endpoint=False)
+        colors = plt.cm.tab10(np.linspace(0, 1, len(angles_deg)))
+        ax.bar(theta, angles_deg, width=0.4, alpha=0.8, color=colors)
+        ax.set_xticks(theta)
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylim(0, 180)
+        ax.set_title(f"{r['name']}\n类间夹角(°)", fontsize=10, pad=15)
+        # 90° 参考圆
+        t_circle = np.linspace(0, 2*np.pi, 200)
+        ax.plot(t_circle, [90]*200, color="red", linestyle="--",
+                linewidth=1, label="90°")
+        ax.legend(loc="upper right", fontsize=7)
+
+    # 行2：原型 L2 范数柱状图
+    ax_norm = fig.add_subplot(gs[2, :])
+    nc_max = max(r["shape"][0] for r in results)
+    bar_w = 0.8 / n
+    x = np.arange(nc_max)
+    for idx, r in enumerate(results):
+        norms = r["norm"]["norms"]
+        nc = len(norms)
+        offset = (idx - n/2 + 0.5) * bar_w
+        bars = ax_norm.bar(x[:nc] + offset, norms, width=bar_w,
+                           label=r["name"], alpha=0.85)
+        for bar, val in zip(bars, norms):
+            ax_norm.text(bar.get_x() + bar.get_width()/2,
+                         bar.get_height() + 0.005,
+                         f"{val:.3f}", ha="center", va="bottom", fontsize=8)
+    ax_norm.set_xlabel("类别")
+    ax_norm.set_ylabel("L2 范数")
+    ax_norm.set_title("各模型原型 L2 范数对比")
+    ax_norm.set_xticks(x[:nc_max])
+    ax_norm.set_xticklabels([f"类{i}" for i in range(nc_max)])
+    ax_norm.legend()
+    ax_norm.grid(axis="y", alpha=0.3)
+
+    plt.suptitle("Prototype 参数对比分析 (MXNet)", fontsize=14,
+                 fontweight="bold", y=1.01)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"\n可视化图已保存至: {save_path}")
+
+
+# ──────────────────────────────────────────────
+# 主函数
+# ──────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="对比多个 MXNet .params 文件中的 Prototype 参数"
+    )
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--ckpts", nargs="+",
+                       help="直接指定 .params 文件路径列表")
+    group.add_argument("--ckpts_dir",
+                       help="自动扫描目录下所有 .params 文件")
+    group.add_argument("--list_keys", metavar="PARAMS_FILE",
+                       help="打印指定 .params 文件的所有参数键后退出")
+
+    parser.add_argument("--proto_key", default=None,
+                        help="参数键名，默认自动搜索含 'prototype' 的键")
+    parser.add_argument("--names", nargs="+", default=None,
+                        help="模型别名，顺序与 --ckpts 一致")
+    parser.add_argument("--save", default="prototype_comparison.png",
+                        help="可视化图保存路径")
+    parser.add_argument("--no_plot", action="store_true",
+                        help="只打印文字结果，不生成图")
+    args = parser.parse_args()
+
+    # 仅列出 key
+    if args.list_keys:
+        list_all_keys(args.list_keys)
+        return
+
+    # 收集文件
+    if args.ckpts_dir:
+        ckpt_files = sorted(glob.glob(os.path.join(args.ckpts_dir, "*.params")))
+        if not ckpt_files:
+            raise FileNotFoundError(f"目录 {args.ckpts_dir} 下未找到 .params 文件")
+    else:
+        ckpt_files = args.ckpts
+
+    names = args.names or [
+        os.path.splitext(os.path.basename(f))[0] for f in ckpt_files
+    ]
+    assert len(names) == len(ckpt_files), "--names 数量需与文件数量一致"
+
+    results = []
+    for name, path in zip(names, ckpt_files):
+        print(f"加载: {path} ...", end=" ", flush=True)
+        try:
+            proto, key, _ = load_prototypes(path, args.proto_key)
+            print(f"✓  key='{key}'  shape={proto.shape}")
+            results.append(analyze(name, proto))
+        except Exception as e:
+            print(f"✗\n  错误: {e}")
+
+    if not results:
+        print("\n没有成功加载任何模型，退出。")
+        return
+
+    print_summary(results)
+
+    if not args.no_plot:
+        plot_results(results, save_path=args.save)
+
+
+if __name__ == "__main__":
+    main()
