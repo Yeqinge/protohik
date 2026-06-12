@@ -1,0 +1,45 @@
+def init(self, input_dim, num_targets, temperature=0.1,
+         focal_gamma_max=3.0, warmup_iters=1000, total_iters=10000):
+    ...
+    self.focal_gamma_max = focal_gamma_max
+    self.warmup_iters = warmup_iters
+    self.total_iters = total_iters
+    self.current_iter = 0                        # 每次 forward 自动累加
+    self.loss_function = nn.CrossEntropyLoss(reduction='none')
+
+def _get_gamma(self):
+    if self.current_iter < self.warmup_iters:
+        return 0.0
+    progress = (self.current_iter - self.warmup_iters) / \
+               max(self.total_iters - self.warmup_iters, 1)
+    return self.focal_gamma_max * min(progress, 1.0)
+
+def forward(self, inputs, targets):
+    assert len(inputs.shape) == 3
+    assert inputs.shape[2] == 1
+    
+    features = torch.squeeze(inputs, dim=2)
+    features_norm = F.normalize(features, dim=1)
+    prototypes_norm = F.normalize(self.prototypes, dim=1)
+    logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
+    self.posterior = logits.unsqueeze(2).detach()
+    
+    per_sample_loss = self.loss_function(logits, targets)
+    
+    gamma = self._get_gamma()
+    
+    # forward 里自动累加 iter，完全不依赖外部
+    self.current_iter += 1
+    
+    if gamma == 0.0:
+        return per_sample_loss.mean()
+    
+    with torch.no_grad():
+        pt = torch.exp(-per_sample_loss)
+        focal_weight = (1.0 - pt) ** gamma
+        focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
+    
+    return (focal_weight * per_sample_loss).mean()
+
+def step(self, *args, **kwargs):
+    pass  # 不需要改训练循环
