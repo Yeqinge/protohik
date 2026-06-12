@@ -1,45 +1,145 @@
-def init(self, input_dim, num_targets, temperature=0.1,
-         focal_gamma_max=3.0, warmup_iters=1000, total_iters=10000):
-    ...
-    self.focal_gamma_max = focal_gamma_max
-    self.warmup_iters = warmup_iters
-    self.total_iters = total_iters
-    self.current_iter = 0                        # 每次 forward 自动累加
-    self.loss_function = nn.CrossEntropyLoss(reduction='none')
+class PrototypeLoss(TopVirtualLoss):
+    def init(self, input_dim, num_targets, temperature=0.1,
+             focal_gamma_max=3.0, warmup_iters=1000, total_iters=10000):
+        """
+        原型损失函数，支持随训练进度自动加大难样本权重（Focal Loss 机制）。
+        
+        工作原理：
+            - 每次 forward 自动累加 iteration 计数
+            - 前 warmup_iters 次：gamma=0，等价于普通交叉熵，让模型先稳定收敛
+            - warmup 结束后：gamma 从 0 线性增大到 focal_gamma_max
+            - gamma 越大，难样本（预测置信度低）获得的损失权重越高
+        
+        gamma 与难样本权重的关系：
+            - gamma=0：所有样本权重相同（普通交叉熵）
+            - gamma=1：轻度关注难样本
+            - gamma=2：标准 Focal Loss（论文推荐值）
+            - gamma=3：强力关注难样本，适合严重不平衡场景
+        
+        参数：
+            input_dim       : 输入特征维度
+            num_targets     : 类别数量
+            temperature     : 相似度缩放温度，越小决策边界越硬，通常取 0.05~0.2
+            focal_gamma_max : gamma 的最终最大值，控制对难样本的最大关注程度
+            warmup_iters    : 预热迭代次数，期间 gamma=0 不加权
+                              建议设为总迭代数的 10%~20%
+                              估算方式：warmup_epochs × (数据量 / batch_size)
+            total_iters     : 总迭代次数，gamma 在此之后不再增大，保持最大值
+                              估算方式：total_epochs × (数据量 / batch_size)
+        """
+        # 原型向量：每个类别一个，形状 [num_targets, input_dim]
+        # 作为可学习参数，代表每个类别在特征空间中的中心
+        self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)  # xavier 初始化，避免梯度消失/爆炸
+        
+        self.temperature = temperature
+        self.focal_gamma_max = focal_gamma_max
+        self.warmup_iters = warmup_iters
+        self.total_iters = total_iters
+        
+        # 当前迭代计数，每次 forward 自动累加，无需外部调用 step()
+        self.current_iter = 0
+        
+        # reduction='none'：返回每个样本的独立 loss 值，形状 [B]
+        # 而非默认的 reduction='mean' 返回标量
+        # 这样才能对每个样本施加不同权重
+        self.loss_function = nn.CrossEntropyLoss(reduction='none')
 
-def _get_gamma(self):
-    if self.current_iter < self.warmup_iters:
-        return 0.0
-    progress = (self.current_iter - self.warmup_iters) / \
-               max(self.total_iters - self.warmup_iters, 1)
-    return self.focal_gamma_max * min(progress, 1.0)
+    def _get_gamma(self):
+        """
+        根据当前迭代次数计算当前的 gamma 值。
+        
+        变化曲线：
+            iter:  0          warmup_iters              total_iters
+            gamma: 0----0----0 → 线性增大 → focal_gamma_max（之后保持不变）
+        
+        返回：
+            float：当前 gamma 值，范围 [0, focal_gamma_max]
+        """
+        # 预热阶段：gamma 保持 0，等价于普通交叉熵
+        if self.current_iter < self.warmup_iters:
+            return 0.0
+        
+        # 计算 warmup 结束后的训练进度，范围 [0, 1]
+        progress = (self.current_iter - self.warmup_iters) / \
+                   max(self.total_iters - self.warmup_iters, 1)
+        
+        # 截断到 1.0，超过 total_iters 后 gamma 保持最大值不再增大
+        progress = min(progress, 1.0)
+        
+        return self.focal_gamma_max * progress
 
-def forward(self, inputs, targets):
-    assert len(inputs.shape) == 3
-    assert inputs.shape[2] == 1
-    
-    features = torch.squeeze(inputs, dim=2)
-    features_norm = F.normalize(features, dim=1)
-    prototypes_norm = F.normalize(self.prototypes, dim=1)
-    logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
-    self.posterior = logits.unsqueeze(2).detach()
-    
-    per_sample_loss = self.loss_function(logits, targets)
-    
-    gamma = self._get_gamma()
-    
-    # forward 里自动累加 iter，完全不依赖外部
-    self.current_iter += 1
-    
-    if gamma == 0.0:
-        return per_sample_loss.mean()
-    
-    with torch.no_grad():
-        pt = torch.exp(-per_sample_loss)
-        focal_weight = (1.0 - pt) ** gamma
-        focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
-    
-    return (focal_weight * per_sample_loss).mean()
+    def forward(self, inputs, targets):
+        """
+        前向传播，计算加权后的损失。
+        
+        难样本权重计算原理（Focal Loss）：
+            1. 计算每个样本的交叉熵 loss：per_sample_loss  形状 [B]
+            2. 计算预测置信度：pt = exp(-loss)
+               - loss 小 → pt 接近 1 → 模型预测准确（易样本）
+               - loss 大 → pt 接近 0 → 模型预测不准（难样本）
+            3. 计算 focal 权重：weight = (1 - pt)^gamma
+               - 易样本：pt→1，(1-pt)→0，weight 接近 0（降低权重）
+               - 难样本：pt→0，(1-pt)→1，weight 接近 1（保持权重）
+            4. 归一化权重，保持整体 loss 量级稳定
+        
+        参数：
+            inputs  : 形状 [B, input_dim, 1]，来自上一层的特征
+            targets : 形状 [B]，类别标签
+        返回：
+            标量 loss
+        """
+        assert len(inputs.shape) == 3
+        assert inputs.shape[2] == 1
+        
+        # 去掉最后一个维度：[B, input_dim, 1] → [B, input_dim]
+        features = torch.squeeze(inputs, dim=2)
+        
+        # L2 归一化，将特征和原型投影到单位超球面上
+        # 这样 mm 的结果就是余弦相似度，范围 [-1, 1]
+        features_norm = F.normalize(features, dim=1)       # [B, input_dim]
+        prototypes_norm = F.normalize(self.prototypes, dim=1)  # [num_targets, input_dim]
+        
+        # 计算每个样本与每个原型的余弦相似度，除以温度系数
+        # logits 形状：[B, num_targets]
+        # 温度越小，相似度差异被放大，分类边界更硬
+        logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
+        
+        # 保存 posterior 供外部计算准确率使用（detach 避免影响梯度）
+        self.posterior = logits.unsqueeze(2).detach()  # [B, num_targets, 1]
+        
+        # 计算每个样本的独立 loss，形状 [B]
+        per_sample_loss = self.loss_function(logits, targets)
+        
+        # 获取当前 gamma 值（会在下方累加 iter）
+        gamma = self._get_gamma()
+        
+        # 每次 forward 自动累加迭代计数，无需外部干预
+        self.current_iter += 1
+        
+        # gamma=0 时退化为普通交叉熵，直接返回均值
+        if gamma == 0.0:
+            return per_sample_loss.mean()
+        
+        # 计算 focal 权重，使用 no_grad 避免权重本身参与梯度计算
+        with torch.no_grad():
+            # pt：模型对正确类别的预测置信度
+            # exp(-CE_loss) 等价于 softmax 后正确类别的概率
+            pt = torch.exp(-per_sample_loss)          # [B]，范围 (0, 1)
+            
+            # focal 权重：难样本(pt小)权重大，易样本(pt大)权重小
+            focal_weight = (1.0 - pt) ** gamma        # [B]
+            
+            # 归一化：使权重均值为 1，保持 loss 整体量级不随 gamma 变化
+            # 避免 gamma 增大导致 loss 整体缩小，影响学习率的有效性
+            focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
+        
+        # 加权求均值，难样本贡献更大的梯度
+        return (focal_weight * per_sample_loss).mean()
 
-def step(self, *args, **kwargs):
-    pass  # 不需要改训练循环
+    def step(self, *args, **kwargs):
+        """
+        保持接口兼容，无需外部调用。
+        迭代计数已在 forward 中自动完成，此方法故意留空。
+        """
+        pass
