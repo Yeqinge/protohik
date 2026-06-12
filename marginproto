@@ -1,59 +1,35 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-class PrototypeLoss(nn.Module):
-    def __init__(self, input_dim, num_targets, temperature=0.1,
-                 margin=0.2, margin_type="cosface"):
-        """
-        margin_type:
-            "cosface"  — cos(θ) - m          简单稳定，推荐首选
-            "arcface"  — cos(θ + m)           角度空间更严格
-            "none"     — 原始无 margin 版本
-        """
-        super().__init__()
-        self.prototypes = nn.Parameter(torch.empty(num_targets, input_dim))
+class PrototypeLoss(TopVirtualLoss):
+    def init(self, input_dim, num_targets, temperature=0.1,
+             margin=0.2, margin_type="cosface"):
+        self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
         nn.init.xavier_uniform_(self.prototypes)
         self.temperature = temperature
         self.margin = margin
         self.margin_type = margin_type
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_function = nn.CrossEntropyLoss()
 
     def forward(self, inputs, targets):
+        assert len(inputs.shape) == 3
         assert inputs.shape[2] == 1
-        features = inputs.squeeze(2)                          # [B, D]
-        features_norm = F.normalize(features, dim=1)          # [B, D]
-        protos_norm = F.normalize(self.prototypes, dim=1)     # [C, D]
+        features = torch.squeeze(inputs, dim=2)
+        features_norm = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+        cosine = torch.mm(features_norm, prototypes_norm.t())
 
-        cosine = torch.mm(features_norm, protos_norm.t())     # [B, C]
-
-        if self.margin_type == "none" or self.margin == 0:
-            logits = cosine / self.temperature
-
-        elif self.margin_type == "cosface":
-            # 只对正确类的 cos 值减去 margin
+        if self.margin_type == "cosface":
             one_hot = torch.zeros_like(cosine)
             one_hot.scatter_(1, targets.view(-1, 1), 1.0)
-            logits = (cosine - one_hot * self.margin) / self.temperature
+            cosine = cosine - one_hot * self.margin
 
         elif self.margin_type == "arcface":
-            # 对正确类的角度加 margin，再取 cos
             one_hot = torch.zeros_like(cosine)
             one_hot.scatter_(1, targets.view(-1, 1), 1.0)
-            # 将 cos 值 clip 到合法范围，避免 acos 数值不稳定
-            cosine_clamp = cosine.clamp(-1 + 1e-7, 1 - 1e-7)
-            theta = torch.acos(cosine_clamp)
-            # 只对正确类加 margin
-            theta_m = theta + one_hot * self.margin
-            cosine_m = torch.cos(theta_m)
-            logits = cosine_m / self.temperature
+            theta = torch.acos(cosine.clamp(-1 + 1e-7, 1 - 1e-7))
+            cosine = torch.cos(theta + one_hot * self.margin)
 
-        else:
-            raise ValueError(f"未知 margin_type: {self.margin_type}")
-
+        logits = cosine / self.temperature
         self.posterior = logits.unsqueeze(2).detach()
-        return self.loss_fn(logits, targets)
+        return self.loss_function(logits, targets)
 
     def step(self, *args, **kwargs):
         pass
