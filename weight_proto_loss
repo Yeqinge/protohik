@@ -1,15 +1,6 @@
 class PrototypeLoss(TopVirtualLoss):
     def init(self, input_dim, num_targets, temperature=0.1,
              focal_gamma_max=2.0, warmup_epochs=2, total_epochs=10):
-        """
-        参数：
-            input_dim       : 输入特征维度
-            num_targets     : 类别数量
-            temperature     : 温度系数
-            focal_gamma_max : gamma 最大值
-            warmup_epochs   : 前几个 epoch 不加权，只需设置 epoch 数
-            total_epochs    : 总 epoch 数
-        """
         self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
         nn.init.xavier_uniform_(self.prototypes)
         self.temperature = temperature
@@ -17,59 +8,23 @@ class PrototypeLoss(TopVirtualLoss):
         self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
 
-        self.current_iter = 0          # 总迭代次数，每次 forward 自动累加
-        self.iters_per_epoch = None    # 第一个 epoch 结束后自动锁定
-        self._epoch_iter_count = 0     # 统计第一个 epoch 的 iter 数
-        self._first_epoch_done = False # 是否已完成第一个 epoch 的统计
+        self.current_iter = 0
+        self.iters_per_epoch = None
+        self._iter_counter = 0          # 第一个 epoch 的 iter 计数
 
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
 
-    def _detect_epoch_boundary(self):
-        """
-        在 forward 里自动检测第一个 epoch 何时结束。
-        
-        判断依据：
-            训练循环里 this_iter 从 0 开始计数，
-            当 current_iter > 0 且 this_iter == 0 时说明新 epoch 开始了，
-            即 current_iter 能被 _epoch_iter_count 整除时触发。
-            
-        但由于我们在 forward 里无法直接拿到 this_iter，
-        改用另一个思路：
-            记录每次 forward 时 current_iter 对 _epoch_iter_count 的余数，
-            当余数重新变为 0 时说明第一个 epoch 结束。
-        
-        实际上最简单的方式：
-            第一个 epoch 期间持续累加 _epoch_iter_count，
-            当 _first_epoch_done=False 且发现 current_iter 已经
-            超过 _epoch_iter_count（说明第二个 epoch 开始）时锁定。
-        """
-        if self._first_epoch_done:
-            return
-        
-        self._epoch_iter_count += 1
-        
-        # 检测是否进入第二个 epoch：
-        # current_iter 能整除 _epoch_iter_count 且不为 0，
-        # 说明 iter 数回到了起点，第一个 epoch 已结束
-        if self.current_iter > 0 and self.current_iter % self._epoch_iter_count == 0:
-            self.iters_per_epoch = self._epoch_iter_count
-            self._first_epoch_done = True
+    def step(self, *args, **kwargs):
+        """框架每个 epoch 结束会调用，用第一次调用锁定 iters_per_epoch"""
+        if self.iters_per_epoch is None and self._iter_counter > 0:
+            self.iters_per_epoch = self._iter_counter
 
     def _get_gamma(self):
-        """
-        根据当前 iter 推算所在 epoch，计算对应 gamma。
-        第一个 epoch 统计完成前始终返回 0。
-        """
-        if not self._first_epoch_done:
+        if self.iters_per_epoch is None:
             return 0.0
-
-        # 推算当前是第几个 epoch（0-based）
         current_epoch = self.current_iter // self.iters_per_epoch
-
-        # warmup 阶段
         if current_epoch < self.warmup_epochs:
             return 0.0
-
         progress = (current_epoch - self.warmup_epochs) / \
                    max(self.total_epochs - self.warmup_epochs, 1)
         return self.focal_gamma_max * min(progress, 1.0)
@@ -86,11 +41,11 @@ class PrototypeLoss(TopVirtualLoss):
 
         per_sample_loss = self.loss_function(logits, targets)
 
-        # 自动检测 epoch 边界，统计 iters_per_epoch
-        self._detect_epoch_boundary()
-        self.current_iter += 1
+        if self.iters_per_epoch is None:
+            self._iter_counter += 1
 
         gamma = self._get_gamma()
+        self.current_iter += 1
 
         if gamma == 0.0:
             return per_sample_loss.mean()
@@ -101,7 +56,3 @@ class PrototypeLoss(TopVirtualLoss):
             focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
 
         return (focal_weight * per_sample_loss).mean()
-
-    def step(self, *args, **kwargs):
-        """保持接口兼容，逻辑已在 forward 中自动完成。"""
-        pass
