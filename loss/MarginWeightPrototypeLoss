@@ -1,0 +1,92 @@
+class MarginWeightPrototypeLoss(TopVirtualLoss):
+    def init(self, input_dim, num_targets, temperature=0.1,
+             margin=0.2, margin_type="cosface",
+             focal_gamma_max=2.0, warmup_epochs=2, total_epochs=10):
+        self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        self.temperature = temperature
+        self.margin = margin
+        self.margin_type = margin_type          # "cosface" 或 "arcface"
+        self.focal_gamma_max = focal_gamma_max  # focal 指数上限，0 则退化为纯 margin loss
+        self.warmup_epochs = warmup_epochs      # 前 N epoch gamma=0，先让模型学会基本分类
+        self.total_epochs = total_epochs        # 总 epoch 数，用于 gamma 线性增长调度
+
+        self.current_iter = 0
+        self.iters_per_epoch = None
+        self._iter_counter = 0                  # 第一个 epoch 的 iter 计数
+
+        # reduction='none'：保留每个样本的独立 loss 值，供 focal 加权使用
+        # 原 MarginPrototypeLoss 用 reduction='mean'，这里改为 'none' 是 focal 的前提
+        self.loss_function = nn.CrossEntropyLoss(reduction='none')
+
+    def step(self, *args, **kwargs):
+        """框架每个 epoch 结束会调用，用第一次调用锁定 iters_per_epoch"""
+        if self.iters_per_epoch is None and self._iter_counter > 0:
+            self.iters_per_epoch = self._iter_counter
+
+    def _get_gamma(self):
+        # iters_per_epoch 未锁定（第一个 epoch 还没结束）：gamma=0，等价于普通 margin loss
+        if self.iters_per_epoch is None:
+            return 0.0
+        current_epoch = self.current_iter // self.iters_per_epoch
+        # warmup 阶段：gamma=0，让 margin 先把特征空间拉开，再引入难例聚焦
+        if current_epoch < self.warmup_epochs:
+            return 0.0
+        # warmup 结束后线性增长到 focal_gamma_max，避免突然增大导致训练不稳
+        progress = (current_epoch - self.warmup_epochs) / \
+                   max(self.total_epochs - self.warmup_epochs, 1)
+        return self.focal_gamma_max * min(progress, 1.0)
+
+    def forward(self, inputs, targets):
+        assert len(inputs.shape) == 3
+        assert inputs.shape[2] == 1
+        features = torch.squeeze(inputs, dim=2)
+        features_norm = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+        cosine = torch.mm(features_norm, prototypes_norm.t())  # (B, C) 余弦相似度矩阵
+
+        # ── Margin：压低目标类得分，强迫特征更靠近原型才能被正确分类 ──────────
+        # one_hot 仅在目标类位置为 1，其余为 0，保证 margin 只作用于正确类
+        if self.margin_type == "cosface":
+            # CosFace: cos(θ) - m，直接在余弦值上减 margin
+            # 简单稳定，梯度方差小，建议优先使用
+            one_hot = torch.zeros_like(cosine)
+            one_hot.scatter_(1, targets.view(-1, 1), 1.0)
+            cosine = cosine - one_hot * self.margin
+
+        elif self.margin_type == "arcface":
+            # ArcFace: cos(θ + m)，在角度域加 margin，几何意义更纯
+            # 超球面上对所有方向施压均匀，但 acos 在边界梯度大，需 clamp 保护
+            one_hot = torch.zeros_like(cosine)
+            one_hot.scatter_(1, targets.view(-1, 1), 1.0)
+            theta = torch.acos(cosine.clamp(-1 + 1e-7, 1 - 1e-7))
+            cosine = torch.cos(theta + one_hot * self.margin)
+
+        logits = cosine / self.temperature
+
+        # posterior 存 logits（含 margin），与原 MarginPrototypeLoss 行为一致
+        self.posterior = logits.unsqueeze(2).detach()
+
+        # ── per-sample loss：每个样本单独保留，供 focal 加权 ─────────────────
+        per_sample_loss = self.loss_function(logits, targets)  # (B,)
+
+        # 第一个 epoch 内持续计数，step() 调用时锁定 iters_per_epoch
+        if self.iters_per_epoch is None:
+            self._iter_counter += 1
+
+        gamma = self._get_gamma()
+        self.current_iter += 1
+
+        # ── Focal 加权：warmup 期间或 gamma=0 时退化为普通 margin loss ────────
+        if gamma == 0.0:
+            return per_sample_loss.mean()
+
+        with torch.no_grad():
+            # pt = exp(-loss)：loss 小则 pt 大（简单样本），loss 大则 pt 小（难样本）
+            # focal_weight = (1-pt)^gamma：难样本权重大，简单样本权重趋近于 0
+            # 归一化：防止 batch 内权重分布变化影响有效学习率尺度
+            pt = torch.exp(-per_sample_loss)
+            focal_weight = (1.0 - pt) ** gamma
+            focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
+
+        return (focal_weight * per_sample_loss).mean()
