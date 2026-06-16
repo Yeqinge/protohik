@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+统计 wav.scp 文件中的样本信息
+wav.scp 格式: <sample_name> <file_path>
+种类名 = 样本名的第一个词（以 '_' 或 '-' 或空格分隔的第一部分）
+"""
+
+import sys
+import os
+from collections import defaultdict, OrderedDict
+
+
+def parse_category(sample_name):
+    """从样本名中提取种类名（第一个词）"""
+    # 支持下划线、连字符、空格作为分隔符
+    for sep in ['_', '-', ' ']:
+        if sep in sample_name:
+            return sample_name.split(sep)[0]
+    return sample_name  # 没有分隔符则整个名字作为种类
+
+
+def read_wav_scp(filepath):
+    """读取 wav.scp 文件，返回样本列表"""
+    samples = []
+    errors = []
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            parts = line.split()
+            if len(parts) < 2:
+                errors.append(f"  第 {line_num} 行格式错误: '{line}'")
+                continue
+
+            sample_name = parts[0]
+            file_path = parts[1]
+            category = parse_category(sample_name)
+            samples.append((sample_name, file_path, category))
+
+    return samples, errors
+
+
+def print_stats(samples, errors, filepath):
+    """打印统计信息"""
+    category_dict = defaultdict(list)
+    for sample_name, file_path, category in samples:
+        category_dict[category].append(sample_name)
+
+    # 按样本数量降序排序
+    sorted_categories = sorted(category_dict.items(), key=lambda x: -len(x[1]))
+
+    print("=" * 60)
+    print(f"  wav.scp 统计报告")
+    print(f"  文件路径: {filepath}")
+    print("=" * 60)
+    print(f"\n📦 总样本数:   {len(samples)}")
+    print(f"🏷️  种类总数:   {len(category_dict)}\n")
+
+    if errors:
+        print(f"⚠️  格式错误行数: {len(errors)}")
+        for e in errors:
+            print(e)
+        print()
+
+    print("-" * 60)
+    print(f"{'种类名':<30} {'样本数':>8}  {'占比':>8}")
+    print("-" * 60)
+
+    for category, sample_list in sorted_categories:
+        ratio = len(sample_list) / len(samples) * 100 if samples else 0
+        print(f"{category:<30} {len(sample_list):>8}  {ratio:>7.1f}%")
+
+    print("-" * 60)
+    print(f"{'合计':<30} {len(samples):>8}  {'100.0%':>8}")
+    print("=" * 60)
+
+
+def main():
+    if len(sys.argv) < 2:
+        # 默认读取当前目录的 wav.scp
+        filepath = 'wav.scp'
+    else:
+        filepath = sys.argv[1]
+
+    if not os.path.exists(filepath):
+        print(f"❌ 文件不存在: {filepath}")
+        print(f"用法: python {sys.argv[0]} [wav.scp路径]")
+        sys.exit(1)
+
+    samples, errors = read_wav_scp(filepath)
+
+    if not samples:
+        print("⚠️  未找到有效样本，请检查文件格式。")
+        sys.exit(1)
+
+    print_stats(samples, errors, filepath)
+
+
+if __name__ == '__main__':
+    main()
