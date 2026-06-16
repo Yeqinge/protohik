@@ -1,0 +1,45 @@
+class PrototypeLoss1(TopVirtualLoss):
+    def init(self,input_dim,num_targets,temperature=0.1,
+                momentum=0.999,diversity_weight=0.1,
+                compactness_weight=0.5,smoothing=0.1):
+        self.prototypes=nn.Parameter(torch.empty(num_targets,input_dim))
+        nn.init.xavier_normal_(self.prototypes)
+        self.register_buffer('ema_prototypes',self.prototypes.data.clone())
+        self.register_buffer('cluster_counts',torch.zeros(num_targets))
+        self.temperature=temperature
+        self.momentum=momentum
+        self.diversity_weight=diversity_weight
+        self.compactness_weight=compactness_weight
+        self.num_targets=num_targets
+        self.input_dim=input_dim
+        self.loss_function=nn.CrossEntropyLoss(label_smoothing=smoothing)
+
+        
+    def forward(self,inputs,targets):
+        assert len(inputs.shape)==3 and inputs.shape[2]==1
+        features=torch.squeeze(inputs,dim=2)
+        features_norm=F.normalize(features,dim=1)
+        prototypes_norm=F.normalize(self.prototypes,dim=1)
+        logits=torch.mm(features_norm,prototypes_norm.t())/self.temperature
+        ce_loss=self.loss_function(logits,targets)
+
+        proto_sim=torch.mm(prototypes_norm,prototypes_norm.t())
+        mask=~torch.eye(self.num_targets,dtype=torch.bool,device=proto_sim.device)
+        diversity_loss=proto_sim[mask].pow(2).mean()
+
+        target_sim=(features_norm*prototypes_norm[targets]).sum(dim=1)
+        compactness_loss=(1-target_sim).mean()
+
+        total_loss=ce_loss+self.diversity_weight*diversity_loss+self.compactness_weight*compactness_loss
+        self.posterior=logits.unsqueeze(2).detach()
+
+        with torch.no_grad():
+            self.cluster_counts.zero_()
+            self.cluster_counts.scatter_add_(0,targets,torch.ones_like(targets,dtype=torch.float))
+
+        return total_loss
+    
+    @torch.no_grad()
+    def step(self,*args,**kwargs):
+        self.ema_prototypes.mul_(self.momentum).add_(self.prototypes.data,alpha=1-self.momentum)
+        self.prototypes.data.copy_(self.ema_prototypes)
