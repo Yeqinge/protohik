@@ -8,6 +8,7 @@
 
 cmd="$@"
 
+
 utt_extra_files=
 spk_extra_files=
 # [NEW] JSON file containing sample metadata; when set, removed samples
