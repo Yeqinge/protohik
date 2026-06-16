@@ -1,4 +1,4 @@
-class MarginFocalPrototypeLoss(TopVirtualLoss):
+class MarginWeightPrototypeLoss(TopVirtualLoss):
     def init(self, input_dim, num_targets, temperature=0.1,
              margin=0.2, margin_type="cosface",
              focal_gamma_max=2.0, warmup_epochs=2, total_epochs=10,
