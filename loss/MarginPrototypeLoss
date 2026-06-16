@@ -1,4 +1,4 @@
-class PrototypeLoss(TopVirtualLoss):
+class MarginPrototypeLoss(TopVirtualLoss):
     def init(self, input_dim, num_targets, temperature=0.1,
              margin=0.2, margin_type="cosface"):
         self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
