@@ -47,6 +47,7 @@ class SampleContributionTracker:
         return self._buf.setdefault(sid, {
             "gn": 0.0, "gn_n": 0, "al": 0.0, "al_n": 0,
             "loss": 0.0, "loss_n": 0, "correct": -1,
+            "fw": 0.0, "fw_n": 0,   # focal_weight（无 focal 分支时不更新，存 nan）
         })
 
     def update_grad(self, ids, grad_norm, align):
@@ -60,6 +61,12 @@ class SampleContributionTracker:
             e = self._ent(str(sid))
             e["loss"] += float(loss[i]); e["loss_n"] += 1
             e["correct"] = int(bool(correct[i]))
+
+    # 新增：由 contrib_hook._loss_post_hook 调用
+    def update_weight(self, ids, weights):
+        for i, sid in enumerate(ids):
+            e = self._ent(str(sid))
+            e["fw"] += float(weights[i]); e["fw_n"] += 1
 
     def save_epoch(self):
         ids = list(self._buf.keys())
@@ -75,6 +82,7 @@ class SampleContributionTracker:
             align=col(lambda e: e["al"] / e["al_n"] if e["al_n"] else np.nan),
             loss=col(lambda e: e["loss"] / e["loss_n"] if e["loss_n"] else np.nan),
             correct=np.array([self._buf[i]["correct"] for i in ids], dtype=np.int8),
+            focal_weight=col(lambda e: e["fw"] / e["fw_n"] if e["fw_n"] else np.nan),  # 新增
         )
         print(f"[contrib] epoch {self._epoch} 已保存 ({len(ids)} 样本)")
 
@@ -93,9 +101,6 @@ class SampleContributionTracker:
         id2idx  = {sid: i for i, sid in enumerate(all_ids)}
 
         # ---- utt_id 映射（三路来源，优先级从高到低）----
-        # 1) egs_file 参数（行号 = 样本整数 id）—— 最推荐
-        # 2) npz 里已有 utt_ids 字段
-        # 3) 都没有：utt_id 列与 id 列相同
         utt_id_map = {}
         if egs_file and os.path.exists(egs_file):
             with open(egs_file) as f:
@@ -122,16 +127,16 @@ class SampleContributionTracker:
         n_samples = len(all_ids)
         print(f"[contrib] 共 {n_samples} 个样本，开始向量化聚合 ...")
 
-        # ---- 第二步：分配 (n_samples, n_epochs) 矩阵，填入数据 ----
+        # ---- 第二步：分配矩阵，填入数据 ----
         gn = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
         al = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
         ls = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
-        co = np.full((n_samples, n_epochs), -1, dtype=np.int8)
+        co = np.full((n_samples, n_epochs), -1,      dtype=np.int8)
+        fw = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)  # 新增
 
         for ei, f in enumerate(files):
             d = np.load(f, allow_pickle=True)
             ids_str = d["ids"].astype(str)
-            # 快速路径：如果 id 是纯数字（真实下标模式），直接转 int 当索引
             try:
                 idxs = ids_str.astype(np.int64)
                 if idxs.max() >= n_samples or idxs.min() < 0:
@@ -142,6 +147,8 @@ class SampleContributionTracker:
             al[idxs, ei] = d["align"]
             ls[idxs, ei] = d["loss"]
             co[idxs, ei] = d["correct"]
+            if "focal_weight" in d:                  # 新增；旧 npz 没有此字段时静默跳过
+                fw[idxs, ei] = d["focal_weight"]
             print(f"  epoch {ei}: {len(ids_str)} 样本已加载")
 
         # ---- 第三步：全量向量化计算 ----
@@ -154,6 +161,8 @@ class SampleContributionTracker:
             mean_ls    = np.nanmean(ls, axis=1)
             last_ls    = ls[:, -1]
             n_ep_valid = np.sum(~np.isnan(gn), axis=1)
+            mean_fw    = np.nanmean(fw, axis=1)      # 新增
+            last_fw    = fw[:, -1]                   # 新增
 
             # frac_neg_align
             valid_al = ~np.isnan(al)
@@ -161,7 +170,7 @@ class SampleContributionTracker:
             n_val_al = valid_al.sum(axis=1).astype(np.float32)
             frac_neg = np.where(n_val_al > 0, neg_al.sum(axis=1) / n_val_al, np.nan)
 
-            # forget events: correct[t]==1 → correct[t+1]==0
+            # forget events
             forget = np.zeros(n_samples, dtype=np.int32)
             if n_epochs > 1:
                 forget = ((co[:, :-1] == 1) & (co[:, 1:] == 0)).sum(axis=1)
@@ -174,7 +183,6 @@ class SampleContributionTracker:
         lo_aln = np.nanpercentile(valid_ma, 10) if len(valid_ma) else -np.inf
 
         tags = np.full(n_samples, 4, dtype=np.int8)  # 4=normal
-        # 按优先级从低到高覆盖（后写的覆盖前写的）
         easy_mask = (~np.isnan(mean_ls)) & (mean_ls < 1e-2) & (forget == 0)
         tags[easy_mask] = 0                            # easy_redundant
         tags[self_inf >= hi_inf] = 1                   # high_influence
@@ -193,7 +201,8 @@ class SampleContributionTracker:
         has_utt = bool(utt_id_map)
         fields = ["id", "utt_id", "tag", "n_epochs", "mean_grad_norm", "early_grad_norm",
                   "self_influence", "mean_align", "frac_neg_align",
-                  "mean_loss", "last_loss", "forget_events", "final_correct"]
+                  "mean_loss", "last_loss", "forget_events", "final_correct",
+                  "mean_focal_weight", "last_focal_weight"]   # 新增两列
         with open(out_csv, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(fields)
@@ -213,6 +222,8 @@ class SampleContributionTracker:
                     f"{last_ls[i]:.6f}",
                     int(forget[i]),
                     int(final_co[i]),
+                    f"{mean_fw[i]:.6f}",   # 新增
+                    f"{last_fw[i]:.6f}",   # 新增
                 ])
         print(f"[contrib] 已写出 {n_samples} 个样本 -> {out_csv}")
         return out_csv
