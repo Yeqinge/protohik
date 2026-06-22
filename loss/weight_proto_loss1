@@ -1,0 +1,39 @@
+class PrototypeLoss(TopVirtualLoss):
+    def __init__(self, input_dim, num_targets, temperature=0.1,
+                 focal_gamma_max=2.0, warmup_epochs=2, total_epochs=10):
+        self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        self.temperature = temperature
+        self.focal_gamma_max = focal_gamma_max
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.current_epoch = 0          # 由 trainer 外部赋值
+        self.loss_function = nn.CrossEntropyLoss(reduction='none')
+
+    def _get_gamma(self):
+        if self.current_epoch < self.warmup_epochs:
+            return 0.0
+        progress = (self.current_epoch - self.warmup_epochs) / \
+                   max(self.total_epochs - self.warmup_epochs, 1)
+        return self.focal_gamma_max * min(progress, 1.0)
+
+    def forward(self, inputs, targets):
+        assert len(inputs.shape) == 3
+        assert inputs.shape[2] == 1
+        features = torch.squeeze(inputs, dim=2)
+        features_norm = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+        logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
+        self.posterior = logits.unsqueeze(2).detach()
+        per_sample_loss = self.loss_function(logits, targets)
+
+        gamma = self._get_gamma()
+        if gamma == 0.0:
+            return per_sample_loss.mean()
+
+        with torch.no_grad():
+            pt = torch.exp(-per_sample_loss)
+            focal_weight = (1.0 - pt) ** gamma
+            focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
+
+        return (focal_weight * per_sample_loss).mean()
