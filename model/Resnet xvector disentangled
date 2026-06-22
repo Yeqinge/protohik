@@ -1,0 +1,799 @@
+# -*- coding:utf-8 -*-
+
+# Copyright xmuspeech (Author: Snowdar 2020-02-28)
+# Modified: Disentangled Representation Learning version
+#
+# 兼容性说明
+# ----------
+# 本文件与原版 ResNetXvector 保持完全相同的外部调用接口：
+#
+#   model = ResNetXvector(inputs_dim=80, num_targets=1000)   # 构造
+#   out   = model(inputs, targets)                            # forward → tensor
+#   loss  = model.get_loss(out, targets)                      # get_loss → scalar
+#   emb   = model.extract_embedding(inputs)                   # 提取 embedding
+#   model.step(epoch, this_iter, epoch_batchs)               # 训练调度
+#
+# 解耦逻辑完全在内部实现，对调用方透明。
+# 新增参数均有默认值，且默认值使解耦功能关闭（disentangle=False），
+# 此时行为与原版完全一致。
+
+import sys
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+sys.path.insert(0, "subtools/pytorch")
+
+import libs.support.utils as utils
+from libs.nnet import *
+from libs.nnet.resnet_se import ResNet
+
+
+# ============================================================
+#  辅助模块
+# ============================================================
+
+class OrthogonalLoss(nn.Module):
+    """正交性约束：令 z_spk 与 z_nui 的余弦相关性趋近 0。"""
+    def forward(self, z_spk, z_nui):
+        # 统一到 2D [B, D]
+        if z_spk.dim() == 3:
+            z_spk = z_spk.squeeze(-1)
+        if z_nui.dim() == 3:
+            z_nui = z_nui.squeeze(-1)
+        # 维度不同时取最小维度做截断对齐
+        d = min(z_spk.shape[1], z_nui.shape[1])
+        z_s = F.normalize(z_spk[:, :d], dim=1)
+        z_n = F.normalize(z_nui[:, :d], dim=1)
+        return (z_s * z_n).sum(dim=1).pow(2).mean()
+
+
+class GradientReversalLayer(torch.autograd.Function):
+    """梯度反转层：前向不变，反向梯度乘以 -alpha。"""
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        return -ctx.alpha * grad, None
+
+
+class AdversarialClassifier(nn.Module):
+    """对抗分类器：通过 GRL 阻止子空间学到不该学的信息。"""
+    def __init__(self, in_dim, num_classes, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x, alpha=1.0):
+        if x.dim() == 3:
+            x = x.squeeze(-1)
+        x = GradientReversalLayer.apply(x, alpha)
+        return self.net(x)
+
+
+class CLUBEstimator(nn.Module):
+    """
+    CLUB 互信息上界估计器（Cheng et al., 2020）。
+    最小化 z_spk 与 z_nui 之间的互信息。
+    """
+    def __init__(self, x_dim, y_dim, hidden_dim=256):
+        super().__init__()
+        self.mu_net = nn.Sequential(
+            nn.Linear(x_dim, hidden_dim), nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, y_dim),
+        )
+        self.lv_net = nn.Sequential(
+            nn.Linear(x_dim, hidden_dim), nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, y_dim), nn.Tanh(),  # 限制范围
+        )
+
+    def forward(self, x, y):
+        if x.dim() == 3:
+            x = x.squeeze(-1)
+        if y.dim() == 3:
+            y = y.squeeze(-1)
+        mu  = self.mu_net(x)
+        lv  = self.lv_net(x)
+        pos = -0.5 * (((y - mu) ** 2) / lv.exp() + lv).sum(1)
+        neg = -0.5 * (((y[torch.randperm(y.size(0))] - mu) ** 2) / lv.exp() + lv).sum(1)
+        return (pos - neg).mean()
+
+
+class DisentangledEncoder(nn.Module):
+    """
+    VAE 风格解耦编码器（use_vae=True 时替换双头 FC）。
+    训练时对潜变量重参数化采样；推理时直接使用均值。
+    """
+    def __init__(self, in_dim, spk_dim, nui_dim):
+        super().__init__()
+        self.spk_mu  = nn.Linear(in_dim, spk_dim)
+        self.spk_lv  = nn.Linear(in_dim, spk_dim)
+        self.nui_mu  = nn.Linear(in_dim, nui_dim)
+        self.nui_lv  = nn.Linear(in_dim, nui_dim)
+
+    @staticmethod
+    def _reparam(mu, lv):
+        return mu + torch.randn_like(mu) * (0.5 * lv).exp()
+
+    @staticmethod
+    def _kl(mu, lv):
+        return -0.5 * (1 + lv - mu.pow(2) - lv.exp()).sum(1).mean()
+
+    def forward(self, x, training=True):
+        if x.dim() == 3:
+            x = x.squeeze(-1)
+        sm, sl = self.spk_mu(x), self.spk_lv(x)
+        nm, nl = self.nui_mu(x), self.nui_lv(x)
+        z_spk = self._reparam(sm, sl) if training else sm
+        z_nui = self._reparam(nm, nl) if training else nm
+        return z_spk, z_nui, self._kl(sm, sl), self._kl(nm, nl)
+
+
+class AttentiveStatsPool(nn.Module):
+    """
+    注意力统计池化：输出均值与加权标准差的拼接，维度翻倍。
+    输入 [B, C, T] → 输出 [B, 2C]
+    """
+    def __init__(self, in_dim, bottleneck_dim=128):
+        super().__init__()
+        self.attn = nn.Sequential(
+            nn.Conv1d(in_dim, bottleneck_dim, 1),
+            nn.Tanh(),
+            nn.Conv1d(bottleneck_dim, in_dim, 1),
+            nn.Softmax(dim=2),
+        )
+
+    def forward(self, x):
+        w  = self.attn(x)
+        mu = (x * w).sum(2)
+        sg = ((w * (x - mu.unsqueeze(2)).pow(2)).sum(2).clamp(min=1e-5)).sqrt()
+        return torch.cat([mu, sg], dim=1)
+
+
+# ============================================================
+#  Loss 注册表
+# ============================================================
+
+LOSS_REGISTRY: dict = {}
+
+def _build_loss_registry():
+    """延迟注册，避免模块顶层循环导入。"""
+    if LOSS_REGISTRY:
+        return  # 已注册，跳过
+    LOSS_REGISTRY.update({
+        "softmax":        SoftmaxLoss,
+        "margin":         MarginSoftmaxLoss,
+        "oc":             OCSoftmaxLoss,
+        "proto":          PrototypeLoss,
+        "proto1":         PrototypeLoss1,
+        "proto_enhanced": PrototypeLossEnhanced,
+        "proto_multi":    PrototypeLossMulti,
+        "proto_uni":      PrototypeLossUni,
+    })
+
+
+# ============================================================
+#  主模型
+# ============================================================
+
+class ResNetXvector(TopVirtualNnet):
+    """
+    ResNet x-vector 框架（解耦表征学习版本）
+
+    外部调用接口与原版完全兼容：
+        forward(inputs, targets)      → Tensor（与原版相同）
+        get_loss(inputs, targets)     → Tensor（与原版相同）
+        extract_embedding(inputs)     → Tensor（与原版相同）
+        step(epoch, this_iter, batchs)
+
+    新增参数（均有默认值，默认关闭解耦）：
+        disentangle        : bool，是否启用解耦（默认 False）
+        nui_dim            : int，干扰子空间维度（默认 fc_dim//2）
+        use_vae            : bool，是否使用 VAE 编码器（默认 False）
+        use_attentive_pool : bool，是否使用注意力统计池化（默认 False）
+        attentive_bottleneck: int，注意力池化瓶颈维度（默认 128）
+        num_channel_labels : int，信道标签数，0 表示无（默认 0）
+        w_orth / w_adv / w_mi / w_kl：各约束权重
+        disentangle_warmup_epochs：前 N epoch 只训练主任务（默认 5）
+        adv_alpha_max      : float，对抗梯度反转系数上限（默认 1.0）
+
+    Loss 参数变化（向下兼容）：
+        新增 loss_type="margin" 字符串参数（推荐使用）
+        同时保留原有布尔参数（margin_loss / oc_loss / proto_loss 等），
+        二者共存时 loss_type 优先。
+    """
+
+    def init(self, inputs_dim, num_targets,
+             # ── 原有参数（保持不变）──────────────────────────
+             aug_dropout=0., res_dropout=0., tail_dropout=0., training=True,
+             resnet_params={}, pooling="avg", pooling_params={},
+             fc1=False, fc1_params={}, fc2_params={},
+             margin_loss=False, oc_loss=False,
+             proto_loss=False, proto1_loss=False,
+             protoenhanced_loss=False, protomulti_loss=False, protouni_loss=True,
+             margin_loss_params={}, oc_loss_params={},
+             proto_loss_params={}, proto1_loss_params={},
+             protoenhanced_loss_params={}, protomulti_loss_params={},
+             protouni_loss_params={},
+             use_step=False, step_params={},
+             freeze=False, extracted_embedding="near",
+             mixup=False, mixup_w_target=False, mixup_alpha=1.0,
+             mixup_core=0, framemixup=False, mixup_lambda=0.2,
+             conv_out_mean=False, fc_dim=128,
+             transform_keys=["resnet", "stats", "fc2"],
+             train_keys=["resnet", "stats", "fc2", "loss"],
+             # ── 新增：Loss 注册表方式（优先级高于布尔参数）──
+             loss_type=None, loss_params={},
+             # ── 新增：解耦相关参数（默认全部关闭）──────────
+             disentangle=False,
+             nui_dim=None,
+             use_vae=False,
+             use_attentive_pool=False,
+             attentive_bottleneck=128,
+             num_channel_labels=0,
+             w_orth=0.1,
+             w_adv=0.1,
+             w_mi=0.05,
+             w_kl=0.001,
+             disentangle_warmup_epochs=5,
+             adv_alpha_max=1.0,
+             ):
+
+        # ── 默认参数合并 ────────────────────────────────────
+        default_resnet_params = {
+            "head_conv": True,
+            "head_conv_params": {"kernel_size": 3, "stride": 1, "padding": 1},
+            "head_maxpool": False,
+            "head_maxpool_params": {"kernel_size": 3, "stride": 1, "padding": 1},
+            "block": "BasicBlock", "groups": 1, "width_per_group": 64,
+            "layers": [2, 2, 2, 2],
+            "planes": [16, 32, 64, 128],
+            "convXd": 2,
+            "norm_layer_params": {"momentum": 0.5, "affine": True},
+            "zero_init_residual": False,
+            "se_flags": [False, False, False, False],
+            "se_params": {"ratio": 4, "stddev": False, "fw": False},
+        }
+        default_pooling_params = {"Xd": 1, "h_size": 1, "w_size": 1}
+        default_fc_params = {
+            "nonlinearity": "relu", "nonlinearity_params": {"inplace": True},
+            "bn-relu": False, "bn": True,
+            "bn_params": {"momentum": 0.5, "affine": True, "track_running_stats": True},
+        }
+        default_margin_loss_params = {
+            "method": "am", "m": 0.2, "feature_normalize": True,
+            "s": 30, "mhe_loss": False, "mhe_w": 0.01, "curricular": False,
+            "base": "ce", "reduction": "mean", "loss_thre": 0.0,
+            "two_class": False, "m2": 0.3, "three_class": False, "m3": 0.3,
+            "sub_center": False, "k": 3, "b": 0.0,
+            "loss_weight_type": "threshold", "gamma": 2,
+        }
+        default_oc_loss_params = {
+            "target_index": 0, "r_real": 0.9, "r_fake": 0.2, "alpha": 20.0,
+        }
+        default_proto_loss_params     = {"temperature": 0.1}
+        default_proto1_loss_params    = {
+            "temperature": 0.1, "momentum": 0.999, "diversity_weight": 0.1,
+            "compactness_weight": 0.5, "smoothing": 0.1,
+        }
+        default_protoenhanced_params  = {
+            "temperature": 0.07, "feature_noise_std": 0.1,
+            "learnable_temperature": True, "spread_threshold": 0.5,
+            "spread_weight": 0.1, "hard_negative_ratio": 0.3,
+            "contrastive_weight": 0.3, "diversity_weight": 0.1,
+            "compactness_weight": 0.3, "smoothing": 0.1,
+        }
+        default_protomulti_params     = {
+            "temperature": 0.07, "num_prototypes_per_class": 4,
+            "soft_assignment": True, "assignment_temperature": 0.1,
+            "intra_diversity_weight": 0.1, "inter_separation_weight": 0.1,
+            "separation_margin": 0.5, "smoothing": 0.1,
+        }
+        default_protouni_params       = {
+            "temperature": 0.1, "momentum": 0.999,
+            "contrastive_weight": 0.1, "smoothing": 0.1,
+        }
+        default_step_params = {
+            "T": None,
+            "m": False, "lambda_0": 0, "lambda_b": 1000, "alpha": 5, "gamma": 1e-4,
+            "s": False, "s_tuple": [30, 12], "s_list": None,
+            "t": False, "t_tuple": [0.5, 1.2],
+            "p": False, "p_tuple": [0.5, 0.1],
+        }
+
+        resnet_params           = utils.assign_params_dict(default_resnet_params, resnet_params)
+        pooling_params          = utils.assign_params_dict(default_pooling_params, pooling_params)
+        fc1_params              = utils.assign_params_dict(default_fc_params, fc1_params)
+        fc2_params              = utils.assign_params_dict(default_fc_params, fc2_params)
+        margin_loss_params      = utils.assign_params_dict(default_margin_loss_params, margin_loss_params)
+        oc_loss_params          = utils.assign_params_dict(default_oc_loss_params, oc_loss_params)
+        proto_loss_params       = utils.assign_params_dict(default_proto_loss_params, proto_loss_params)
+        proto1_loss_params      = utils.assign_params_dict(default_proto1_loss_params, proto1_loss_params)
+        protoenhanced_loss_params = utils.assign_params_dict(default_protoenhanced_params, protoenhanced_loss_params)
+        protomulti_loss_params  = utils.assign_params_dict(default_protomulti_params, protomulti_loss_params)
+        protouni_loss_params    = utils.assign_params_dict(default_protouni_params, protouni_loss_params)
+        step_params             = utils.assign_params_dict(default_step_params, step_params)
+
+        # ── 基本属性 ────────────────────────────────────────
+        self.extracted_embedding        = extracted_embedding
+        self.use_step                   = use_step
+        self.step_params                = step_params
+        self.convXd                     = resnet_params["convXd"]
+        self.poolXd                     = pooling_params["Xd"]
+        self.conv_out_mean              = conv_out_mean
+        self.fc_dim                     = fc_dim
+        # 解耦相关
+        self.disentangle                = disentangle
+        self.nui_dim                    = nui_dim if nui_dim is not None else fc_dim // 2
+        self.use_vae                    = use_vae and disentangle
+        self.use_attentive_pool         = use_attentive_pool
+        self.num_channel_labels         = num_channel_labels
+        self.w_orth                     = w_orth
+        self.w_adv                      = w_adv
+        self.w_mi                       = w_mi
+        self.w_kl                       = w_kl
+        self.disentangle_warmup_epochs  = disentangle_warmup_epochs
+        self.adv_alpha_max              = adv_alpha_max
+        self._current_epoch             = 0
+        # 内部缓存（用于 get_loss 读取 forward 的解耦输出）
+        self._z_nui   = None
+        self._kl_loss = None
+
+        # ── 数据增强 ────────────────────────────────────────
+        if mixup_w_target:
+            self.mixup = MixupwithTarget(alpha=mixup_alpha, mixup_core=mixup_core) if mixup else None
+        else:
+            self.mixup = Mixup(alpha=mixup_alpha, core=mixup_core) if mixup else None
+        self.framemixup  = FrameMixup(lam=mixup_lambda) if framemixup else None
+        self.aug_dropout = nn.Dropout2d(p=aug_dropout) if aug_dropout > 0 else None
+
+        # ── ResNet Backbone ──────────────────────────────────
+        inplanes     = 1 if self.convXd == 2 else inputs_dim
+        self.resnet  = ResNet(inplanes, inputs_dim, **resnet_params)
+        self.res_dropout = nn.Dropout2d(p=res_dropout) if res_dropout > 0 else None
+
+        # ── 计算 ResNet 输出维度 ─────────────────────────────
+        if self.poolXd == 2:
+            resnet_out_dim = (resnet_params["planes"][3]
+                              * pooling_params["h_size"] * pooling_params["w_size"])
+        else:
+            resnet_out_dim = (
+                (inputs_dim + self.resnet.get_downsample_multiple() - 1)
+                // self.resnet.get_downsample_multiple()
+                * self.resnet.get_output_planes()
+            )
+
+        # ── 池化层 ───────────────────────────────────────────
+        if use_attentive_pool and self.poolXd == 1:
+            # 注意力统计池化：输出维度 = 2 × resnet_out_dim
+            self.pooling   = AttentiveStatsPool(resnet_out_dim, bottleneck_dim=attentive_bottleneck)
+            fc_input_dim   = resnet_out_dim * 2
+        else:
+            if pooling == "avg":
+                self.pooling = (nn.AdaptiveAvgPool2d((pooling_params["h_size"], pooling_params["w_size"]))
+                                if self.poolXd == 2 else
+                                nn.AdaptiveAvgPool1d(pooling_params["w_size"]))
+            elif pooling == "max":
+                self.pooling = (nn.AdaptiveMaxPool2d((pooling_params["h_size"], pooling_params["w_size"]))
+                                if self.poolXd == 2 else
+                                nn.AdaptiveMaxPool1d(pooling_params["w_size"]))
+            fc_input_dim = resnet_out_dim
+
+        # ── FC 层 ────────────────────────────────────────────
+        self.fc1    = ReluBatchNormTdnnLayer(fc_input_dim, fc_dim, **fc1_params) if fc1 else None
+        fc2_in_dim  = fc_dim if fc1 else fc_input_dim
+
+        if disentangle:
+            if self.use_vae:
+                # VAE 风格：概率解耦编码器
+                self.disentangled_encoder = DisentangledEncoder(fc2_in_dim, fc_dim, self.nui_dim)
+                self.fc2    = None   # 兼容 transform_keys 中 "fc2" 的引用
+                self.fc_spk = None
+                self.fc_nui = None
+            else:
+                # 双头 FC
+                self.disentangled_encoder = None
+                self.fc_spk = ReluBatchNormTdnnLayer(fc2_in_dim, fc_dim, **fc2_params)
+                self.fc_nui = ReluBatchNormTdnnLayer(fc2_in_dim, self.nui_dim, **fc2_params)
+                self.fc2    = self.fc_spk   # 令 fc2 指向 fc_spk，兼容外部访问 model.fc2
+
+            # 解耦约束模块
+            self.orth_loss    = OrthogonalLoss()
+            self.adv_spk      = AdversarialClassifier(self.nui_dim, num_targets)
+            self.adv_nui      = (AdversarialClassifier(fc_dim, num_channel_labels)
+                                 if num_channel_labels > 0 else None)
+            self.mi_estimator = CLUBEstimator(fc_dim, self.nui_dim)
+        else:
+            # ── 原版单头 FC ──────────────────────────────────
+            self.disentangled_encoder = None
+            self.fc_spk = None
+            self.fc_nui = None
+            self.fc2    = ReluBatchNormTdnnLayer(fc2_in_dim, fc_dim, **fc2_params)
+            self.orth_loss    = None
+            self.adv_spk      = None
+            self.adv_nui      = None
+            self.mi_estimator = None
+
+        self.tail_dropout = nn.Dropout2d(p=tail_dropout) if tail_dropout > 0 else None
+
+        # ── Loss ────────────────────────────────────────────
+        # 优先使用 loss_type 字符串；否则回退到原有布尔参数
+        if loss_type is not None:
+            _build_loss_registry()
+            if loss_type not in LOSS_REGISTRY:
+                raise ValueError(f"未知 loss_type='{loss_type}'，可选: {list(LOSS_REGISTRY.keys())}")
+            merged = utils.assign_params_dict(margin_loss_params, loss_params)
+            self.loss = LOSS_REGISTRY[loss_type](fc_dim, num_targets, **merged)
+        elif margin_loss:
+            self.loss = MarginSoftmaxLoss(fc_dim, num_targets, **margin_loss_params)
+        elif oc_loss:
+            self.loss = OCSoftmaxLoss(fc_dim, num_targets, **oc_loss_params)
+        elif proto_loss:
+            self.loss = PrototypeLoss(fc_dim, num_targets, **proto_loss_params)
+        elif proto1_loss:
+            self.loss = PrototypeLoss1(fc_dim, num_targets, **proto1_loss_params)
+        elif protoenhanced_loss:
+            self.loss = PrototypeLossEnhanced(fc_dim, num_targets, **protoenhanced_loss_params)
+        elif protomulti_loss:
+            self.loss = PrototypeLossMulti(fc_dim, num_targets, **protomulti_loss_params)
+        elif protouni_loss:
+            self.loss = PrototypeLossUni(fc_dim, num_targets, **protouni_loss_params)
+        else:
+            self.loss = SoftmaxLoss(fc_dim, num_targets)
+
+        print(f"[ResNetXvector] Loss: {self.loss.__class__.__name__} | "
+              f"解耦: {'ON (' + ('VAE' if self.use_vae else '双头FC') + ')' if disentangle else 'OFF'} | "
+              f"池化: {'AttentiveStats' if use_attentive_pool else pooling}")
+
+        # ── Mixup Wrapper ────────────────────────────────────
+        if training:
+            self.wrapper_loss = MixupLoss(self.loss, self.mixup) if mixup else None
+        else:
+            self.wrapper_loss = None
+
+        # ── Transform / Freeze ───────────────────────────────
+        self.transform_keys = transform_keys
+        self.train_keys     = train_keys
+        if freeze:
+            for pname, param in self.named_parameters():
+                if pname.split(".")[0] not in self.train_keys:
+                    param.requires_grad = False
+
+    # ──────────────────────────────────────────────────────────
+    #  内部工具：特征提取（backbone → pool → fc1）
+    # ──────────────────────────────────────────────────────────
+
+    def _encode_features(self, x):
+        """
+        共享特征提取流程，返回进入双头前的共享特征 h。
+        输出形状：[B, D, 1]（兼容后续 ReluBatchNormTdnnLayer 的输入格式）
+        """
+        x = x.unsqueeze(1) if self.convXd == 2 else x
+        x = self.resnet(x)
+        x = self.auto(self.res_dropout, x)
+
+        if self.use_attentive_pool and self.poolXd == 1:
+            # [B, C, H, T] → [B, C*H, T] → AttentiveStatsPool → [B, 2C*H] → [B, 2C*H, 1]
+            x = x.reshape(x.shape[0], x.shape[1] * x.shape[2], x.shape[3])
+            x = self.pooling(x)        # [B, 2C*H]
+            x = x.unsqueeze(2)         # [B, 2C*H, 1]
+        else:
+            x = (x if self.poolXd == 2
+                 else x.reshape(x.shape[0], x.shape[1] * x.shape[2], x.shape[3]))
+            x = self.pooling(x)
+            x = x.squeeze(3) if self.poolXd == 2 else x   # [B, D, w_size]
+
+        x = self.auto(self.fc1, x)
+        return x   # [B, D, 1] 或 [B, D, w_size]
+
+    def _split_spk_nui(self, h, training=True):
+        """
+        将共享特征 h 分裂为 (z_spk, z_nui, kl_spk, kl_nui)。
+        非解耦模式下 z_nui / kl 均为 None / 0。
+        """
+        if not self.disentangle:
+            z_spk = self.fc2(h)
+            return z_spk, None, None, None
+
+        if self.use_vae:
+            z_spk, z_nui, kl_spk, kl_nui = self.disentangled_encoder(h, training=training)
+            # VAE 输出是 2D，包装成 3D 以兼容 tail_dropout（Dropout2d 需要 ≥3D）
+            z_spk = z_spk.unsqueeze(2)
+            z_nui = z_nui.unsqueeze(2)
+        else:
+            z_spk = self.fc_spk(h)
+            z_nui = self.fc_nui(h)
+            kl_spk = kl_nui = None
+
+        return z_spk, z_nui, kl_spk, kl_nui
+
+    def _get_adv_alpha(self):
+        """对抗系数随 epoch 线性增大，warmup 期间为 0。"""
+        if self._current_epoch < self.disentangle_warmup_epochs:
+            return 0.0
+        progress = min(1.0, (self._current_epoch - self.disentangle_warmup_epochs) / 10.0)
+        return self.adv_alpha_max * progress
+
+    def _disentangle_active(self):
+        return self.disentangle and (self._current_epoch >= self.disentangle_warmup_epochs)
+
+    # ──────────────────────────────────────────────────────────
+    #  forward：对外返回 z_spk（与原版相同，Tensor）
+    #  解耦中间量缓存在 self._z_nui / self._kl_loss
+    # ──────────────────────────────────────────────────────────
+
+    @utils.for_device_free
+    def forward(self, inputs, targets):
+        """
+        与原版签名完全相同：forward(inputs, targets) → Tensor
+
+        解耦中间量（z_nui / kl）存入实例缓存，
+        get_loss 会自动读取，调用方无感知。
+        """
+        x = inputs
+        x = self.mixup(x, targets) if self.mixup is not None else x
+        x = self.framemixup(x, targets) if self.framemixup is not None else x
+        x = self.auto(self.aug_dropout, x)
+
+        h = self._encode_features(x)
+        z_spk, z_nui, kl_spk, kl_nui = self._split_spk_nui(h, training=True)
+        z_spk = self.auto(self.tail_dropout, z_spk)
+
+        # 缓存解耦中间量供 get_loss 使用
+        self._z_nui   = z_nui
+        self._kl_loss = ((kl_spk + kl_nui) if (kl_spk is not None and kl_nui is not None)
+                         else None)
+
+        return z_spk   # ← 与原版相同，只返回 Tensor
+
+    # ──────────────────────────────────────────────────────────
+    #  get_loss：与原版签名完全相同
+    # ──────────────────────────────────────────────────────────
+
+    @utils.for_device_free
+    def get_loss(self, inputs, targets):
+        """
+        与原版签名完全相同：get_loss(inputs, targets) → Tensor
+
+        解耦约束通过读取 self._z_nui / self._kl_loss 获得，
+        无需调用方传入额外参数。
+
+        损失组成（解耦开启时）：
+            L = L_spk + w_orth*L_orth + w_adv*L_adv + w_mi*L_mi [+ w_kl*L_kl]
+        """
+        # ① 主任务 loss（与原版相同）
+        if self.wrapper_loss is not None:
+            loss_spk = self.wrapper_loss(inputs, targets)
+        else:
+            loss_spk = self.loss(inputs, targets)
+
+        if not self._disentangle_active() or self._z_nui is None:
+            return loss_spk
+
+        # ② 解耦约束
+        z_spk = inputs
+        z_nui = self._z_nui
+        alpha = self._get_adv_alpha()
+
+        # 正交性
+        loss_orth = self.orth_loss(z_spk, z_nui)
+
+        # 对抗①：z_nui 不能区分说话人
+        loss_adv = F.cross_entropy(self.adv_spk(z_nui, alpha), targets)
+
+        # 对抗②：z_spk 不能区分信道（可选）
+        if self.adv_nui is not None:
+            # channel_labels 需在外部通过 model.channel_labels 注入
+            ch = getattr(self, "_channel_labels", None)
+            if ch is not None:
+                loss_adv = loss_adv + F.cross_entropy(self.adv_nui(z_spk, alpha), ch)
+
+        # 互信息
+        loss_mi = self.mi_estimator(z_spk, z_nui)
+
+        total = (loss_spk
+                 + self.w_orth * loss_orth
+                 + self.w_adv  * loss_adv
+                 + self.w_mi   * loss_mi)
+
+        # KL（VAE 模式）
+        if self._kl_loss is not None:
+            total = total + self.w_kl * self._kl_loss
+
+        return total   # ← 与原版相同，只返回 Tensor
+
+    # ──────────────────────────────────────────────────────────
+    #  信道标签注入（可选，供有信道标签的训练脚本使用）
+    # ──────────────────────────────────────────────────────────
+
+    def set_channel_labels(self, labels):
+        """
+        训练循环中可调用此方法注入当前 batch 的信道标签：
+            model.set_channel_labels(channel_labels)
+            out  = model(inputs, targets)
+            loss = model.get_loss(out, targets)
+        """
+        self._channel_labels = labels
+
+    # ──────────────────────────────────────────────────────────
+    #  后验概率（兼容原接口）
+    # ──────────────────────────────────────────────────────────
+
+    def get_posterior(self):
+        return self.loss.get_posterior()
+
+    # ──────────────────────────────────────────────────────────
+    #  Embedding 提取：推理只取 z_spk
+    # ──────────────────────────────────────────────────────────
+
+    def _get_spk_embedding(self, h, position):
+        """统一的说话人 embedding 提取逻辑（供两个 extract 方法共用）。"""
+        if position == "far":
+            assert self.fc1 is not None, "extracted_embedding='far' 需要 fc1=True"
+            return self.fc1.affine(h)
+
+        if position == "near_affine":
+            if self.use_vae:
+                x = h.squeeze(-1) if h.dim() == 3 else h
+                return self.disentangled_encoder.spk_mu(x).unsqueeze(-1)
+            elif self.disentangle:
+                return self.fc_spk.affine(h)
+            else:
+                return self.fc2.affine(h)
+
+        if position == "near":
+            if self.use_vae:
+                z_spk, _, _, _ = self._split_spk_nui(h, training=False)
+                return z_spk
+            elif self.disentangle:
+                return self.fc_spk(h)
+            else:
+                return self.fc2(h)
+
+        if position == "posterior":
+            if self.use_vae:
+                z_spk, _, _, _ = self._split_spk_nui(h, training=False)
+            elif self.disentangle:
+                z_spk = self.fc_spk(h)
+            else:
+                z_spk = self.fc2(h)
+            self.loss.forward(z_spk, torch.tensor([0], device=h.device))
+            return self.loss.get_posterior()
+
+        raise TypeError(f"expected far/near_affine/near/posterior, got '{position}'")
+
+    @for_extract_embedding(maxChunk=10000, isMatrix=True)
+    def extract_embedding(self, inputs):
+        """与原版签名完全相同。解耦时只返回 z_spk，z_nui 丢弃。"""
+        h = self._encode_features(inputs)
+        return self._get_spk_embedding(h, self.extracted_embedding)
+
+    @for_extract_batch_embedding(maxChunk=10000, isMatrix=True)
+    def extract_batch_embedding(self, inputs):
+        """与原版签名完全相同。"""
+        h = self._encode_features(inputs)
+        return self._get_spk_embedding(h, self.extracted_embedding)
+
+    # ──────────────────────────────────────────────────────────
+    #  训练调度（修复原版 @staticmethod 缺失 bug）
+    # ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def get_warmR_T(T_0, T_mult, epoch):
+        n     = int(math.log(max(0.05, (epoch / T_0 * (T_mult - 1) + 1)), T_mult))
+        T_cur = epoch - T_0 * (T_mult ** n - 1) / (T_mult - 1)
+        T_i   = T_0 * T_mult ** n
+        return T_cur, T_i
+
+    def compute_decay_value(self, start, end, T_cur, T_i):
+        return start - (start - end) / (T_i - 1) * (T_cur % T_i)
+
+    def step(self, epoch, this_iter, epoch_batchs):
+        """与原版签名完全相同，额外更新 _current_epoch 用于解耦调度。"""
+        self._current_epoch = epoch
+
+        if self.use_step:
+            if self.step_params["m"]:
+                pos = epoch * epoch_batchs + this_iter
+                lf  = max(self.step_params["lambda_0"],
+                          self.step_params["lambda_b"]
+                          * (1 + self.step_params["gamma"] * pos) ** (-self.step_params["alpha"]))
+                self.loss.step(1 / (1 + lf))
+
+            if self.step_params["T"] is not None and (self.step_params["t"] or self.step_params["p"]):
+                T_cur, T_i = ResNetXvector.get_warmR_T(*self.step_params["T"], epoch)
+                T_cur = T_cur * epoch_batchs + this_iter
+                T_i   = T_i * epoch_batchs
+
+            if self.step_params["t"]:
+                self.loss.t = self.compute_decay_value(*self.step_params["t_tuple"], T_cur, T_i)
+            if self.step_params["p"]:
+                self.aug_dropout.p = self.compute_decay_value(*self.step_params["p_tuple"], T_cur, T_i)
+            if self.step_params["s"]:
+                self.loss.s = self.step_params["s_tuple"][self.step_params["s_list"][epoch]]
+
+
+# ============================================================
+#  使用示例 / 单元测试
+# ============================================================
+
+if __name__ == "__main__":
+
+    def _run(label, model, inputs, targets):
+        print(f"\n{'='*55}")
+        print(f"  {label}")
+        print(f"{'='*55}")
+        # ── 训练接口（与原版完全相同）──
+        out  = model(inputs, targets)
+        loss = model.get_loss(out, targets)
+        print(f"  forward 输出 shape : {out.shape}")
+        print(f"  get_loss 输出      : {loss.item():.4f}  (Tensor, 标量)")
+        # ── 推理接口 ──
+        model.eval()
+        with torch.no_grad():
+            emb = model.extract_embedding(inputs[:1])
+        print(f"  extract_embedding  : {emb.shape}")
+        model.train()
+
+    B, F, T = 4, 80, 200
+    inputs  = torch.randn(B, F, T)
+    targets = torch.randint(0, 100, (B,))
+
+    # 1. 原版模式：与原代码行为完全一致
+    m1 = ResNetXvector(
+        inputs_dim=F, num_targets=100,
+        margin_loss=True,
+        resnet_params={"planes": [16, 32, 64, 128], "convXd": 2},
+    )
+    _run("原版模式（margin_loss=True，无解耦）", m1, inputs, targets)
+
+    # 2. 解耦模式（双头 FC + 注意力池化）
+    m2 = ResNetXvector(
+        inputs_dim=F, num_targets=100,
+        loss_type="margin",
+        disentangle=True,
+        use_attentive_pool=True,
+        disentangle_warmup_epochs=0,   # 测试时直接开启约束
+        resnet_params={"planes": [16, 32, 64, 128], "convXd": 2},
+    )
+    m2.step(epoch=0, this_iter=0, epoch_batchs=100)  # 更新 epoch 计数
+    _run("解耦模式（双头FC + 注意力池化）", m2, inputs, targets)
+
+    # 3. 解耦模式（VAE 编码器）
+    m3 = ResNetXvector(
+        inputs_dim=F, num_targets=100,
+        loss_type="softmax",
+        disentangle=True,
+        use_vae=True,
+        use_attentive_pool=True,
+        disentangle_warmup_epochs=0,
+        resnet_params={"planes": [16, 32, 64, 128], "convXd": 2},
+    )
+    m3.step(epoch=0, this_iter=0, epoch_batchs=100)
+    _run("解耦模式（VAE 编码器）", m3, inputs, targets)
+
+    # 4. 验证信道标签注入（可选）
+    print(f"\n{'='*55}")
+    print("  信道标签注入示例")
+    print(f"{'='*55}")
+    channel_labels = torch.randint(0, 5, (B,))
+    m4 = ResNetXvector(
+        inputs_dim=F, num_targets=100,
+        loss_type="margin",
+        disentangle=True,
+        num_channel_labels=5,          # 有 5 个信道类别
+        disentangle_warmup_epochs=0,
+        resnet_params={"planes": [16, 32, 64, 128], "convXd": 2},
+    )
+    m4.step(epoch=0, this_iter=0, epoch_batchs=100)
+    m4.set_channel_labels(channel_labels)  # 注入信道标签
+    out  = m4(inputs, targets)
+    loss = m4.get_loss(out, targets)
+    print(f"  含信道对抗 loss: {loss.item():.4f}")
