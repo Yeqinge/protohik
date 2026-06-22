@@ -1,8 +1,8 @@
 class MarginWeightPrototypeLoss(TopVirtualLoss):
-    def init(self, input_dim, num_targets, temperature=0.1,
-             margin=0.2, margin_type="cosface",
-             focal_gamma_max=2.0, warmup_epochs=2, total_epochs=10,
-             noise_std=0.05, momentum=0.99):
+    def __init__(self, input_dim, num_targets, temperature=0.1,
+                 margin=0.2, margin_type="cosface",
+                 focal_gamma_max=2.0, warmup_epochs=2, total_epochs=10,
+                 noise_std=0.05, momentum=0.99):
         self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
         nn.init.xavier_uniform_(self.prototypes)
         self.register_buffer('ema_prototypes', self.prototypes.data.clone())
@@ -13,36 +13,36 @@ class MarginWeightPrototypeLoss(TopVirtualLoss):
         self.focal_gamma_max = focal_gamma_max
         self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
-        self.noise_std = noise_std      # 训练时对归一化特征加高斯扰动，模拟域偏移；测试时自动关闭
-        self.momentum = momentum        # EMA 动量，0.99 比 proto1 的 0.999 响应快 10 倍，适合大数据集
+        self.noise_std = noise_std
+        self.momentum = momentum
 
-        self.current_iter = 0
-        self.iters_per_epoch = None
-        self._iter_counter = 0          # 第一个 epoch 的 iter 计数，用于锁定 iters_per_epoch
-
-        # reduction='none'：保留每个样本的独立 loss，供 focal 加权使用
+        self.current_epoch = 0          # 由 trainer 外部赋值
+        self._last_printed_epoch = -1
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
 
     def step(self, *args, **kwargs):
-        """框架每个 epoch 结束调用；第一次调用锁定 iters_per_epoch，同时做 EMA 更新"""
-        if self.iters_per_epoch is None and self._iter_counter > 0:
-            self.iters_per_epoch = self._iter_counter
-        # EMA 平滑原型：momentum 越大原型越稳定，防止在大数据集上过拟合到训练域的分布
+        """框架每个 epoch 结束调用，做 EMA 更新；current_epoch 由 trainer 外部赋值。"""
         self.ema_prototypes.mul_(self.momentum).add_(self.prototypes.data, alpha=1 - self.momentum)
         self.prototypes.data.copy_(self.ema_prototypes)
 
     def _get_gamma(self):
-        # iters_per_epoch 未锁定（第一个 epoch 未结束）：gamma=0，退化为普通 margin loss
-        if self.iters_per_epoch is None:
+        if self.current_epoch < self.warmup_epochs:
             return 0.0
-        current_epoch = self.current_iter // self.iters_per_epoch
-        # warmup 阶段 gamma=0：让 margin 先把两类拉开，再引入难例聚焦，避免早期训练不稳
-        if current_epoch < self.warmup_epochs:
-            return 0.0
-        # warmup 结束后线性增长到 focal_gamma_max
-        progress = (current_epoch - self.warmup_epochs) / \
+        progress = (self.current_epoch - self.warmup_epochs + 1) / \
                    max(self.total_epochs - self.warmup_epochs, 1)
         return self.focal_gamma_max * min(progress, 1.0)
+
+    def _maybe_print(self, gamma, per_sample_loss, focal_weight=None):
+        if self.current_epoch == self._last_printed_epoch:
+            return
+        self._last_printed_epoch = self.current_epoch
+        print(f"[MarginWeightPrototypeLoss] epoch={self.current_epoch} | "
+              f"gamma={gamma:.4f} | "
+              f"loss_mean={per_sample_loss.mean().item():.4f} | "
+              f"loss_max={per_sample_loss.max().item():.4f}")
+        if focal_weight is not None:
+            print(f"[MarginWeightPrototypeLoss]   focal_weight_mean={focal_weight.mean().item():.4f} | "
+                  f"focal_weight_max={focal_weight.max().item():.4f}")
 
     def forward(self, inputs, targets):
         assert len(inputs.shape) == 3
@@ -50,24 +50,18 @@ class MarginWeightPrototypeLoss(TopVirtualLoss):
         features = torch.squeeze(inputs, dim=2)
         features_norm = F.normalize(features, dim=1)
 
-        # 域偏移扰动：训练时对归一化后的特征加高斯噪声，迫使原型学习对微小分布偏移鲁棒的位置
-        # self.training 由框架控制，eval() 后自动关闭，不影响推理
-        # 归一化后加噪再归一化：等价于在单位超球面上做小角度随机扰动
         if self.training and self.noise_std > 0:
             features_norm = F.normalize(features_norm + torch.randn_like(features_norm) * self.noise_std, dim=1)
 
         prototypes_norm = F.normalize(self.prototypes, dim=1)
-        cosine = torch.mm(features_norm, prototypes_norm.t())   # (B, C) 余弦相似度矩阵
+        cosine = torch.mm(features_norm, prototypes_norm.t())
 
-        # Margin：压低目标类得分，强迫特征更靠近原型才能被正确分类
         if self.margin_type == "cosface":
-            # cos(θ) - m，直接在余弦值上减 margin，稳定，建议优先使用
             one_hot = torch.zeros_like(cosine)
             one_hot.scatter_(1, targets.view(-1, 1), 1.0)
             cosine = cosine - one_hot * self.margin
 
         elif self.margin_type == "arcface":
-            # cos(θ + m)，角度域加 margin，几何意义更纯，但 acos 边界处梯度大需 clamp 保护
             one_hot = torch.zeros_like(cosine)
             one_hot.scatter_(1, targets.view(-1, 1), 1.0)
             theta = torch.acos(cosine.clamp(-1 + 1e-7, 1 - 1e-7))
@@ -75,26 +69,20 @@ class MarginWeightPrototypeLoss(TopVirtualLoss):
 
         logits = cosine / self.temperature
         self.posterior = logits.unsqueeze(2).detach()
-
-        # per-sample loss：每个样本独立保留，供 focal 加权
-        per_sample_loss = self.loss_function(logits, targets)   # (B,)
-
-        if self.iters_per_epoch is None:
-            self._iter_counter += 1
+        per_sample_loss = self.loss_function(logits, targets)
 
         gamma = self._get_gamma()
-        self.current_iter += 1
 
-        # warmup 阶段或 gamma=0：普通均值，等价于标准 margin loss
         if gamma == 0.0:
+            self._last_focal_weight = None
+            self._maybe_print(gamma, per_sample_loss)
             return per_sample_loss.mean()
 
         with torch.no_grad():
-            # pt = exp(-loss)：loss 小则 pt 大（简单/已收敛样本），loss 大则 pt 小（难例/域偏移样本）
-            # focal_weight = (1-pt)^gamma：难例权重大，简单样本权重趋近 0
-            # 归一化：保持 batch 内有效学习率尺度稳定，防止 gamma 变化时 loss 量级跳变
             pt = torch.exp(-per_sample_loss)
             focal_weight = (1.0 - pt) ** gamma
             focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
 
+        self._last_focal_weight = focal_weight.detach().cpu()
+        self._maybe_print(gamma, per_sample_loss, focal_weight)
         return (focal_weight * per_sample_loss).mean()
