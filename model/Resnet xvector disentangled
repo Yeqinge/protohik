@@ -429,8 +429,8 @@ class ResNetXvector(TopVirtualNnet):
             _build_loss_registry()
             if loss_type not in LOSS_REGISTRY:
                 raise ValueError(f"未知 loss_type='{loss_type}'，可选: {list(LOSS_REGISTRY.keys())}")
-            merged = utils.assign_params_dict(margin_loss_params, loss_params)
-            self.loss = LOSS_REGISTRY[loss_type](fc_dim, num_targets, **merged)
+            # 直接使用用户传入的 loss_params，不混入其他 loss 的默认参数
+            self.loss = LOSS_REGISTRY[loss_type](fc_dim, num_targets, **loss_params)
         elif margin_loss:
             self.loss = MarginSoftmaxLoss(fc_dim, num_targets, **margin_loss_params)
         elif oc_loss:
