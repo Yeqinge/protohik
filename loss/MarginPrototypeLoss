@@ -1,58 +1,18 @@
-class MarginWeightPrototypeLoss(TopVirtualLoss):
-    def __init__(self, input_dim, num_targets, temperature=0.1,
-                 margin=0.2, margin_type="cosface",
-                 focal_gamma_max=2.0, warmup_epochs=2, total_epochs=10,
-                 noise_std=0.05, momentum=0.99):
+class MarginPrototypeLoss(TopVirtualLoss):
+    def init(self, input_dim, num_targets, temperature=0.1,
+             margin=0.2, margin_type="cosface"):
         self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
         nn.init.xavier_uniform_(self.prototypes)
-        self.register_buffer('ema_prototypes', self.prototypes.data.clone())
-
         self.temperature = temperature
         self.margin = margin
         self.margin_type = margin_type
-        self.focal_gamma_max = focal_gamma_max
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
-        self.noise_std = noise_std
-        self.momentum = momentum
-
-        self.current_epoch = 0          # 由 trainer 外部赋值
-        self._last_printed_epoch = -1
-        self.loss_function = nn.CrossEntropyLoss(reduction='none')
-
-    def step(self, *args, **kwargs):
-        """框架每个 epoch 结束调用，做 EMA 更新；current_epoch 由 trainer 外部赋值。"""
-        self.ema_prototypes.mul_(self.momentum).add_(self.prototypes.data, alpha=1 - self.momentum)
-        self.prototypes.data.copy_(self.ema_prototypes)
-
-    def _get_gamma(self):
-        if self.current_epoch < self.warmup_epochs:
-            return 0.0
-        progress = (self.current_epoch - self.warmup_epochs + 1) / \
-                   max(self.total_epochs - self.warmup_epochs, 1)
-        return self.focal_gamma_max * min(progress, 1.0)
-
-    def _maybe_print(self, gamma, per_sample_loss, focal_weight=None):
-        if self.current_epoch == self._last_printed_epoch:
-            return
-        self._last_printed_epoch = self.current_epoch
-        print(f"[MarginWeightPrototypeLoss] epoch={self.current_epoch} | "
-              f"gamma={gamma:.4f} | "
-              f"loss_mean={per_sample_loss.mean().item():.4f} | "
-              f"loss_max={per_sample_loss.max().item():.4f}")
-        if focal_weight is not None:
-            print(f"[MarginWeightPrototypeLoss]   focal_weight_mean={focal_weight.mean().item():.4f} | "
-                  f"focal_weight_max={focal_weight.max().item():.4f}")
+        self.loss_function = nn.CrossEntropyLoss()
 
     def forward(self, inputs, targets):
         assert len(inputs.shape) == 3
         assert inputs.shape[2] == 1
         features = torch.squeeze(inputs, dim=2)
         features_norm = F.normalize(features, dim=1)
-
-        if self.training and self.noise_std > 0:
-            features_norm = F.normalize(features_norm + torch.randn_like(features_norm) * self.noise_std, dim=1)
-
         prototypes_norm = F.normalize(self.prototypes, dim=1)
         cosine = torch.mm(features_norm, prototypes_norm.t())
 
@@ -69,20 +29,7 @@ class MarginWeightPrototypeLoss(TopVirtualLoss):
 
         logits = cosine / self.temperature
         self.posterior = logits.unsqueeze(2).detach()
-        per_sample_loss = self.loss_function(logits, targets)
+        return self.loss_function(logits, targets)
 
-        gamma = self._get_gamma()
-
-        if gamma == 0.0:
-            self._last_focal_weight = None
-            self._maybe_print(gamma, per_sample_loss)
-            return per_sample_loss.mean()
-
-        with torch.no_grad():
-            pt = torch.exp(-per_sample_loss)
-            focal_weight = (1.0 - pt) ** gamma
-            focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
-
-        self._last_focal_weight = focal_weight.detach().cpu()
-        self._maybe_print(gamma, per_sample_loss, focal_weight)
-        return (focal_weight * per_sample_loss).mean()
+    def step(self, *args, **kwargs):
+        pass
