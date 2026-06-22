@@ -69,8 +69,6 @@ def _find_loss_module(model):
     return cand
 
 
-
-
 def _get_dataloader_with_sampler(loader):
     """找到真正持有 batch_sampler 的 torch DataLoader（可能被 fast loader 包了一层）。"""
     if getattr(loader, "batch_sampler", None) is not None:
@@ -149,14 +147,26 @@ class _Instrumenter:
 
         holder["h"] = X.register_hook(_grad_cb)
 
+    # —— 新增：损失模块 forward 结束后读取 focal_weight ——
+    def _loss_post_hook(self, module, args, output):
+        if not self.model.training or self._stash is None:
+            return
+        fw = getattr(module, "_last_focal_weight", None)
+        if fw is None:
+            return
+        ids = list(self._stash[0])
+        if len(ids) == fw.shape[0]:
+            self.tracker.update_weight(ids, fw.numpy())
+
     def attach_model(self):
         lname, lmod = _find_loss_module(self.model)
         if lmod is None:
             print("[contrib] 警告：没定位到损失模块，主指标无法采集。")
         else:
             self._hooks.append(lmod.register_forward_pre_hook(self._loss_pre_hook))
+            self._hooks.append(lmod.register_forward_hook(self._loss_post_hook))  # 新增
             print(f"[contrib] 梯度采集已挂到损失模块: {lname}")
-        print("[contrib] 只记录 grad_norm/align。")
+        print("[contrib] 只记录 grad_norm/align/focal_weight。")
 
     def attach_real_ids(self, loader):
         dl = _get_dataloader_with_sampler(loader)
@@ -165,13 +175,10 @@ class _Instrumenter:
                   "          （你的 loader 可能不是标准 map-style DataLoader）")
             return False
         wrapped = _RecordingBatchSampler(dl.batch_sampler, self._idx_queue)
-        # DataLoader/DataLoaderFast 在 __setattr__ 里禁止初始化后改 batch_sampler，
-        # 故直接写进实例 __dict__ 绕过该保护（迭代时 PyTorch 仍按 batch_sampler 取批）。
         try:
             object.__setattr__(dl, "batch_sampler", wrapped)
         except Exception:
             dl.__dict__["batch_sampler"] = wrapped
-        # 有些版本迭代走的是内部 _index_sampler，一并指过去以防万一
         if "_index_sampler" in dl.__dict__:
             dl.__dict__["_index_sampler"] = wrapped
         self.real_ids = True
@@ -197,7 +204,7 @@ class _LoaderWrapper:
             self._inst.tracker.save_epoch(); self._epoch += 1
         self._started = True
         self._inst.tracker.set_epoch(self._epoch)
-        self._inst._idx_queue.clear()                 # 新一轮，清空残留下标
+        self._inst._idx_queue.clear()
         for batch in self._loader:
             targets, feats = _split_targets(batch)
             if self._inst.real_ids and self._inst._idx_queue:
