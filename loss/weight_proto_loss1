@@ -7,7 +7,8 @@ class PrototypeLoss(TopVirtualLoss):
         self.focal_gamma_max = focal_gamma_max
         self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
-        self.current_epoch = 0          # 由 trainer 外部赋值
+        self.current_epoch = 0
+        self._last_printed_epoch = -1   # 记录上次打印的 epoch
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
 
     def _get_gamma(self):
@@ -16,6 +17,19 @@ class PrototypeLoss(TopVirtualLoss):
         progress = (self.current_epoch - self.warmup_epochs) / \
                    max(self.total_epochs - self.warmup_epochs, 1)
         return self.focal_gamma_max * min(progress, 1.0)
+
+    def _maybe_print(self, gamma, per_sample_loss, focal_weight=None):
+        if self.current_epoch == self._last_printed_epoch:
+            return
+        self._last_printed_epoch = self.current_epoch
+
+        print(f"[PrototypeLoss] epoch={self.current_epoch} | "
+              f"gamma={gamma:.4f} | "
+              f"loss_mean={per_sample_loss.mean().item():.4f} | "
+              f"loss_max={per_sample_loss.max().item():.4f}")
+        if focal_weight is not None:
+            print(f"[PrototypeLoss]   focal_weight_mean={focal_weight.mean().item():.4f} | "
+                  f"focal_weight_max={focal_weight.max().item():.4f}")
 
     def forward(self, inputs, targets):
         assert len(inputs.shape) == 3
@@ -28,7 +42,9 @@ class PrototypeLoss(TopVirtualLoss):
         per_sample_loss = self.loss_function(logits, targets)
 
         gamma = self._get_gamma()
+
         if gamma == 0.0:
+            self._maybe_print(gamma, per_sample_loss)
             return per_sample_loss.mean()
 
         with torch.no_grad():
@@ -36,4 +52,5 @@ class PrototypeLoss(TopVirtualLoss):
             focal_weight = (1.0 - pt) ** gamma
             focal_weight = focal_weight / (focal_weight.mean() + 1e-8)
 
+        self._maybe_print(gamma, per_sample_loss, focal_weight)
         return (focal_weight * per_sample_loss).mean()
