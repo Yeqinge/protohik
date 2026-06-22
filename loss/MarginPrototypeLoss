@@ -15,7 +15,8 @@ class MarginWeightPrototypeLoss(TopVirtualLoss):
         self.total_epochs = total_epochs
         self.noise_std = noise_std
         self.momentum = momentum
-        self.current_epoch = 0
+
+        self.current_epoch = 0          # 由 trainer 外部赋值
         self._last_printed_epoch = -1
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
 
@@ -50,8 +51,7 @@ class MarginWeightPrototypeLoss(TopVirtualLoss):
         features_norm = F.normalize(features, dim=1)
 
         if self.training and self.noise_std > 0:
-            features_norm = F.normalize(
-                features_norm + torch.randn_like(features_norm) * self.noise_std, dim=1)
+            features_norm = F.normalize(features_norm + torch.randn_like(features_norm) * self.noise_std, dim=1)
 
         prototypes_norm = F.normalize(self.prototypes, dim=1)
         cosine = torch.mm(features_norm, prototypes_norm.t())
