@@ -78,7 +78,7 @@ def main():
                 if p: idx2utt[i] = p[0]
     print(f"   有效映射数: {len(idx2utt)}")
 
-    # ── 3. 加载 epoch 轨迹（含 weight）──
+    # ── 3. 加载 epoch 轨迹（含 focal_weight）──
     print("\n[3/5] 加载 epoch 轨迹 ...")
     files = sorted(glob.glob(os.path.join(args.contrib, "contrib_epoch*.npz")))
     print(f"   找到 {len(files)} 个 .npz")
@@ -87,7 +87,7 @@ def main():
     epochs = []
     gn_egs = al_egs = wt_egs = None
     has_traj = len(files) > 0
-    has_weight = False   # 是否任意一个 npz 含有 weight 字段
+    has_weight = False   # 是否任意一个 npz 含有 focal_weight 字段
 
     if has_traj:
         ne = len(files)
@@ -108,16 +108,16 @@ def main():
             m = idxs >= 0
             gn_egs[idxs[m], ei] = d["grad_norm"][m]
             al_egs[idxs[m], ei] = d["align"][m]
-            # weight 字段（可选）
-            if "weight" in d:
+            # focal_weight 字段（可选）
+            if "focal_weight" in d:
                 has_weight = True
-                wt_egs[idxs[m], ei] = d["weight"][m]
+                wt_egs[idxs[m], ei] = d["focal_weight"][m]
 
         epochs = sorted(epochs)
         if has_weight:
-            print(f"   ✅ 检测到 weight 字段（将生成 weight 轨迹）")
+            print(f"   ✅ 检测到 focal_weight 字段（将生成 focal_weight 轨迹）")
         else:
-            print(f"   ℹ️  未检测到 weight 字段，跳过 weight 可视化")
+            print(f"   ℹ️  未检测到 focal_weight 字段，跳过 weight 可视化")
 
     # ── 4. 聚合到 utterance 粒度 ──
     print("\n[4/5] 聚合到 utterance 粒度 ...")
