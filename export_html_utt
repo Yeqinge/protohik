@@ -4,6 +4,12 @@
 export_html_utt.py —— Utterance 级样本贡献度分析可视化工具 v4
 新增 weight 字段：epoch 轨迹 + utterance 级聚合 (mean_weight / weight_std)
 去掉 dup_ratio，修复搜索，列头点击排序升降序，导出 CSV，亮色主题
+
+python3 export_html_utt.py \
+  --contrib /path/to/contrib_dir \
+  --egs     /path/to/train.egs.csv \
+  --meta    /path/to/summary.json \
+  --output  contrib_utt.html
 """
 
 import argparse
