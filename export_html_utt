@@ -12,6 +12,7 @@ import glob
 import os
 import re
 import sys
+import json
 import numpy as np
 from collections import defaultdict
 
@@ -35,10 +36,36 @@ def main():
     ap.add_argument("--egs",     default="", help="可选：train.egs.csv 路径")
     ap.add_argument("--summary", default="", help="可选：明确指定 summary CSV 路径")
     ap.add_argument("--output",  default="contrib_utt.html", help="输出 HTML 文件名")
+    ap.add_argument("--meta",    default="", help="可选：JSON 汇总文件路径（含 file_path/label/detector_id 等字段）")
     args = ap.parse_args()
 
     print(f"📍 CWD: {os.getcwd()}")
     print(f"📁 --contrib: {os.path.abspath(args.contrib)}")
+
+
+    # ── 0. 加载 JSON 元信息（可选）──
+    meta_map = {}   # utt_id_stem → dict
+    if args.meta and os.path.exists(args.meta):
+        print(f"\n[0/5] 加载 JSON 元信息: {args.meta}")
+        with open(args.meta, encoding="utf-8") as f:
+            jdata = json.load(f)
+        items = jdata if isinstance(jdata, list) else jdata.get("datas", jdata.get("data", []))
+        for item in items:
+            raw_id = item.get("ID", "")
+            stem = re.sub(r"\.wav$", "", raw_id, flags=re.IGNORECASE)
+            stem = strip_chunk_suffix(stem)
+            meta_map[stem] = {
+                "file_path":   item.get("file_path", ""),
+                "label":       item.get("label", ""),
+                "detector_id": item.get("detector_id", ""),
+                "channel_id":  item.get("channel_id", ""),
+                "project":     item.get("project", ""),
+                "duration":    item.get("duration", ""),
+                "time_point":  item.get("time_point", ""),
+            }
+        print(f"   元信息条目数: {len(meta_map)}")
+    else:
+        print("\n[0/5] 未指定 --meta，跳过元信息加载")
 
     # ── 1. 加载 egs 粒度 Summary CSV ──
     print("\n[1/5] 加载 egs 粒度 Summary CSV ...")
@@ -61,13 +88,11 @@ def main():
     print(f"   egs 样本数: {n_egs}")
 
     # ── 2. sample_id → utt_id 映射 ──
+    # 优先级：--egs 外挂文件 > CSV utt_id 列 > 数字 id（fallback）
     print("\n[2/5] 建立 sample_id → utt_id 映射 ...")
     idx2utt = {}
-    if egs_rows and "utt_id" in egs_rows[0]:
-        print("   -> 从 CSV utt_id 字段读取")
-        idx2utt = {i: r["utt_id"] for i, r in enumerate(egs_rows) if r.get("utt_id")}
-    elif args.egs and os.path.exists(args.egs):
-        print(f"   -> 从外挂文件: {args.egs}")
+    if args.egs and os.path.exists(args.egs):
+        print(f"   -> 从外挂 egs 文件读取: {args.egs}")
         with open(args.egs, encoding="utf-8") as f:
             first = f.readline()
             delim = "\t" if "\t" in first else " "
@@ -75,8 +100,16 @@ def main():
             for i, line in enumerate(f):
                 if i >= n_egs: break
                 p = line.strip().split(delim)
-                if p: idx2utt[i] = p[0]
-    print(f"   有效映射数: {len(idx2utt)}")
+                if p and p[0]: idx2utt[i] = p[0]
+        print(f"   有效映射数: {len(idx2utt)}")
+        if len(idx2utt) == 0:
+            print("   ⚠️  egs 文件未读到任何映射，检查格式是否为「utt_id 其他字段...」")
+    elif egs_rows and "utt_id" in egs_rows[0]:
+        print("   -> 从 CSV utt_id 列读取（fallback）")
+        idx2utt = {i: r["utt_id"] for i, r in enumerate(egs_rows) if r.get("utt_id")}
+        print(f"   有效映射数: {len(idx2utt)}")
+    else:
+        print("   ⚠️  未找到 utt_id 来源，将使用数字 id（可通过 --egs 指定外挂文件）")
 
     # ── 3. 加载 epoch 轨迹（含 focal_weight）──
     print("\n[3/5] 加载 epoch 轨迹 ...")
@@ -112,6 +145,14 @@ def main():
             if "focal_weight" in d:
                 has_weight = True
                 wt_egs[idxs[m], ei] = d["focal_weight"][m]
+            # 始终用第一个 npz 的 utt_ids 覆盖 idx2utt（保证显示真实编号）
+            if ei == 0 and "utt_ids" in d:
+                utt_ids_npz = d["utt_ids"].astype(str)
+                for k in range(len(ids_str)):
+                    egs_i = idxs[k]
+                    if egs_i >= 0:
+                        idx2utt[egs_i] = utt_ids_npz[k]
+                print(f"   -> 从 npz utt_ids 覆盖映射，有效: {len(idx2utt)}")
 
         epochs = sorted(epochs)
         if has_weight:
@@ -143,30 +184,44 @@ def main():
         si = arr("self_influence"); gn = arr("mean_grad_norm")
         al = arr("mean_align");     fn = arr("frac_neg_align")
         fo = arr("forget_events");  fc = arr("final_correct")
-        wt = arr("mean_weight")     # CSV 中的 mean_weight（可能不存在，返回 nan）
+        # mean_wt / wt_std 从 wt_egs 轨迹矩阵直接计算（不依赖 CSV 列）
 
         gn_std = sd(gn)
-        wt_std = sd(wt)
 
         tags      = [TAG_MAP.get(egs_rows[i].get("tag", "normal"), 4) for i in idxs]
         worst_tag = min(tags)
 
         gn_traj = al_traj = wt_traj = None
+        mean_wt = float("nan"); wt_std = 0.0
         if has_traj:
             gn_traj = np.nanmean(gn_egs[idxs, :], axis=0)
             al_traj = np.nanmean(al_egs[idxs, :], axis=0)
             if has_weight:
                 wt_traj = np.nanmean(wt_egs[idxs, :], axis=0)
+                # 对所有 chunk × 所有 epoch 的 focal_weight 求全局均值和标准差
+                wt_flat = wt_egs[idxs, :].flatten()
+                wt_valid = wt_flat[~np.isnan(wt_flat)]
+                if len(wt_valid):
+                    mean_wt = float(np.mean(wt_valid))
+                    wt_std  = float(np.std(wt_valid)) if len(wt_valid) > 1 else 0.0
 
+        meta = meta_map.get(utt_id, {})
         utt_data.append(dict(
             utt_id=utt_id, n_chunks=nc,
             mean_si=sm(si), max_si=sx(si),
             mean_gn=sm(gn), max_gn=sx(gn), gn_std=gn_std,
             mean_al=sm(al), mean_fn=sm(fn),
             mean_fo=sm(fo), mean_fc=sm(fc),
-            mean_wt=sm(wt), wt_std=wt_std,
+            mean_wt=mean_wt, wt_std=wt_std,
             worst_tag=worst_tag,
             gn_traj=gn_traj, al_traj=al_traj, wt_traj=wt_traj,
+            file_path=meta.get("file_path", ""),
+            label=meta.get("label", ""),
+            detector_id=meta.get("detector_id", ""),
+            channel_id=meta.get("channel_id", ""),
+            project=meta.get("project", ""),
+            duration=str(meta.get("duration", "")),
+            time_point=meta.get("time_point", ""),
         ))
 
     utt_data.sort(key=lambda x: x["mean_si"] if not np.isnan(x["mean_si"]) else -1e9, reverse=True)
@@ -263,8 +318,26 @@ def main():
 
     print(f"   ✅ .bin  {os.path.getsize(bin_path)/1e6:.2f} MB → {os.path.abspath(bin_path)}")
 
+    # 导出 meta JSON（前端筛选/展示用）
+    meta_out = []
+    for d in utt_data:
+        meta_out.append({
+            "file_path":   d.get("file_path", ""),
+            "label":       d.get("label", ""),
+            "detector_id": d.get("detector_id", ""),
+            "channel_id":  d.get("channel_id", ""),
+            "project":     d.get("project", ""),
+            "duration":    d.get("duration", ""),
+            "time_point":  d.get("time_point", ""),
+        })
+    meta_json_name = os.path.splitext(os.path.basename(bin_path))[0] + "_meta.json"
+    meta_json_path = os.path.join(os.path.dirname(bin_path), meta_json_name)
+    with open(meta_json_path, "w", encoding="utf-8") as f:
+        json.dump(meta_out, f, ensure_ascii=False)
+    print(f"   ✅ .json {os.path.getsize(meta_json_path)/1024:.1f} KB → {os.path.abspath(meta_json_path)}")
+
     with open(args.output, "w", encoding="utf-8") as f:
-        f.write(make_html(os.path.basename(bin_path), epochs, n_u))
+        f.write(make_html(os.path.basename(bin_path), meta_json_name, epochs, n_u))
     print(f"   ✅ .html {os.path.getsize(args.output)/1024:.1f} KB → {os.path.abspath(args.output)}")
 
     single_chunk = sum(1 for d in utt_data if d["n_chunks"] == 1)
@@ -278,7 +351,7 @@ def main():
 # ─────────────────────────────────────────────────────────────────
 #  HTML
 # ─────────────────────────────────────────────────────────────────
-def make_html(bin_filename, epochs, n_u):
+def make_html(bin_filename, meta_filename, epochs, n_u):
     return f"""<!DOCTYPE html>
 <html lang="zh"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -445,6 +518,20 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 
 /* ── Weight mini-bar in list ── */
 .wt-bar{{position:absolute;bottom:0;left:0;height:2px;background:var(--wt);opacity:.5;border-radius:0 1px 1px 0;}}
+
+/* ── Meta info bar (right panel, below chart-hdr) ── */
+.meta-bar{{padding:8px 20px;border-bottom:1px solid var(--bdr);background:var(--surf2);
+  display:none;flex-wrap:wrap;gap:6px 18px;font-family:var(--mono);font-size:10px;}}
+.meta-bar.show{{display:flex;}}
+.meta-kv{{display:flex;gap:5px;align-items:baseline;min-width:0;}}
+.meta-k{{color:var(--mt2);text-transform:uppercase;font-size:9px;letter-spacing:.04em;white-space:nowrap;}}
+.meta-v{{color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:320px;}}
+.meta-v.fp{{color:var(--mt);font-size:9.5px;max-width:480px;cursor:pointer;}}
+.meta-v.fp:hover{{color:var(--ac);text-decoration:underline;}}
+.meta-badge{{padding:1px 6px;border-radius:3px;font-size:9px;border:1px solid;}}
+.meta-badge.normal{{color:var(--easy);border-color:#86efac;background:var(--easy-bg);}}
+.meta-badge.anomaly,.meta-badge.abnormal{{color:var(--harmful);border-color:#fca5a5;background:var(--harmful-bg);}}
+.meta-badge.unknown{{color:var(--mt);border-color:var(--bdr2);background:var(--surf2);}}
 </style>
 </head><body>
 <div class="layout">
@@ -480,6 +567,17 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
         </select>
         <button class="export-btn" onclick="exportCSV()">⬇ CSV</button>
       </div>
+      <div class="filter-row" id="meta-filters" style="display:none;">
+        <select id="label-f" onchange="rebuild()">
+          <option value="">全部 Label</option>
+        </select>
+        <select id="detector-f" onchange="rebuild()">
+          <option value="">全部 Detector</option>
+        </select>
+        <select id="project-f" onchange="rebuild()">
+          <option value="">全部 Project</option>
+        </select>
+      </div>
     </div>
 
     <div class="list-header">
@@ -510,6 +608,18 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
         <div class="csub"   id="csub"></div>
       </div>
       <div class="stat-grid" id="stat-grid"></div>
+    </div>
+
+    <!-- Meta info bar -->
+    <div class="meta-bar" id="meta-bar">
+      <div class="meta-kv"><span class="meta-k">label</span><span class="meta-v" id="m-label"></span></div>
+      <div class="meta-kv"><span class="meta-k">detector</span><span class="meta-v" id="m-detector"></span></div>
+      <div class="meta-kv"><span class="meta-k">channel</span><span class="meta-v" id="m-channel"></span></div>
+      <div class="meta-kv"><span class="meta-k">project</span><span class="meta-v" id="m-project"></span></div>
+      <div class="meta-kv"><span class="meta-k">duration</span><span class="meta-v" id="m-duration"></span></div>
+      <div class="meta-kv"><span class="meta-k">time</span><span class="meta-v" id="m-time"></span></div>
+      <div class="meta-kv" style="flex-basis:100%;"><span class="meta-k">path</span>
+        <span class="meta-v fp" id="m-path" title="点击复制" onclick="copyPath(this)"></span></div>
     </div>
 
     <!-- Chart tabs -->
@@ -547,6 +657,7 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 
 <script>
 const DATA_URL  = "{bin_filename}";
+const META_URL  = "{meta_filename}";
 const EPOCHS    = {epochs};
 const TAG_NAMES = ["harmful_suspect","hard","high_influence","easy_redundant","normal"];
 
@@ -556,6 +667,7 @@ let _GN_MIN, _GN_SC, _WT_MIN, _WT_SC;
 let N_CHUNKS, MEAN_SI, MAX_SI, MEAN_GN, MAX_GN, GN_STD, MEAN_AL, MEAN_FN;
 let MEAN_WT, WT_STD, TAGS, UTT_IDS;
 let GN_U8=null, AL_U8=null, WT_U8=null;
+let META=null;  // array of {{file_path,label,detector_id,...}}
 
 // ── 状态 ──
 const PAGE=100, ROW_H=36;
@@ -631,6 +743,16 @@ async function loadBinaryData(){{
     }}
 
     buildTagBadges();
+
+    // load meta JSON
+    try{{
+      const mr=await fetch(META_URL);
+      if(mr.ok){{
+        META=await mr.json();
+        buildMetaFilters();
+      }}
+    }}catch(e){{ /* meta optional */ }}
+
     filtered=Int32Array.from({{length:_N}},(_,i)=>i);
     renderPage();
     document.getElementById('hstatus').style.display='none';
@@ -652,6 +774,27 @@ function buildTagBadges(){{
     b.textContent=`${{TAG_NAMES[t].replace(/_/g,' ')}} ${{cnt[t].toLocaleString()}}`;
     el.appendChild(b);
   }});
+}}
+
+// ── Meta 筛选器动态构建 ──
+function buildMetaFilters(){{
+  if(!META||!META.length) return;
+  const labels=new Set(), detectors=new Set(), projects=new Set();
+  META.forEach(m=>{{
+    if(m.label)      labels.add(m.label);
+    if(m.detector_id) detectors.add(m.detector_id);
+    if(m.project)    projects.add(m.project);
+  }});
+  function fill(selId, vals){{
+    const sel=document.getElementById(selId); if(!sel) return;
+    [...vals].sort().forEach(v=>{{
+      const o=document.createElement('option'); o.value=v; o.textContent=v; sel.appendChild(o);
+    }});
+  }}
+  fill('label-f', labels);
+  fill('detector-f', detectors);
+  fill('project-f', projects);
+  document.getElementById('meta-filters').style.display='flex';
 }}
 
 // ── 排序值 ──
@@ -778,7 +921,7 @@ function renderPage(){{
     const barW=HAS_WEIGHT&&!isNaN(wt)?Math.round(wt/wtMax*100):0;
 
     row.innerHTML=
-      `<div class="s-rank">${{pageStart+vi+1}}</div>`+
+      `<div class="s-rank">${{i+1}}</div>`+
       `<div class="s-uid" title="${{escH(uid)}}">${{highlight(uid,q)}}</div>`+
       `<div class="s-nc">${{N_CHUNKS[i]}}</div>`+
       `<div class="s-gn">${{isNaN(gn)?'—':gn.toFixed(3)}}</div>`+
@@ -835,6 +978,26 @@ function selectSample(idx,el){{
     `<div class="stat-item"><div class="slbl">${{s.l}}</div>`+
     `<div class="sval ${{s.cls||''}}">${{s.v}}</div></div>`
   ).join('');
+
+  // meta bar
+  const mb=document.getElementById('meta-bar');
+  if(META&&META[idx]){{
+    const m=META[idx];
+    const lbl=m.label||'';
+    const lc=lbl.toLowerCase();
+    const bc=lc==='normal'?'normal':(lc==='anomaly'||lc==='abnormal'?'anomaly':'unknown');
+    document.getElementById('m-label').innerHTML=`<span class="meta-badge ${{bc}}">${{lbl||'—'}}</span>`;
+    document.getElementById('m-detector').textContent=m.detector_id||'—';
+    document.getElementById('m-channel').textContent=m.channel_id||'—';
+    document.getElementById('m-project').textContent=m.project||'—';
+    document.getElementById('m-duration').textContent=m.duration?(m.duration+'s'):'—';
+    document.getElementById('m-time').textContent=m.time_point||'—';
+    const fp=document.getElementById('m-path');
+    fp.textContent=m.file_path||'—'; fp.title='点击复制: '+(m.file_path||'');
+    mb.classList.add('show');
+  }}else{{
+    mb.classList.remove('show');
+  }}
 
   // show tabs
   document.getElementById('chart-tabs').style.display=HAS_TRAJ?'flex':'none';
@@ -943,6 +1106,15 @@ function drawWeightChart(idx){{
         }}
       }}
     }}
+  }});
+}}
+
+// ── 复制路径 ──
+function copyPath(el){{
+  const txt=el.title.replace('点击复制: ','');
+  navigator.clipboard?.writeText(txt).then(()=>{{
+    const orig=el.textContent; el.textContent='✓ 已复制';
+    setTimeout(()=>el.textContent=orig,1200);
   }});
 }}
 
