@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-export_html_utt.py —— Utterance 级样本贡献度分析可视化工具 v3
+export_html_utt.py —— Utterance 级样本贡献度分析可视化工具 v4
+新增 weight 字段：epoch 轨迹 + utterance 级聚合 (mean_weight / weight_std)
 去掉 dup_ratio，修复搜索，列头点击排序升降序，导出 CSV，亮色主题
 """
 
@@ -26,10 +27,10 @@ def strip_chunk_suffix(utt_id):
 
 def main():
     print("\n" + "="*60)
-    print("🚀 [START] Utterance 级聚合分析脚本 v3 启动...")
+    print("🚀 [START] Utterance 级聚合分析脚本 v4 启动...")
     print("="*60)
 
-    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v3")
+    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v4")
     ap.add_argument("--contrib", required=True, help="包含 contrib_epoch*.npz 和 summary CSV 的目录")
     ap.add_argument("--egs",     default="", help="可选：train.egs.csv 路径")
     ap.add_argument("--summary", default="", help="可选：明确指定 summary CSV 路径")
@@ -77,20 +78,23 @@ def main():
                 if p: idx2utt[i] = p[0]
     print(f"   有效映射数: {len(idx2utt)}")
 
-    # ── 3. 加载 epoch 轨迹 ──
+    # ── 3. 加载 epoch 轨迹（含 weight）──
     print("\n[3/5] 加载 epoch 轨迹 ...")
     files = sorted(glob.glob(os.path.join(args.contrib, "contrib_epoch*.npz")))
     print(f"   找到 {len(files)} 个 .npz")
 
     id2idx_egs = {r["id"]: i for i, r in enumerate(egs_rows)}
     epochs = []
-    gn_egs = al_egs = None
+    gn_egs = al_egs = wt_egs = None
     has_traj = len(files) > 0
+    has_weight = False   # 是否任意一个 npz 含有 weight 字段
 
     if has_traj:
         ne = len(files)
         gn_egs = np.full((n_egs, ne), np.nan, dtype=np.float32)
         al_egs = np.full((n_egs, ne), np.nan, dtype=np.float32)
+        wt_egs = np.full((n_egs, ne), np.nan, dtype=np.float32)
+
         for ei, fp in enumerate(files):
             ep = int(os.path.basename(fp)[len("contrib_epoch"):-len(".npz")])
             epochs.append(ep)
@@ -104,7 +108,16 @@ def main():
             m = idxs >= 0
             gn_egs[idxs[m], ei] = d["grad_norm"][m]
             al_egs[idxs[m], ei] = d["align"][m]
+            # weight 字段（可选）
+            if "weight" in d:
+                has_weight = True
+                wt_egs[idxs[m], ei] = d["weight"][m]
+
         epochs = sorted(epochs)
+        if has_weight:
+            print(f"   ✅ 检测到 weight 字段（将生成 weight 轨迹）")
+        else:
+            print(f"   ℹ️  未检测到 weight 字段，跳过 weight 可视化")
 
     # ── 4. 聚合到 utterance 粒度 ──
     print("\n[4/5] 聚合到 utterance 粒度 ...")
@@ -130,16 +143,20 @@ def main():
         si = arr("self_influence"); gn = arr("mean_grad_norm")
         al = arr("mean_align");     fn = arr("frac_neg_align")
         fo = arr("forget_events");  fc = arr("final_correct")
+        wt = arr("mean_weight")     # CSV 中的 mean_weight（可能不存在，返回 nan）
 
         gn_std = sd(gn)
+        wt_std = sd(wt)
 
         tags      = [TAG_MAP.get(egs_rows[i].get("tag", "normal"), 4) for i in idxs]
         worst_tag = min(tags)
 
-        gn_traj = al_traj = None
+        gn_traj = al_traj = wt_traj = None
         if has_traj:
             gn_traj = np.nanmean(gn_egs[idxs, :], axis=0)
             al_traj = np.nanmean(al_egs[idxs, :], axis=0)
+            if has_weight:
+                wt_traj = np.nanmean(wt_egs[idxs, :], axis=0)
 
         utt_data.append(dict(
             utt_id=utt_id, n_chunks=nc,
@@ -147,7 +164,9 @@ def main():
             mean_gn=sm(gn), max_gn=sx(gn), gn_std=gn_std,
             mean_al=sm(al), mean_fn=sm(fn),
             mean_fo=sm(fo), mean_fc=sm(fc),
-            worst_tag=worst_tag, gn_traj=gn_traj, al_traj=al_traj,
+            mean_wt=sm(wt), wt_std=wt_std,
+            worst_tag=worst_tag,
+            gn_traj=gn_traj, al_traj=al_traj, wt_traj=wt_traj,
         ))
 
     utt_data.sort(key=lambda x: x["mean_si"] if not np.isnan(x["mean_si"]) else -1e9, reverse=True)
@@ -157,7 +176,7 @@ def main():
     print(f"\n   导出 utterance CSV → {csv_out}")
     fieldnames = ["utt_id", "n_chunks", "mean_si", "max_si",
                   "mean_gn", "max_gn", "gn_std", "mean_al", "mean_fn",
-                  "mean_fo", "mean_fc", "worst_tag"]
+                  "mean_fo", "mean_fc", "mean_wt", "wt_std", "worst_tag"]
     with open(csv_out, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -173,7 +192,6 @@ def main():
     n_u = len(utt_data)
     ne  = len(epochs)
 
-    # 二进制数组（无 dup_arr）
     n_chunks_arr = np.array([d["n_chunks"] for d in utt_data], dtype=np.int16)
     mean_si_arr  = np.array([d["mean_si"]  for d in utt_data], dtype=np.float32)
     max_si_arr   = np.array([d["max_si"]   for d in utt_data], dtype=np.float32)
@@ -182,38 +200,67 @@ def main():
     gn_std_arr   = np.array([d["gn_std"]   for d in utt_data], dtype=np.float32)
     mean_al_arr  = np.array([d["mean_al"]  for d in utt_data], dtype=np.float32)
     mean_fn_arr  = np.array([d["mean_fn"]  for d in utt_data], dtype=np.float32)
+    mean_wt_arr  = np.array([d["mean_wt"]  for d in utt_data], dtype=np.float32)
+    wt_std_arr   = np.array([d["wt_std"]   for d in utt_data], dtype=np.float32)
     tags_arr     = np.array([d["worst_tag"]for d in utt_data], dtype=np.uint8)
 
-    gn_mat_u8 = al_mat_u8 = None
+    gn_mat_u8 = al_mat_u8 = wt_mat_u8 = None
     gn_min = 0.0; gn_scale = 1.0
+    wt_min = 0.0; wt_scale = 1.0
     if has_traj and ne > 0:
         gn_s = np.stack([d["gn_traj"] for d in utt_data])
         al_s = np.stack([d["al_traj"] for d in utt_data])
-        valid = gn_s[~np.isnan(gn_s)]
-        if len(valid):
+
+        valid_gn = gn_s[~np.isnan(gn_s)]
+        if len(valid_gn):
             gn_min   = float(np.nanmin(gn_s))
-            gn_scale = max(float(np.nanpercentile(valid, 99)) - gn_min, 1e-9)
+            gn_scale = max(float(np.nanpercentile(valid_gn, 99)) - gn_min, 1e-9)
         gq = np.clip((gn_s - gn_min) / gn_scale * 255, 0, 255); gq[np.isnan(gn_s)] = 255
         aq = np.clip((al_s + 1.0) / 2.0 * 253, 0, 253);          aq[np.isnan(al_s)] = 254
         gn_mat_u8 = gq.astype(np.uint8)
         al_mat_u8 = aq.astype(np.uint8)
 
+        if has_weight:
+            wt_s = np.stack([d["wt_traj"] if d["wt_traj"] is not None
+                             else np.full(ne, np.nan) for d in utt_data])
+            valid_wt = wt_s[~np.isnan(wt_s)]
+            if len(valid_wt):
+                wt_min   = float(np.nanmin(wt_s))
+                wt_scale = max(float(np.nanpercentile(valid_wt, 99)) - wt_min, 1e-9)
+            wq = np.clip((wt_s - wt_min) / wt_scale * 253, 0, 253); wq[np.isnan(wt_s)] = 254
+            wt_mat_u8 = wq.astype(np.uint8)
+
     utt_bytes = "\n".join(d["utt_id"] for d in utt_data).encode("utf-8")
     utt_len   = len(utt_bytes)
 
+    # Header 布局（80 bytes）:
+    #   int32 × 4  : n_u, ne, utt_len, flags   (flags bit0=has_traj, bit1=has_weight)
+    #   float32 × 2: gn_min, gn_scale
+    #   float32 × 2: wt_min, wt_scale
+    #   padding     : 64 - 32 = 48 bytes  → total 80 bytes
+    flags = (1 if has_traj else 0) | (2 if has_weight else 0)
     bin_path = os.path.splitext(args.output)[0] + "_utt.bin"
     with open(bin_path, "wb") as fb:
-        fb.write(np.array([n_u, ne, utt_len, 1 if has_traj else 0], dtype=np.int32).tobytes())
-        fb.write(np.array([gn_min, gn_scale], dtype=np.float32).tobytes())
-        fb.write(b"\x00" * 40)   # padding → header 共 64 bytes
+        fb.write(np.array([n_u, ne, utt_len, flags], dtype=np.int32).tobytes())   # 16 B
+        fb.write(np.array([gn_min, gn_scale], dtype=np.float32).tobytes())        # 8 B
+        fb.write(np.array([wt_min, wt_scale], dtype=np.float32).tobytes())        # 8 B
+        fb.write(b"\x00" * 48)   # padding → header 共 80 bytes
+        # 数值数组
         for a in [n_chunks_arr, mean_si_arr, max_si_arr,
                   mean_gn_arr, max_gn_arr, gn_std_arr,
-                  mean_al_arr, mean_fn_arr, tags_arr]:
+                  mean_al_arr, mean_fn_arr,
+                  mean_wt_arr, wt_std_arr,
+                  tags_arr]:
             fb.write(a.tobytes())
+        # utt_id 字符串块
         fb.write(utt_bytes)
+        # 轨迹矩阵（按 gn / al / wt 顺序）
         if has_traj and gn_mat_u8 is not None:
             fb.write(gn_mat_u8.flatten().tobytes())
             fb.write(al_mat_u8.flatten().tobytes())
+            if has_weight and wt_mat_u8 is not None:
+                fb.write(wt_mat_u8.flatten().tobytes())
+
     print(f"   ✅ .bin  {os.path.getsize(bin_path)/1e6:.2f} MB → {os.path.abspath(bin_path)}")
 
     with open(args.output, "w", encoding="utf-8") as f:
@@ -224,6 +271,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"✨ 完成！utterance 数: {n_utt}")
     print(f"   单 chunk（短语音）: {single_chunk} ({100*single_chunk/max(n_utt,1):.1f}%)")
+    print(f"   weight 轨迹: {'已生成' if has_weight else '未检测到'}")
     print(f"{'='*60}\n")
 
 
@@ -247,6 +295,7 @@ def make_html(bin_filename, epochs, n_u):
   --hard:#ea580c;    --hard-bg:#fff7ed;
   --inf:#7c3aed;     --inf-bg:#f5f3ff;
   --easy:#16a34a;    --easy-bg:#f0fdf4;
+  --wt:#0891b2;      --wt-bg:#ecfeff;
   --mono:'IBM Plex Mono',monospace; --sans:'Inter',sans-serif;
   --radius:6px;
   --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
@@ -255,7 +304,7 @@ def make_html(bin_filename, epochs, n_u):
 html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sans);overflow:hidden;font-size:13px;}}
 
 /* ── Layout ── */
-.layout{{display:grid;grid-template-columns:520px 1fr;grid-template-rows:52px 1fr;height:100vh;}}
+.layout{{display:grid;grid-template-columns:560px 1fr;grid-template-rows:52px 1fr;height:100vh;}}
 
 /* ── Header ── */
 .header{{grid-column:1/-1;display:flex;align-items:center;padding:0 18px;gap:12px;
@@ -305,7 +354,7 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .export-btn:hover{{background:var(--ac2);}}
 
 /* ── Table header ── */
-.list-header{{display:grid;grid-template-columns:38px 1fr 50px 64px 64px 110px;
+.list-header{{display:grid;grid-template-columns:38px 1fr 46px 60px 60px 60px 106px;
   align-items:center;padding:0 12px;gap:4px;height:28px;
   border-bottom:2px solid var(--bdr);background:var(--surf3);
   font-family:var(--mono);font-size:9px;color:var(--mt);
@@ -326,7 +375,7 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .vlist::-webkit-scrollbar-thumb:hover{{background:var(--mt2);}}
 #vinner{{position:relative;}}
 
-.srow{{display:grid;grid-template-columns:38px 1fr 50px 64px 64px 110px;
+.srow{{display:grid;grid-template-columns:38px 1fr 46px 60px 60px 60px 106px;
   align-items:center;padding:0 12px;cursor:pointer;gap:4px;
   border-bottom:1px solid var(--bdr);height:36px;
   position:absolute;width:100%;transition:background .08s;}}
@@ -337,8 +386,9 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .s-uid mark{{background:rgba(37,99,235,.15);color:var(--ac);border-radius:2px;padding:0 1px;}}
 .s-nc{{text-align:center;font-size:10px;font-family:var(--mono);color:var(--mt);}}
-.s-gn,.s-al{{text-align:right;font-size:10px;font-family:var(--mono);color:var(--mt);}}
+.s-gn,.s-al,.s-wt{{text-align:right;font-size:10px;font-family:var(--mono);color:var(--mt);}}
 .s-al.pos{{color:var(--easy);}} .s-al.neg{{color:var(--harmful);}}
+.s-wt.hi{{color:var(--wt);font-weight:500;}}
 .col-tag{{justify-self:end;}}
 
 /* ── Pagination ── */
@@ -360,23 +410,41 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .ctitle{{font-family:var(--mono);font-size:12px;color:var(--tx);font-weight:600;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .csub{{font-family:var(--mono);font-size:10px;color:var(--mt);}}
-.stat-grid{{display:flex;gap:18px;flex-shrink:0;flex-wrap:wrap;}}
+.stat-grid{{display:flex;gap:14px;flex-shrink:0;flex-wrap:wrap;}}
 .stat-item{{text-align:right;}}
 .slbl{{font-size:9px;color:var(--mt);font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em;}}
-.sval{{font-size:16px;font-family:var(--mono);font-weight:600;color:var(--tx);margin-top:1px;}}
+.sval{{font-size:15px;font-family:var(--mono);font-weight:600;color:var(--tx);margin-top:1px;}}
+.sval.wt-val{{color:var(--wt);}}
+
+/* ── Chart tabs ── */
+.chart-tabs{{display:flex;gap:0;border-bottom:1px solid var(--bdr);
+  background:var(--surf);padding:0 20px;}}
+.ctab{{padding:8px 16px;font-family:var(--mono);font-size:11px;color:var(--mt);
+  cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;
+  transition:color .15s,border-color .15s;user-select:none;}}
+.ctab:hover{{color:var(--tx);}}
+.ctab.active{{color:var(--ac);border-bottom-color:var(--ac);font-weight:600;}}
+.ctab.wt-tab.active{{color:var(--wt);border-bottom-color:var(--wt);}}
+.ctab[data-tab="wt"]{{display:none;}}  /* hidden until weight is confirmed present */
+.ctab[data-tab="wt"].show{{display:block;}}
 
 /* ── Chart area ── */
-.chart-area{{flex:1;padding:20px 24px 16px;display:flex;flex-direction:column;gap:12px;overflow:hidden;}}
+.chart-area{{flex:1;padding:16px 24px 14px;display:flex;flex-direction:column;gap:10px;overflow:hidden;}}
 .chart-wrap{{flex:1;position:relative;min-height:0;}}
 .chart-wrap canvas{{position:absolute;inset:0;}}
+.chart-panel{{display:none;flex:1;flex-direction:column;gap:10px;}}
+.chart-panel.active{{display:flex;}}
 .placeholder{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:10px;color:var(--mt2);font-family:var(--mono);}}
 .phi{{font-size:40px;opacity:.25;}}
 .placeholder p{{font-size:11px;}}
-.legend{{display:flex;gap:20px;font-family:var(--mono);font-size:10px;color:var(--mt);}}
+.legend{{display:flex;gap:20px;font-family:var(--mono);font-size:10px;color:var(--mt);flex-wrap:wrap;}}
 .li{{display:flex;align-items:center;gap:6px;}}
 .ld{{width:8px;height:8px;border-radius:50%;}}
-.ld.gn{{background:#2563eb;}} .ld.al{{background:#7c3aed;}}
+.ld.gn{{background:#2563eb;}} .ld.al{{background:#7c3aed;}} .ld.wt{{background:#0891b2;}}
+
+/* ── Weight mini-bar in list ── */
+.wt-bar{{position:absolute;bottom:0;left:0;height:2px;background:var(--wt);opacity:.5;border-radius:0 1px 1px 0;}}
 </style>
 </head><body>
 <div class="layout">
@@ -404,6 +472,12 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
           <option value="3">↓ easy_redundant</option>
           <option value="4">· normal</option>
         </select>
+        <select id="wt-f" onchange="rebuild()" style="display:none;" id="wt-filter-sel">
+          <option value="0">全部 Weight</option>
+          <option value="1">高权重 (≥0.75)</option>
+          <option value="2">中权重 (0.25–0.75)</option>
+          <option value="3">低权重 (&lt;0.25)</option>
+        </select>
         <button class="export-btn" onclick="exportCSV()">⬇ CSV</button>
       </div>
     </div>
@@ -411,9 +485,10 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
     <div class="list-header">
       <span class="th" onclick="setSort('rank')" id="th-rank">#<span class="arrow"></span></span>
       <span class="th" onclick="setSort('uid')" id="th-uid">utt_id<span class="arrow"></span></span>
-      <span class="th th-c" onclick="setSort('nc')" id="th-nc">chunks<span class="arrow"></span></span>
+      <span class="th th-c" onclick="setSort('nc')" id="th-nc">chk<span class="arrow"></span></span>
       <span class="th th-r" onclick="setSort('gn')" id="th-gn">mean_gn<span class="arrow"></span></span>
       <span class="th th-r" onclick="setSort('al')" id="th-al">mean_al<span class="arrow"></span></span>
+      <span class="th th-r" onclick="setSort('wt')" id="th-wt" style="display:none;">mean_wt<span class="arrow"></span></span>
       <span class="th th-r" onclick="setSort('tag')" id="th-tag">tag<span class="arrow"></span></span>
     </div>
 
@@ -436,16 +511,34 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
       </div>
       <div class="stat-grid" id="stat-grid"></div>
     </div>
+
+    <!-- Chart tabs -->
+    <div class="chart-tabs" id="chart-tabs" style="display:none;">
+      <div class="ctab active" data-tab="traj" onclick="switchTab('traj')">梯度 / 对齐 轨迹</div>
+      <div class="ctab wt-tab" data-tab="wt" onclick="switchTab('wt')">权重轨迹</div>
+    </div>
+
     <div class="chart-area">
+      <!-- placeholder -->
       <div id="ph" class="placeholder">
         <div class="phi">◈</div>
         <p>选择 utterance 后，此处显示各 epoch 的梯度均值轨迹</p>
       </div>
-      <div id="cc" style="display:none;flex:1;flex-direction:column;gap:10px;">
-        <div class="chart-wrap"><canvas id="myChart"></canvas></div>
+
+      <!-- traj panel -->
+      <div id="panel-traj" class="chart-panel">
+        <div class="chart-wrap"><canvas id="chartTraj"></canvas></div>
         <div class="legend">
           <div class="li"><div class="ld gn"></div>grad_norm 均值（左轴）</div>
           <div class="li"><div class="ld al"></div>align 均值（右轴）</div>
+        </div>
+      </div>
+
+      <!-- weight panel -->
+      <div id="panel-wt" class="chart-panel">
+        <div class="chart-wrap"><canvas id="chartWt"></canvas></div>
+        <div class="legend">
+          <div class="li"><div class="ld wt"></div>weight 均值（左轴）</div>
         </div>
       </div>
     </div>
@@ -457,18 +550,24 @@ const DATA_URL  = "{bin_filename}";
 const EPOCHS    = {epochs};
 const TAG_NAMES = ["harmful_suspect","hard","high_influence","easy_redundant","normal"];
 
-// ── 全局数据（无 DUP）──
-let _N, _NE, HAS_TRAJ, _GN_MIN, _GN_SC;
-let N_CHUNKS, MEAN_SI, MAX_SI, MEAN_GN, MAX_GN, GN_STD, MEAN_AL, MEAN_FN, TAGS, UTT_IDS;
-let GN_U8=null, AL_U8=null;
+// ── 全局数据 ──
+let _N, _NE, HAS_TRAJ, HAS_WEIGHT;
+let _GN_MIN, _GN_SC, _WT_MIN, _WT_SC;
+let N_CHUNKS, MEAN_SI, MAX_SI, MEAN_GN, MAX_GN, GN_STD, MEAN_AL, MEAN_FN;
+let MEAN_WT, WT_STD, TAGS, UTT_IDS;
+let GN_U8=null, AL_U8=null, WT_U8=null;
 
 // ── 状态 ──
 const PAGE=100, ROW_H=36;
-let filtered=null, pageStart=0, selIdx=-1, chart=null, stimer=null;
+let filtered=null, pageStart=0, selIdx=-1;
+let chartTraj=null, chartWt=null;
+let stimer=null;
 let sortKey='si', sortAsc=false;
+let activeTab='traj';
+let wtMax=1.0; // for normalizing bar widths
 
 // ── 列头 id 映射 ──
-const TH_IDS={{rank:'th-rank',uid:'th-uid',nc:'th-nc',gn:'th-gn',al:'th-al',tag:'th-tag'}};
+const TH_IDS={{rank:'th-rank',uid:'th-uid',nc:'th-nc',gn:'th-gn',al:'th-al',wt:'th-wt',tag:'th-tag'}};
 
 // ── 数据加载 ──
 async function loadBinaryData(){{
@@ -477,35 +576,62 @@ async function loadBinaryData(){{
     if(!res.ok) throw new Error("无法读取 .bin，请用 Web Server 打开（python -m http.server）");
     const buf = await res.arrayBuffer();
 
+    // Header: 80 bytes
+    // int32[4] = n_u, ne, utt_len, flags   (flags: bit0=has_traj, bit1=has_weight)
+    // float32[2] = gn_min, gn_scale
+    // float32[2] = wt_min, wt_scale
+    // padding 48 bytes
     const mi=new Int32Array(buf,0,4);
-    _N=mi[0]; _NE=mi[1]; const uttLen=mi[2]; HAS_TRAJ=mi[3]===1;
-    const mf=new Float32Array(buf,16,2);
+    _N=mi[0]; _NE=mi[1]; const uttLen=mi[2]; const flags=mi[3];
+    HAS_TRAJ  =(flags&1)===1;
+    HAS_WEIGHT=(flags&2)===2;
+
+    const mf=new Float32Array(buf,16,4);
     _GN_MIN=mf[0]; _GN_SC=mf[1];
+    _WT_MIN=mf[2]; _WT_SC=mf[3];
 
-    document.getElementById('hmeta').textContent=`${{_N.toLocaleString()}} utterances · ${{_NE}} epochs`;
+    document.getElementById('hmeta').textContent=
+      `${{_N.toLocaleString()}} utterances · ${{_NE}} epochs`+
+      (HAS_WEIGHT?' · weight ✓':'');
 
-    // 偏移顺序与 Python 写入完全一致（无 DUP）
-    let o=64;
-    N_CHUNKS=new Int16Array(buf,o,_N);    o+=_N*2;
-    MEAN_SI =new Float32Array(buf,o,_N);  o+=_N*4;
-    MAX_SI  =new Float32Array(buf,o,_N);  o+=_N*4;
-    MEAN_GN =new Float32Array(buf,o,_N);  o+=_N*4;
-    MAX_GN  =new Float32Array(buf,o,_N);  o+=_N*4;
-    GN_STD  =new Float32Array(buf,o,_N);  o+=_N*4;
-    MEAN_AL =new Float32Array(buf,o,_N);  o+=_N*4;
-    MEAN_FN =new Float32Array(buf,o,_N);  o+=_N*4;
-    TAGS    =new Uint8Array(buf,o,_N);    o+=_N*1;
+    // 数值数组（偏移 80 bytes）
+    let o=80;
+    N_CHUNKS=new Int16Array  (buf,o,_N); o+=_N*2;
+    MEAN_SI =new Float32Array(buf,o,_N); o+=_N*4;
+    MAX_SI  =new Float32Array(buf,o,_N); o+=_N*4;
+    MEAN_GN =new Float32Array(buf,o,_N); o+=_N*4;
+    MAX_GN  =new Float32Array(buf,o,_N); o+=_N*4;
+    GN_STD  =new Float32Array(buf,o,_N); o+=_N*4;
+    MEAN_AL =new Float32Array(buf,o,_N); o+=_N*4;
+    MEAN_FN =new Float32Array(buf,o,_N); o+=_N*4;
+    MEAN_WT =new Float32Array(buf,o,_N); o+=_N*4;
+    WT_STD  =new Float32Array(buf,o,_N); o+=_N*4;
+    TAGS    =new Uint8Array  (buf,o,_N); o+=_N*1;
 
     UTT_IDS=new TextDecoder("utf-8").decode(new Uint8Array(buf,o,uttLen)).split('\\n'); o+=uttLen;
 
     if(HAS_TRAJ&&_NE>0){{
       const ts=_N*_NE;
       GN_U8=new Uint8Array(buf,o,ts); o+=ts;
-      AL_U8=new Uint8Array(buf,o,ts);
+      AL_U8=new Uint8Array(buf,o,ts); o+=ts;
+      if(HAS_WEIGHT){{
+        WT_U8=new Uint8Array(buf,o,ts);
+      }}
     }}
 
-    filtered=Int32Array.from({{length:_N}},(_,i)=>i);
+    // compute weight range for bar display
+    if(HAS_WEIGHT){{
+      let mx=0;
+      for(let i=0;i<_N;i++){{ if(!isNaN(MEAN_WT[i])&&MEAN_WT[i]>mx) mx=MEAN_WT[i]; }}
+      wtMax=mx||1.0;
+      // show weight UI
+      document.getElementById('wt-filter-sel')&&(document.getElementById('wt-f').style.display='');
+      document.getElementById('th-wt').style.display='flex';
+      document.querySelectorAll('.ctab[data-tab="wt"]').forEach(t=>t.classList.add('show'));
+    }}
+
     buildTagBadges();
+    filtered=Int32Array.from({{length:_N}},(_,i)=>i);
     renderPage();
     document.getElementById('hstatus').style.display='none';
   }}catch(e){{
@@ -536,6 +662,7 @@ function getVal(sk,i){{
   if(sk==='al')    return MEAN_AL[i];
   if(sk==='nc')    return N_CHUNKS[i];
   if(sk==='tag')   return TAGS[i];
+  if(sk==='wt')    return MEAN_WT[i];
   return 0;
 }}
 
@@ -544,7 +671,6 @@ function setSort(key){{
   const realKey=key==='rank'?'si':key;
   if(sortKey===realKey){{ sortAsc=!sortAsc; }}
   else{{ sortKey=realKey; sortAsc=(realKey==='al'); }}
-  // 更新列头样式
   Object.entries(TH_IDS).forEach(([k,id])=>{{
     const el=document.getElementById(id);
     if(!el) return;
@@ -577,11 +703,18 @@ function clearSearch(){{
 // ── 重建过滤+排序 ──
 function rebuild(){{
   const tagF=parseInt(document.getElementById('tag-f').value);
+  const wtF =parseInt(document.getElementById('wt-f')?.value||'0');
   const q=document.getElementById('search').value.trim().toLowerCase();
 
   let arr=[];
   for(let i=0;i<_N;i++){{
     if(tagF>=0 && TAGS[i]!==tagF) continue;
+    if(HAS_WEIGHT&&wtF>0){{
+      const w=MEAN_WT[i]/wtMax;
+      if(wtF===1&&w<0.75) continue;
+      if(wtF===2&&(w<0.25||w>=0.75)) continue;
+      if(wtF===3&&w>=0.25) continue;
+    }}
     if(q && !((UTT_IDS[i]||'').toLowerCase().includes(q))) continue;
     arr.push(i);
   }}
@@ -635,16 +768,24 @@ function renderPage(){{
     row.className='srow'+(i===selIdx?' sel':'');
     row.style.top=(vi*ROW_H)+'px';
     const uid=UTT_IDS[i]||String(i);
-    const gn=MEAN_GN[i], al=MEAN_AL[i];
+    const gn=MEAN_GN[i], al=MEAN_AL[i], wt=MEAN_WT[i];
     const tag=TAG_NAMES[TAGS[i]];
     const alc=isNaN(al)?'':(al>=0?'pos':'neg');
+    const wtc=(!HAS_WEIGHT||isNaN(wt))?'':(wt/wtMax>=0.75?'hi':'');
+    const wtStr=(!HAS_WEIGHT||isNaN(wt))?'':wt.toFixed(3);
+
+    // weight bottom bar width %
+    const barW=HAS_WEIGHT&&!isNaN(wt)?Math.round(wt/wtMax*100):0;
+
     row.innerHTML=
       `<div class="s-rank">${{pageStart+vi+1}}</div>`+
       `<div class="s-uid" title="${{escH(uid)}}">${{highlight(uid,q)}}</div>`+
       `<div class="s-nc">${{N_CHUNKS[i]}}</div>`+
       `<div class="s-gn">${{isNaN(gn)?'—':gn.toFixed(3)}}</div>`+
       `<div class="s-al ${{alc}}">${{isNaN(al)?'—':al.toFixed(3)}}</div>`+
-      `<div class="col-tag"><span class="badge ${{tag}}">${{tag.replace(/_/g,' ')}}</span></div>`;
+      (HAS_WEIGHT?`<div class="s-wt ${{wtc}}">${{wtStr||'—'}}</div>`:'<div></div>')+
+      `<div class="col-tag"><span class="badge ${{tag}}">${{tag.replace(/_/g,' ')}}</span></div>`+
+      (HAS_WEIGHT&&barW>0?`<div class="wt-bar" style="width:${{barW}}%"></div>`:'');
     row.addEventListener('click',()=>selectSample(i,row));
     inner.appendChild(row);
   }}
@@ -654,6 +795,16 @@ function renderPage(){{
 function prevPage(){{ if(pageStart>0){{ pageStart=Math.max(0,pageStart-PAGE); renderPage(); }} }}
 function nextPage(){{ if(pageStart+PAGE<filtered.length){{ pageStart+=PAGE; renderPage(); }} }}
 
+// ── Tab 切换 ──
+function switchTab(tab){{
+  activeTab=tab;
+  document.querySelectorAll('.ctab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
+  document.querySelectorAll('.chart-panel').forEach(p=>p.classList.toggle('active',p.id===`panel-${{tab}}`));
+  // resize charts after display change
+  if(tab==='traj'&&chartTraj) chartTraj.resize();
+  if(tab==='wt'&&chartWt)     chartWt.resize();
+}}
+
 // ── 选中样本 ──
 function selectSample(idx,el){{
   selIdx=idx;
@@ -662,9 +813,11 @@ function selectSample(idx,el){{
 
   const uid=UTT_IDS[idx]||String(idx);
   const tag=TAG_NAMES[TAGS[idx]];
+  const wt=MEAN_WT[idx];
   document.getElementById('ctitle').textContent=uid;
   document.getElementById('csub').textContent=
-    `tag: ${{tag}}  ·  chunks: ${{N_CHUNKS[idx]}}  ·  mean_si: ${{MEAN_SI[idx].toFixed(2)}}  ·  max_si: ${{MAX_SI[idx].toFixed(2)}}`;
+    `tag: ${{tag}}  ·  chunks: ${{N_CHUNKS[idx]}}  ·  mean_si: ${{MEAN_SI[idx].toFixed(2)}}  ·  max_si: ${{MAX_SI[idx].toFixed(2)}}`+
+    (HAS_WEIGHT&&!isNaN(wt)?`  ·  mean_wt: ${{wt.toFixed(4)}}  ±${{WT_STD[idx].toFixed(4)}}`:'');
 
   const stats=[
     {{l:'MEAN SI',    v:MEAN_SI[idx].toFixed(2)}},
@@ -674,24 +827,32 @@ function selectSample(idx,el){{
     {{l:'MEAN ALIGN', v:MEAN_AL[idx].toFixed(4)}},
     {{l:'NEG ALIGN',  v:(MEAN_FN[idx]*100).toFixed(0)+'%'}},
   ];
+  if(HAS_WEIGHT&&!isNaN(wt)){{
+    stats.push({{l:'MEAN WT',  v:wt.toFixed(4), cls:'wt-val'}});
+    stats.push({{l:'WT STD',   v:WT_STD[idx].toFixed(4), cls:'wt-val'}});
+  }}
   document.getElementById('stat-grid').innerHTML=stats.map(s=>
-    `<div class="stat-item"><div class="slbl">${{s.l}}</div><div class="sval">${{s.v}}</div></div>`
+    `<div class="stat-item"><div class="slbl">${{s.l}}</div>`+
+    `<div class="sval ${{s.cls||''}}">${{s.v}}</div></div>`
   ).join('');
 
-  drawChart(idx);
+  // show tabs
+  document.getElementById('chart-tabs').style.display=HAS_TRAJ?'flex':'none';
+  document.getElementById('ph').style.display='none';
+  document.getElementById('panel-traj').classList.add('active');
+
+  drawTrajChart(idx);
+  if(HAS_WEIGHT) drawWeightChart(idx);
 }}
 
-// ── 折线图 ──
-function drawChart(idx){{
+// ── 梯度/对齐轨迹图 ──
+function drawTrajChart(idx){{
   if(!HAS_TRAJ||!GN_U8){{
     document.getElementById('ph').style.display='flex';
     document.getElementById('ph').querySelector('p').textContent='无轨迹数据（未找到 .npz 文件）';
-    document.getElementById('cc').style.display='none';
+    document.getElementById('panel-traj').classList.remove('active');
     return;
   }}
-  document.getElementById('ph').style.display='none';
-  document.getElementById('cc').style.display='flex';
-
   const gn=[],al=[];
   for(let e=0;e<_NE;e++){{
     const b=idx*_NE+e;
@@ -699,8 +860,8 @@ function drawChart(idx){{
     al.push(AL_U8[b]===254?null:(AL_U8[b]/253)*2-1);
   }}
 
-  if(chart) chart.destroy();
-  chart=new Chart(document.getElementById('myChart').getContext('2d'),{{
+  if(chartTraj) chartTraj.destroy();
+  chartTraj=new Chart(document.getElementById('chartTraj').getContext('2d'),{{
     type:'line',
     data:{{
       labels:EPOCHS.map(e=>`ep${{e}}`),
@@ -734,13 +895,67 @@ function drawChart(idx){{
   }});
 }}
 
+// ── Weight 轨迹图 ──
+function drawWeightChart(idx){{
+  if(!HAS_WEIGHT||!WT_U8) return;
+  const wt=[];
+  for(let e=0;e<_NE;e++){{
+    const b=idx*_NE+e;
+    wt.push(WT_U8[b]===254?null:_WT_MIN+(WT_U8[b]/253)*_WT_SC);
+  }}
+
+  if(chartWt) chartWt.destroy();
+  chartWt=new Chart(document.getElementById('chartWt').getContext('2d'),{{
+    type:'line',
+    data:{{
+      labels:EPOCHS.map(e=>`ep${{e}}`),
+      datasets:[
+        {{label:'weight(均值)',data:wt,
+          borderColor:'#0891b2',backgroundColor:'rgba(8,145,178,.10)',
+          borderWidth:2.5,pointRadius:5,pointBackgroundColor:'#0891b2',
+          tension:.35,fill:true,yAxisID:'y'}}
+      ]
+    }},
+    options:{{
+      responsive:true,maintainAspectRatio:false,animation:{{duration:200}},
+      interaction:{{mode:'index',intersect:false}},
+      plugins:{{
+        legend:{{display:false}},
+        tooltip:{{
+          backgroundColor:'#fff',borderColor:'#dde3ee',borderWidth:1,
+          titleColor:'#1a2035',bodyColor:'#6b7a99',
+          titleFont:{{family:'IBM Plex Mono',size:11}},bodyFont:{{family:'IBM Plex Mono',size:10}},
+          callbacks:{{label:c=>`  weight: ${{c.parsed.y?.toFixed(6)??'—'}}`}}
+        }},
+        // horizontal reference lines at common threshold values
+        annotation: undefined
+      }},
+      scales:{{
+        x:{{
+          grid:{{color:'#eef1f7'}},
+          ticks:{{color:'#6b7a99',font:{{family:'IBM Plex Mono',size:10}}}}
+        }},
+        y:{{
+          grid:{{color:'#eef1f7'}},
+          ticks:{{color:'#0891b2',font:{{family:'IBM Plex Mono',size:9}}}},
+          title:{{display:true,text:'weight',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}},
+          beginAtZero:true
+        }}
+      }}
+    }}
+  }});
+}}
+
 // ── 导出当前视图 CSV ──
 function exportCSV(){{
   if(!filtered||!UTT_IDS) return;
-  const rows=[['utt_id','n_chunks','mean_si','max_si','mean_gn','gn_std','mean_al','mean_fn','tag']];
+  const hdr=['utt_id','n_chunks','mean_si','max_si','mean_gn','gn_std','mean_al','mean_fn'];
+  if(HAS_WEIGHT) hdr.push('mean_wt','wt_std');
+  hdr.push('tag');
+  const rows=[hdr];
   for(let i=0;i<filtered.length;i++){{
     const idx=filtered[i];
-    rows.push([
+    const r=[
       UTT_IDS[idx]||idx,
       N_CHUNKS[idx],
       MEAN_SI[idx].toFixed(4),
@@ -749,8 +964,13 @@ function exportCSV(){{
       GN_STD[idx].toFixed(4),
       MEAN_AL[idx].toFixed(4),
       MEAN_FN[idx].toFixed(4),
-      TAG_NAMES[TAGS[idx]]
-    ]);
+    ];
+    if(HAS_WEIGHT) r.push(
+      isNaN(MEAN_WT[idx])?'':MEAN_WT[idx].toFixed(4),
+      isNaN(WT_STD[idx]) ?'':WT_STD[idx].toFixed(4)
+    );
+    r.push(TAG_NAMES[TAGS[idx]]);
+    rows.push(r);
   }}
   const csv=rows.map(r=>r.map(c=>`"${{String(c).replace(/"/g,'""')}}"`).join(',')).join('\\n');
   const a=document.createElement('a');
