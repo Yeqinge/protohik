@@ -65,10 +65,7 @@ def main():
             jdata = json.load(f)
         items = jdata if isinstance(jdata, list) else jdata.get("datas", jdata.get("data", []))
         for item in items:
-            raw_id = item.get("ID", "")
-            stem = re.sub(r"\.wav$", "", raw_id, flags=re.IGNORECASE)
-            stem = strip_label_prefix(strip_chunk_suffix(stem))
-            meta_map[stem] = {
+            entry = {
                 "file_path":   item.get("file_path", ""),
                 "label":       item.get("label", ""),
                 "detector_id": item.get("detector_id", ""),
@@ -77,6 +74,16 @@ def main():
                 "duration":    item.get("duration", ""),
                 "time_point":  item.get("time_point", ""),
             }
+            # key1: file_path 的 basename stem（去路径、去.wav）—— 和 egs utt_id 来自同一命名体系
+            fp = item.get("file_path", "") or item.get("ID", "")
+            fp_stem = re.sub(r"\.wav$", "", os.path.basename(fp), flags=re.IGNORECASE)
+            if fp_stem:
+                meta_map[fp_stem] = entry
+            # key2: ID stem（兼容旧格式）
+            raw_id = item.get("ID", "")
+            id_stem = re.sub(r"\.wav$", "", raw_id, flags=re.IGNORECASE)
+            if id_stem and id_stem != fp_stem:
+                meta_map[id_stem] = entry
         print(f"   元信息条目数: {len(meta_map)}")
     else:
         print("\n[0/5] 未指定 --meta，跳过元信息加载")
@@ -210,7 +217,12 @@ def main():
     utt2chunks = defaultdict(list)
     for i, row in enumerate(egs_rows):
         raw = idx2utt.get(i, row.get("id", str(i)))
-        utt2chunks[strip_label_prefix(strip_chunk_suffix(raw))].append(i)
+        # 去 chunk 后缀 → 去 label 前缀 → 去 .wav 后缀 → 取 basename
+        key = strip_chunk_suffix(raw)
+        key = strip_label_prefix(key)
+        key = re.sub(r'\.wav$', '', key, flags=re.IGNORECASE)
+        key = os.path.basename(key)   # 万一含路径也处理掉
+        utt2chunks[key].append(i)
 
     utt_ids_list = sorted(utt2chunks.keys())
     n_utt = len(utt_ids_list)
