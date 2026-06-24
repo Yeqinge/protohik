@@ -104,26 +104,49 @@ def main():
     # ── 2. sample_id → utt_id 映射 ──
     # 优先级：--egs 外挂文件 > CSV utt_id 列 > 数字 id（fallback）
     print("\n[2/5] 建立 sample_id → utt_id 映射 ...")
-    idx2utt = {}
+    idx2utt = {}   # csv_row_index → raw_utt_id（含 label 前缀和 chunk 后缀）
     if args.egs and os.path.exists(args.egs):
         print(f"   -> 从外挂 egs 文件读取: {args.egs}")
+        # 第一步：把 egs 整个文件读完，建立 raw_utt_id → 行号 的映射
         with open(args.egs, encoding="utf-8") as f:
             first = f.readline()
             delim = "\t" if "\t" in first else " "
+        egs_uttid2lineno = {}   # raw_utt_id(含前缀和chunk后缀) → egs 中的数据行号(0-based)
         with open(args.egs, encoding="utf-8") as f:
-            data_i = 0   # 数据行计数（跳过 header）
+            data_i = 0
             for line in f:
-                if data_i >= n_egs: break
                 p = line.strip().split(delim)
                 if not p or not p[0]: continue
-                # 跳过 header 行（首列不含数字，如 "utt-id"、"utterance-id"）
+                # 跳过 header 行（首列不含任何数字）
                 if not any(c.isdigit() for c in p[0]):
                     continue
-                idx2utt[data_i] = p[0]
+                egs_uttid2lineno[p[0]] = data_i
                 data_i += 1
-        print(f"   有效映射数: {len(idx2utt)}")
-        if len(idx2utt) == 0:
-            print("   ⚠️  egs 文件未读到任何映射，检查格式是否为「utt_id 其他字段...」")
+        print(f"   egs 总数据行: {len(egs_uttid2lineno)}")
+
+        # 第二步：对 summary CSV 每一行，用其 id 字段在 egs 中查找对应的 utt_id
+        # summary CSV 的 id 字段就是 egs 数据行的行号（0-based）
+        # 同时建立反向表：egs 行号 → raw_utt_id
+        lineno2uttid = {v: k for k, v in egs_uttid2lineno.items()}
+        hit = 0
+        for i, row in enumerate(egs_rows):
+            csv_id = row.get("id", "")
+            try:
+                lineno = int(csv_id)
+                raw = lineno2uttid.get(lineno)
+                if raw:
+                    idx2utt[i] = raw
+                    hit += 1
+            except (ValueError, TypeError):
+                pass
+        print(f"   summary CSV 命中 egs 行: {hit}/{n_egs}")
+        if hit == 0:
+            print("   ⚠️  未能从 egs 行号匹配！检查 summary CSV 的 id 列是否为 egs 数据行号")
+            # 打印样本帮助排查
+            sample_csv_ids = [r.get("id","") for r in egs_rows[:5]]
+            sample_egs_keys = list(egs_uttid2lineno.keys())[:5]
+            print(f"      CSV id 样本:      {sample_csv_ids}")
+            print(f"      egs utt_id 样本:  {sample_egs_keys}")
     elif egs_rows and "utt_id" in egs_rows[0]:
         print("   -> 从 CSV utt_id 列读取（fallback）")
         idx2utt = {i: r["utt_id"] for i, r in enumerate(egs_rows) if r.get("utt_id")}
