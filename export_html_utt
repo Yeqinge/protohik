@@ -24,7 +24,21 @@ def fv(row, key):
     except: return float("nan")
 
 def strip_chunk_suffix(utt_id):
+    """去掉末尾 -数字 chunk 后缀，如 abnormal-D0014_..._136-0 → abnormal-D0014_..._136"""
     return re.sub(r'-\d+$', '', utt_id)
+
+# 已知的 label 前缀列表（不区分大小写）
+_LABEL_PREFIXES = re.compile(
+    r'^(?:abnormal|normal|hard|unknown|noise|fault|'
+    r'harmful_suspect|high_influence|easy_redundant)-',
+    re.IGNORECASE
+)
+
+def strip_label_prefix(utt_id):
+    """去掉 abnormal-/normal-/... 等 label 前缀，返回纯文件名 stem。
+    如 abnormal-D0014_..._136 → D0014_..._136
+    """
+    return _LABEL_PREFIXES.sub('', utt_id)
 
 def main():
     print("\n" + "="*60)
@@ -53,7 +67,7 @@ def main():
         for item in items:
             raw_id = item.get("ID", "")
             stem = re.sub(r"\.wav$", "", raw_id, flags=re.IGNORECASE)
-            stem = strip_chunk_suffix(stem)
+            stem = strip_label_prefix(strip_chunk_suffix(stem))
             meta_map[stem] = {
                 "file_path":   item.get("file_path", ""),
                 "label":       item.get("label", ""),
@@ -97,10 +111,16 @@ def main():
             first = f.readline()
             delim = "\t" if "\t" in first else " "
         with open(args.egs, encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i >= n_egs: break
+            data_i = 0   # 数据行计数（跳过 header）
+            for line in f:
+                if data_i >= n_egs: break
                 p = line.strip().split(delim)
-                if p and p[0]: idx2utt[i] = p[0]
+                if not p or not p[0]: continue
+                # 跳过 header 行（首列不含数字，如 "utt-id"、"utterance-id"）
+                if not any(c.isdigit() for c in p[0]):
+                    continue
+                idx2utt[data_i] = p[0]
+                data_i += 1
         print(f"   有效映射数: {len(idx2utt)}")
         if len(idx2utt) == 0:
             print("   ⚠️  egs 文件未读到任何映射，检查格式是否为「utt_id 其他字段...」")
@@ -165,7 +185,7 @@ def main():
     utt2chunks = defaultdict(list)
     for i, row in enumerate(egs_rows):
         raw = idx2utt.get(i, row.get("id", str(i)))
-        utt2chunks[strip_chunk_suffix(raw)].append(i)
+        utt2chunks[strip_label_prefix(strip_chunk_suffix(raw))].append(i)
 
     utt_ids_list = sorted(utt2chunks.keys())
     n_utt = len(utt_ids_list)
