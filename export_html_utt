@@ -188,14 +188,16 @@ def main():
             if "focal_weight" in d:
                 has_weight = True
                 wt_egs[idxs[m], ei] = d["focal_weight"][m]
-            # 始终用第一个 npz 的 utt_ids 覆盖 idx2utt（保证显示真实编号）
-            if ei == 0 and "utt_ids" in d:
+            # 只在 step 2 未建立有效映射时，才用 npz 的 utt_ids 作为 fallback
+            if ei == 0 and "utt_ids" in d and len(idx2utt) == 0:
                 utt_ids_npz = d["utt_ids"].astype(str)
                 for k in range(len(ids_str)):
                     egs_i = idxs[k]
                     if egs_i >= 0:
                         idx2utt[egs_i] = utt_ids_npz[k]
-                print(f"   -> 从 npz utt_ids 覆盖映射，有效: {len(idx2utt)}")
+                print(f"   -> 从 npz utt_ids 补充映射（fallback），有效: {len(idx2utt)}")
+            elif ei == 0 and "utt_ids" in d:
+                print(f"   -> npz 含 utt_ids 但 --egs 映射已建立，跳过覆盖")
 
         epochs = sorted(epochs)
         if has_weight:
