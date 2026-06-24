@@ -247,13 +247,15 @@ def main():
     if meta_map:
         hit = sum(1 for d in utt_data if d.get("file_path") or d.get("label"))
         print(f"   meta 匹配率: {hit}/{n_utt} utterances")
-        if hit == 0:
-            # 打印诊断信息帮助排查
-            sample_utt = utt_ids_list[:2]
-            sample_meta = list(meta_map.keys())[:2]
-            print(f"   ⚠️  未命中任何条目！请检查格式：")
-            print(f"      utt_id 样本:      {sample_utt}")
-            print(f"      meta_map key 样本: {sample_meta}")
+        # 无论匹配率如何，都打印样本对比
+        miss = [d["utt_id"] for d in utt_data if not d.get("file_path") and not d.get("label")]
+        sample_utt   = utt_ids_list[:5]
+        sample_meta  = list(meta_map.keys())[:5]
+        sample_miss  = miss[:5]
+        print(f"   utt_id 样本 (聚合后):  {sample_utt}")
+        print(f"   meta key 样本:         {sample_meta}")
+        if miss:
+            print(f"   未命中 utt_id 样本:    {sample_miss}")
 
     utt_data.sort(key=lambda x: x["mean_si"] if not np.isnan(x["mean_si"]) else -1e9, reverse=True)
 
