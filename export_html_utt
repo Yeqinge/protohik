@@ -43,10 +43,10 @@ def strip_label_prefix(utt_id):
 
 def main():
     print("\n" + "="*60)
-    print("🚀 [START] Utterance 级聚合分析脚本 v4.2 启动...")
+    print("🚀 [START] Utterance 级聚合分析脚本 v4.3 启动...")
     print("="*60)
 
-    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v4.2")
+    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v4.3")
     ap.add_argument("--contrib", required=True, help="包含 contrib_epoch*.npz 和 summary CSV 的目录")
     ap.add_argument("--egs",     default="", help="可选：train.egs.csv 路径")
     ap.add_argument("--summary", default="", help="可选：明确指定 summary CSV 路径")
@@ -334,7 +334,7 @@ def main():
         if len(valid_gn):
             gn_min   = float(np.nanmin(gn_s))
             gn_scale = max(float(np.nanpercentile(valid_gn, 99)) - gn_min, 1e-9)
-        gq = np.clip((gn_s - gn_min) / gn_scale * 255, 0, 255); gq[np.isnan(gn_s)] = 255
+        gq = np.clip((gn_s - gn_min) / gn_scale * 254, 0, 254); gq[np.isnan(gn_s)] = 255
         aq = np.clip((al_s + 1.0) / 2.0 * 253, 0, 253);          aq[np.isnan(al_s)] = 254
         gn_mat_u8 = gq.astype(np.uint8)
         al_mat_u8 = aq.astype(np.uint8)
@@ -934,7 +934,7 @@ function drawTrajChart(idx){{
   const gn=[],al=[];
   for(let e=0;e<_NE;e++){{
     const b=idx*_NE+e;
-    gn.push(GN_U8[b]===255?null:_GN_MIN+(GN_U8[b]/255)*_GN_SC);
+    gn.push(GN_U8[b]===255?null:_GN_MIN+(GN_U8[b]/254)*_GN_SC);
     al.push(AL_U8[b]===254?null:(AL_U8[b]/253)*2-1);
   }}
   if(chartTraj) chartTraj.destroy();
@@ -963,8 +963,8 @@ function drawTrajChart(idx){{
       }},
       scales:{{
         x:{{grid:{{color:'#eef1f7'}},ticks:{{color:'#6b7a99',font:{{family:'IBM Plex Mono',size:10}}}}}},
-        y:{{type:'logarithmic',grid:{{color:'#eef1f7'}},ticks:{{color:'#2563eb',font:{{family:'IBM Plex Mono',size:9}},callback:v=>v.toExponential(1)}},
-          title:{{display:true,text:'grad_norm',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}}}},
+        y:{{type:'logarithmic',min:1e-9,grid:{{color:'#eef1f7'}},ticks:{{color:'#2563eb',font:{{family:'IBM Plex Mono',size:9}},callback:v=>v.toExponential(1)}},
+          title:{{display:true,text:'grad_norm (log)',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}}}},
         y2:{{position:'right',grid:{{display:false}},ticks:{{color:'#7c3aed',font:{{family:'IBM Plex Mono',size:9}}}},
           title:{{display:true,text:'align',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}}}}
       }}
