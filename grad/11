@@ -46,3 +46,28 @@ for fp in files:
 
 
 
+
+import numpy as np, glob, csv, os
+
+target_id = "309172"
+files = sorted(glob.glob("contrib/contrib_epoch*.npz"))
+
+# 重建 id2idx_egs
+with open("contrib_summary.csv", newline="") as f:
+    egs_rows = list(csv.DictReader(f))
+id2idx_egs = {r["id"]: i for i, r in enumerate(egs_rows)}
+
+print("target_id 在 id2idx_egs 中的行号:", id2idx_egs.get(target_id, "不存在"))
+print()
+
+for fp in files:
+    d = np.load(fp, allow_pickle=True)
+    ids = d["ids"].astype(str)
+    pos_in_npz = list(ids).index(target_id)          # 在 npz 里的位置
+    row_in_egs = id2idx_egs.get(target_id, -1)       # 映射到 gn_egs 的行号
+    gn_val     = d["grad_norm"][pos_in_npz]
+    print(os.path.basename(fp),
+          f"npz位置={pos_in_npz}",
+          f"→ gn_egs行={row_in_egs}",
+          f"gn={gn_val:.6e}")
+
