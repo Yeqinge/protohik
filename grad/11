@@ -71,3 +71,46 @@ for fp in files:
           f"→ gn_egs行={row_in_egs}",
           f"gn={gn_val:.6e}")
 
+import numpy as np, glob, csv
+
+target_id = "309172"
+files = sorted(glob.glob("contrib/contrib_epoch*.npz"))
+
+with open("contrib_summary.csv", newline="") as f:
+    egs_rows = list(csv.DictReader(f))
+id2idx_egs = {r["id"]: i for i, r in enumerate(egs_rows)}
+row_in_egs = id2idx_egs.get(target_id, -1)
+print(f"gn_egs 行号: {row_in_egs}")
+
+# 重建 gn_egs 这一行
+ne = len(files)
+gn_row = np.full(ne, np.nan, dtype=np.float32)
+for ei, fp in enumerate(files):
+    d = np.load(fp, allow_pickle=True)
+    ids = d["ids"].astype(str)
+    idxs = np.array([id2idx_egs.get(s, -1) for s in ids], dtype=np.int64)
+    m = idxs >= 0
+    gn_tmp = np.full(len(egs_rows), np.nan, dtype=np.float32)
+    gn_tmp[idxs[m]] = d["grad_norm"][m]
+    gn_row[ei] = gn_tmp[row_in_egs]
+
+print(f"gn_row (填充后): {gn_row}")
+
+# 模拟量化
+valid = gn_row[~np.isnan(gn_row)]
+
+# 先用全量数据算 gn_min / gn_scale（需要所有样本，这里只用这一行近似验证）
+# 实际 gn_scale 取决于全局 p99，手动指定一个估计值
+gn_min   = float(np.nanmin(gn_row))
+gn_scale = float(np.nanpercentile(valid, 99)) - gn_min
+gn_scale = max(gn_scale, 1e-9)
+print(f"gn_min={gn_min:.4e}  gn_scale={gn_scale:.4e}")
+
+quantized = np.clip((gn_row - gn_min) / gn_scale * 255, 0, 255)
+quantized[np.isnan(gn_row)] = 255
+quantized_u8 = quantized.astype(np.uint8)
+print(f"量化后 uint8: {quantized_u8}")
+
+# 反量化
+decoded = [None if v == 255 else gn_min + (v / 255) * gn_scale for v in quantized_u8]
+print(f"反量化: {decoded}")
