@@ -34,5 +34,15 @@ for fp in files:
         gn_egs_row.append(float("nan"))
 print("gn_egs[309172, :] =", gn_egs_row)
 
+import numpy as np, glob
+
+target_id = "309172"
+files = sorted(glob.glob("contrib/contrib_epoch*.npz"))
+
+for fp in files:
+    d = np.load(fp, allow_pickle=True)
+    ids = d["ids"].astype(str)
+    print(os.path.basename(fp), "含目标:", target_id in ids, "总样本数:", len(ids))
+
 
 
