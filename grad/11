@@ -1,14 +1,7 @@
-import numpy as np, glob
-
-files = sorted(glob.glob("contrib/contrib_epoch*.npz"))
-# 找一个你认为 gn 只有两三个 epoch 的样本 id
-target_id = "12345"   # 换成你实际看到的那个
-
-for f in files:
-    d = np.load(f)
-    ids = d["ids"].astype(str)
-    if target_id in ids:
-        idx = list(ids).index(target_id)
-        print(f, "gn:", d["grad_norm"][idx], "al:", d["align"][idx])
-    else:
-        print(f, "-- 该样本不在此 epoch --")
+import csv
+with open("contrib_summary.csv") as f:
+    rows = list(csv.DictReader(f))
+ids_in_csv = {r["id"] for r in rows}
+print("309172 in csv:", "309172" in ids_in_csv)
+print("n_egs:", len(rows))
+print("309172 as int >= n_egs:", int("309172") >= len(rows))
