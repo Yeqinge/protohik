@@ -4,6 +4,12 @@
 export_html_utt.py —— Utterance 级样本贡献度分析可视化工具 v4
 新增 weight 字段：epoch 轨迹 + utterance 级聚合 (mean_weight / weight_std)
 去掉 dup_ratio，修复搜索，列头点击排序升降序，导出 CSV，亮色主题
+
+修复说明（v4.1）：
+  gn_egs / al_egs / wt_egs 填充时，原来先尝试把 id 字段的整数值直接当矩阵行号，
+  但 summary CSV 按 self_influence 降序排列，id 与物理行号完全不对应，
+  导致几乎所有样本的轨迹图数据错位或全为 nan。
+  修复：统一通过 id2idx_egs（id字符串 → CSV物理行号）查行号，删除整数强转分支。
 """
 
 import argparse
@@ -24,10 +30,8 @@ def fv(row, key):
     except: return float("nan")
 
 def strip_chunk_suffix(utt_id):
-    """去掉末尾 -数字 chunk 后缀，如 abnormal-D0014_..._136-0 → abnormal-D0014_..._136"""
     return re.sub(r'-\d+$', '', utt_id)
 
-# 已知的 label 前缀列表（不区分大小写）
 _LABEL_PREFIXES = re.compile(
     r'^(?:abnormal|normal|hard|unknown|noise|fault|'
     r'harmful_suspect|high_influence|easy_redundant)-',
@@ -35,17 +39,14 @@ _LABEL_PREFIXES = re.compile(
 )
 
 def strip_label_prefix(utt_id):
-    """去掉 abnormal-/normal-/... 等 label 前缀，返回纯文件名 stem。
-    如 abnormal-D0014_..._136 → D0014_..._136
-    """
     return _LABEL_PREFIXES.sub('', utt_id)
 
 def main():
     print("\n" + "="*60)
-    print("🚀 [START] Utterance 级聚合分析脚本 v4 启动...")
+    print("🚀 [START] Utterance 级聚合分析脚本 v4.2 启动...")
     print("="*60)
 
-    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v4")
+    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v4.2")
     ap.add_argument("--contrib", required=True, help="包含 contrib_epoch*.npz 和 summary CSV 的目录")
     ap.add_argument("--egs",     default="", help="可选：train.egs.csv 路径")
     ap.add_argument("--summary", default="", help="可选：明确指定 summary CSV 路径")
@@ -56,9 +57,8 @@ def main():
     print(f"📍 CWD: {os.getcwd()}")
     print(f"📁 --contrib: {os.path.abspath(args.contrib)}")
 
-
     # ── 0. 加载 JSON 元信息（可选）──
-    meta_map = {}   # utt_id_stem → dict
+    meta_map = {}
     if args.meta and os.path.exists(args.meta):
         print(f"\n[0/5] 加载 JSON 元信息: {args.meta}")
         with open(args.meta, encoding="utf-8") as f:
@@ -74,12 +74,10 @@ def main():
                 "duration":    item.get("duration", ""),
                 "time_point":  item.get("time_point", ""),
             }
-            # key1: file_path 的 basename stem（去路径、去.wav）—— 和 egs utt_id 来自同一命名体系
             fp = item.get("file_path", "") or item.get("ID", "")
             fp_stem = re.sub(r"\.wav$", "", os.path.basename(fp), flags=re.IGNORECASE)
             if fp_stem:
                 meta_map[fp_stem] = entry
-            # key2: ID stem（兼容旧格式）
             raw_id = item.get("ID", "")
             id_stem = re.sub(r"\.wav$", "", raw_id, flags=re.IGNORECASE)
             if id_stem and id_stem != fp_stem:
@@ -109,31 +107,25 @@ def main():
     print(f"   egs 样本数: {n_egs}")
 
     # ── 2. sample_id → utt_id 映射 ──
-    # 优先级：--egs 外挂文件 > CSV utt_id 列 > 数字 id（fallback）
     print("\n[2/5] 建立 sample_id → utt_id 映射 ...")
-    idx2utt = {}   # csv_row_index → raw_utt_id（含 label 前缀和 chunk 后缀）
+    idx2utt = {}
     if args.egs and os.path.exists(args.egs):
         print(f"   -> 从外挂 egs 文件读取: {args.egs}")
-        # 第一步：把 egs 整个文件读完，建立 raw_utt_id → 行号 的映射
         with open(args.egs, encoding="utf-8") as f:
             first = f.readline()
             delim = "\t" if "\t" in first else " "
-        egs_uttid2lineno = {}   # raw_utt_id(含前缀和chunk后缀) → egs 中的数据行号(0-based)
+        egs_uttid2lineno = {}
         with open(args.egs, encoding="utf-8") as f:
             data_i = 0
             for line in f:
                 p = line.strip().split(delim)
                 if not p or not p[0]: continue
-                # 跳过 header 行（首列不含任何数字）
                 if not any(c.isdigit() for c in p[0]):
                     continue
                 egs_uttid2lineno[p[0]] = data_i
                 data_i += 1
         print(f"   egs 总数据行: {len(egs_uttid2lineno)}")
 
-        # 第二步：对 summary CSV 每一行，用其 id 字段在 egs 中查找对应的 utt_id
-        # summary CSV 的 id 字段就是 egs 数据行的行号（0-based）
-        # 同时建立反向表：egs 行号 → raw_utt_id
         lineno2uttid = {v: k for k, v in egs_uttid2lineno.items()}
         hit = 0
         for i, row in enumerate(egs_rows):
@@ -149,8 +141,7 @@ def main():
         print(f"   summary CSV 命中 egs 行: {hit}/{n_egs}")
         if hit == 0:
             print("   ⚠️  未能从 egs 行号匹配！检查 summary CSV 的 id 列是否为 egs 数据行号")
-            # 打印样本帮助排查
-            sample_csv_ids = [r.get("id","") for r in egs_rows[:5]]
+            sample_csv_ids  = [r.get("id", "") for r in egs_rows[:5]]
             sample_egs_keys = list(egs_uttid2lineno.keys())[:5]
             print(f"      CSV id 样本:      {sample_csv_ids}")
             print(f"      egs utt_id 样本:  {sample_egs_keys}")
@@ -166,11 +157,16 @@ def main():
     files = sorted(glob.glob(os.path.join(args.contrib, "contrib_epoch*.npz")))
     print(f"   找到 {len(files)} 个 .npz")
 
+    # ── 修复：统一用 id字符串 → CSV物理行号 的映射 ──
+    # 原来的逻辑：先尝试把 id 整数值直接当行号（idxs = ids_str.astype(np.int64)），
+    # summary CSV 按 self_influence 降序排，id 与物理行号完全不对应，
+    # 导致轨迹数据全部错位。现在删除该分支，统一走 id2idx_egs。
     id2idx_egs = {r["id"]: i for i, r in enumerate(egs_rows)}
+
     epochs = []
     gn_egs = al_egs = wt_egs = None
-    has_traj = len(files) > 0
-    has_weight = False   # 是否任意一个 npz 含有 focal_weight 字段
+    has_traj   = len(files) > 0
+    has_weight = False
 
     if has_traj:
         ne = len(files)
@@ -183,19 +179,23 @@ def main():
             epochs.append(ep)
             d = np.load(fp, allow_pickle=True)
             ids_str = d["ids"].astype(str)
-            try:
-                idxs = ids_str.astype(np.int64)
-                if idxs.max() >= n_egs or idxs.min() < 0: raise ValueError
-            except (ValueError, OverflowError):
-                idxs = np.array([id2idx_egs.get(s, -1) for s in ids_str], dtype=np.int64)
-            m = idxs >= 0
+
+            # 统一通过 id2idx_egs 查 CSV 物理行号，-1 表示未命中
+            idxs = np.array([id2idx_egs.get(s, -1) for s in ids_str], dtype=np.int64)
+            m    = idxs >= 0
+
+            if ei == 0 and not m.any():
+                print(f"  ⚠️  epoch {ei}: 没有任何 id 命中 summary CSV，检查 id 格式是否一致")
+                print(f"      npz id 样本:  {list(ids_str[:5])}")
+                print(f"      csv id 样本:  {list(id2idx_egs.keys())[:5]}")
+
             gn_egs[idxs[m], ei] = d["grad_norm"][m]
             al_egs[idxs[m], ei] = d["align"][m]
-            # focal_weight 字段（可选）
             if "focal_weight" in d:
                 has_weight = True
                 wt_egs[idxs[m], ei] = d["focal_weight"][m]
-            # 只在 step 2 未建立有效映射时，才用 npz 的 utt_ids 作为 fallback
+
+            # utt_ids fallback：只在 step2 未建立有效映射时才用
             if ei == 0 and "utt_ids" in d and len(idx2utt) == 0:
                 utt_ids_npz = d["utt_ids"].astype(str)
                 for k in range(len(ids_str)):
@@ -207,6 +207,8 @@ def main():
                 print(f"   -> npz 含 utt_ids 但 --egs 映射已建立，跳过覆盖")
 
         epochs = sorted(epochs)
+        last_hit = int(m.sum())
+        print(f"   轨迹命中率（最后 epoch）: {last_hit}/{len(ids_str)}")
         if has_weight:
             print(f"   ✅ 检测到 focal_weight 字段（将生成 focal_weight 轨迹）")
         else:
@@ -217,11 +219,10 @@ def main():
     utt2chunks = defaultdict(list)
     for i, row in enumerate(egs_rows):
         raw = idx2utt.get(i, row.get("id", str(i)))
-        # 去 chunk 后缀 → 去 label 前缀 → 去 .wav 后缀 → 取 basename
         key = strip_chunk_suffix(raw)
         key = strip_label_prefix(key)
         key = re.sub(r'\.wav$', '', key, flags=re.IGNORECASE)
-        key = os.path.basename(key)   # 万一含路径也处理掉
+        key = os.path.basename(key)
         utt2chunks[key].append(i)
 
     utt_ids_list = sorted(utt2chunks.keys())
@@ -241,10 +242,8 @@ def main():
         si = arr("self_influence"); gn = arr("mean_grad_norm")
         al = arr("mean_align");     fn = arr("frac_neg_align")
         fo = arr("forget_events");  fc = arr("final_correct")
-        # mean_wt / wt_std 从 wt_egs 轨迹矩阵直接计算（不依赖 CSV 列）
 
         gn_std = sd(gn)
-
         tags      = [TAG_MAP.get(egs_rows[i].get("tag", "normal"), 4) for i in idxs]
         worst_tag = min(tags)
 
@@ -255,8 +254,7 @@ def main():
             al_traj = np.nanmean(al_egs[idxs, :], axis=0)
             if has_weight:
                 wt_traj = np.nanmean(wt_egs[idxs, :], axis=0)
-                # 对所有 chunk × 所有 epoch 的 focal_weight 求全局均值和标准差
-                wt_flat = wt_egs[idxs, :].flatten()
+                wt_flat  = wt_egs[idxs, :].flatten()
                 wt_valid = wt_flat[~np.isnan(wt_flat)]
                 if len(wt_valid):
                     mean_wt = float(np.mean(wt_valid))
@@ -282,17 +280,13 @@ def main():
         ))
 
     if meta_map:
-        hit = sum(1 for d in utt_data if d.get("file_path") or d.get("label"))
-        print(f"   meta 匹配率: {hit}/{n_utt} utterances")
-        # 无论匹配率如何，都打印样本对比
+        hit  = sum(1 for d in utt_data if d.get("file_path") or d.get("label"))
         miss = [d["utt_id"] for d in utt_data if not d.get("file_path") and not d.get("label")]
-        sample_utt   = utt_ids_list[:5]
-        sample_meta  = list(meta_map.keys())[:5]
-        sample_miss  = miss[:5]
-        print(f"   utt_id 样本 (聚合后):  {sample_utt}")
-        print(f"   meta key 样本:         {sample_meta}")
+        print(f"   meta 匹配率: {hit}/{n_utt} utterances")
+        print(f"   utt_id 样本 (聚合后):  {utt_ids_list[:5]}")
+        print(f"   meta key 样本:         {list(meta_map.keys())[:5]}")
         if miss:
-            print(f"   未命中 utt_id 样本:    {sample_miss}")
+            print(f"   未命中 utt_id 样本:    {miss[:5]}")
 
     utt_data.sort(key=lambda x: x["mean_si"] if not np.isnan(x["mean_si"]) else -1e9, reverse=True)
 
@@ -358,28 +352,20 @@ def main():
     utt_bytes = "\n".join(d["utt_id"] for d in utt_data).encode("utf-8")
     utt_len   = len(utt_bytes)
 
-    # Header 布局（80 bytes）:
-    #   int32 × 4  : n_u, ne, utt_len, flags   (flags bit0=has_traj, bit1=has_weight)
-    #   float32 × 2: gn_min, gn_scale
-    #   float32 × 2: wt_min, wt_scale
-    #   padding     : 64 - 32 = 48 bytes  → total 80 bytes
-    flags = (1 if has_traj else 0) | (2 if has_weight else 0)
+    flags    = (1 if has_traj else 0) | (2 if has_weight else 0)
     bin_path = os.path.splitext(args.output)[0] + "_utt.bin"
     with open(bin_path, "wb") as fb:
-        fb.write(np.array([n_u, ne, utt_len, flags], dtype=np.int32).tobytes())   # 16 B
-        fb.write(np.array([gn_min, gn_scale], dtype=np.float32).tobytes())        # 8 B
-        fb.write(np.array([wt_min, wt_scale], dtype=np.float32).tobytes())        # 8 B
-        fb.write(b"\x00" * 48)   # padding → header 共 80 bytes
-        # 数值数组
+        fb.write(np.array([n_u, ne, utt_len, flags], dtype=np.int32).tobytes())
+        fb.write(np.array([gn_min, gn_scale], dtype=np.float32).tobytes())
+        fb.write(np.array([wt_min, wt_scale], dtype=np.float32).tobytes())
+        fb.write(b"\x00" * 48)
         for a in [n_chunks_arr, mean_si_arr, max_si_arr,
                   mean_gn_arr, max_gn_arr, gn_std_arr,
                   mean_al_arr, mean_fn_arr,
                   mean_wt_arr, wt_std_arr,
                   tags_arr]:
             fb.write(a.tobytes())
-        # utt_id 字符串块
         fb.write(utt_bytes)
-        # 轨迹矩阵（按 gn / al / wt 顺序）
         if has_traj and gn_mat_u8 is not None:
             fb.write(gn_mat_u8.flatten().tobytes())
             fb.write(al_mat_u8.flatten().tobytes())
@@ -388,7 +374,6 @@ def main():
 
     print(f"   ✅ .bin  {os.path.getsize(bin_path)/1e6:.2f} MB → {os.path.abspath(bin_path)}")
 
-    # 导出 meta JSON（前端筛选/展示用）
     meta_out = []
     for d in utt_data:
         meta_out.append({
@@ -445,11 +430,7 @@ def make_html(bin_filename, meta_filename, epochs, n_u):
 }}
 *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0;}}
 html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sans);overflow:hidden;font-size:13px;}}
-
-/* ── Layout ── */
 .layout{{display:grid;grid-template-columns:560px 1fr;grid-template-rows:52px 1fr;height:100vh;}}
-
-/* ── Header ── */
 .header{{grid-column:1/-1;display:flex;align-items:center;padding:0 18px;gap:12px;
   border-bottom:1px solid var(--bdr);background:var(--surf);box-shadow:var(--shadow);z-index:10;}}
 .htitle{{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--ac);letter-spacing:.04em;}}
@@ -458,8 +439,6 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .hstatus{{font-size:11px;color:var(--ac);font-family:var(--mono);padding:2px 8px;
   border:1px solid var(--bdr2);border-radius:4px;animation:pulse 1.4s infinite;}}
 @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.4}}}}
-
-/* ── Tag badges ── */
 .badge{{display:inline-flex;align-items:center;padding:2px 7px;border-radius:4px;
   font-size:10px;font-family:var(--mono);font-weight:500;border:1px solid;white-space:nowrap;}}
 .badge.harmful_suspect{{color:var(--harmful);border-color:#fca5a5;background:var(--harmful-bg);}}
@@ -467,131 +446,78 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .badge.high_influence{{color:var(--inf);border-color:#c4b5fd;background:var(--inf-bg);}}
 .badge.easy_redundant{{color:var(--easy);border-color:#86efac;background:var(--easy-bg);}}
 .badge.normal{{color:var(--mt);border-color:var(--bdr2);background:var(--surf2);}}
-
-/* ── Left panel ── */
-.panel-left{{display:flex;flex-direction:column;background:var(--surf);
-  border-right:1px solid var(--bdr);overflow:hidden;}}
-
-/* ── Controls ── */
-.controls{{padding:10px 12px;border-bottom:1px solid var(--bdr);
-  display:flex;flex-direction:column;gap:7px;background:var(--surf2);}}
+.panel-left{{display:flex;flex-direction:column;background:var(--surf);border-right:1px solid var(--bdr);overflow:hidden;}}
+.controls{{padding:10px 12px;border-bottom:1px solid var(--bdr);display:flex;flex-direction:column;gap:7px;background:var(--surf2);}}
 .search-wrap{{position:relative;display:flex;align-items:center;}}
-.search-wrap svg{{position:absolute;left:9px;width:14px;height:14px;
-  color:var(--mt2);pointer-events:none;flex-shrink:0;}}
-#search{{width:100%;padding:7px 32px 7px 30px;background:var(--surf);
-  border:1px solid var(--bdr2);color:var(--tx);font-family:var(--mono);
-  font-size:11px;outline:none;border-radius:var(--radius);
-  transition:border-color .15s,box-shadow .15s;}}
+.search-wrap svg{{position:absolute;left:9px;width:14px;height:14px;color:var(--mt2);pointer-events:none;flex-shrink:0;}}
+#search{{width:100%;padding:7px 32px 7px 30px;background:var(--surf);border:1px solid var(--bdr2);color:var(--tx);font-family:var(--mono);font-size:11px;outline:none;border-radius:var(--radius);transition:border-color .15s,box-shadow .15s;}}
 #search:focus{{border-color:var(--ac);box-shadow:0 0 0 3px rgba(37,99,235,.12);}}
-#search-clear{{position:absolute;right:8px;cursor:pointer;background:none;border:none;
-  color:var(--mt2);font-size:14px;line-height:1;padding:2px;display:none;}}
+#search-clear{{position:absolute;right:8px;cursor:pointer;background:none;border:none;color:var(--mt2);font-size:14px;line-height:1;padding:2px;display:none;}}
 #search-clear:hover{{color:var(--tx);}}
 .filter-row{{display:flex;gap:6px;}}
-.filter-row select{{flex:1;padding:5px 8px;background:var(--surf);border:1px solid var(--bdr2);
-  color:var(--tx);font-family:var(--mono);font-size:11px;outline:none;
-  border-radius:var(--radius);cursor:pointer;}}
+.filter-row select{{flex:1;padding:5px 8px;background:var(--surf);border:1px solid var(--bdr2);color:var(--tx);font-family:var(--mono);font-size:11px;outline:none;border-radius:var(--radius);cursor:pointer;}}
 .filter-row select:focus{{border-color:var(--ac);}}
-.export-btn{{padding:5px 12px;background:var(--ac);color:#fff;border:none;
-  border-radius:var(--radius);font-family:var(--mono);font-size:10px;font-weight:500;
-  cursor:pointer;letter-spacing:.02em;transition:background .15s;white-space:nowrap;}}
+.export-btn{{padding:5px 12px;background:var(--ac);color:#fff;border:none;border-radius:var(--radius);font-family:var(--mono);font-size:10px;font-weight:500;cursor:pointer;letter-spacing:.02em;transition:background .15s;white-space:nowrap;}}
 .export-btn:hover{{background:var(--ac2);}}
-
-/* ── Table header ── */
-.list-header{{display:grid;grid-template-columns:38px 1fr 46px 60px 60px 60px 106px;
-  align-items:center;padding:0 12px;gap:4px;height:28px;
-  border-bottom:2px solid var(--bdr);background:var(--surf3);
-  font-family:var(--mono);font-size:9px;color:var(--mt);
-  text-transform:uppercase;letter-spacing:.05em;user-select:none;}}
-.th{{cursor:pointer;display:flex;align-items:center;gap:3px;padding:2px 3px;
-  border-radius:3px;transition:background .1s,color .1s;white-space:nowrap;}}
+.list-header{{display:grid;grid-template-columns:38px 1fr 46px 60px 60px 60px 106px;align-items:center;padding:0 12px;gap:4px;height:28px;border-bottom:2px solid var(--bdr);background:var(--surf3);font-family:var(--mono);font-size:9px;color:var(--mt);text-transform:uppercase;letter-spacing:.05em;user-select:none;}}
+.th{{cursor:pointer;display:flex;align-items:center;gap:3px;padding:2px 3px;border-radius:3px;transition:background .1s,color .1s;white-space:nowrap;}}
 .th:hover{{background:var(--bdr);color:var(--tx);}}
 .th.active{{color:var(--ac);font-weight:600;}}
 .th .arrow{{font-size:8px;opacity:.7;}}
-.th-r{{justify-content:flex-end;}}
-.th-c{{justify-content:center;}}
-
-/* ── Virtual list ── */
+.th-r{{justify-content:flex-end;}} .th-c{{justify-content:center;}}
 .vlist{{flex:1;overflow-y:auto;position:relative;}}
 .vlist::-webkit-scrollbar{{width:5px;}}
 .vlist::-webkit-scrollbar-track{{background:var(--surf2);}}
 .vlist::-webkit-scrollbar-thumb{{background:var(--bdr2);border-radius:3px;}}
 .vlist::-webkit-scrollbar-thumb:hover{{background:var(--mt2);}}
 #vinner{{position:relative;}}
-
-.srow{{display:grid;grid-template-columns:38px 1fr 46px 60px 60px 60px 106px;
-  align-items:center;padding:0 12px;cursor:pointer;gap:4px;
-  border-bottom:1px solid var(--bdr);height:36px;
-  position:absolute;width:100%;transition:background .08s;}}
+.srow{{display:grid;grid-template-columns:38px 1fr 46px 60px 60px 60px 106px;align-items:center;padding:0 12px;cursor:pointer;gap:4px;border-bottom:1px solid var(--bdr);height:36px;position:absolute;width:100%;transition:background .08s;}}
 .srow:hover{{background:var(--surf2);}}
 .srow.sel{{background:var(--ac-bg);border-left:3px solid var(--ac);padding-left:9px;}}
 .s-rank{{font-family:var(--mono);font-size:10px;color:var(--mt2);}}
-.s-uid{{font-family:var(--mono);font-size:10.5px;color:var(--tx);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+.s-uid{{font-family:var(--mono);font-size:10.5px;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .s-uid mark{{background:rgba(37,99,235,.15);color:var(--ac);border-radius:2px;padding:0 1px;}}
 .s-nc{{text-align:center;font-size:10px;font-family:var(--mono);color:var(--mt);}}
 .s-gn,.s-al,.s-wt{{text-align:right;font-size:10px;font-family:var(--mono);color:var(--mt);}}
 .s-al.pos{{color:var(--easy);}} .s-al.neg{{color:var(--harmful);}}
 .s-wt.hi{{color:var(--wt);font-weight:500;}}
 .col-tag{{justify-self:end;}}
-
-/* ── Pagination ── */
-.pagination{{padding:6px 12px;border-top:1px solid var(--bdr);display:flex;align-items:center;
-  gap:8px;font-family:var(--mono);font-size:10px;color:var(--mt);background:var(--surf2);}}
-.pagination button{{padding:3px 10px;background:var(--surf);border:1px solid var(--bdr2);
-  color:var(--tx);font-family:var(--mono);font-size:10px;cursor:pointer;border-radius:4px;transition:all .1s;}}
+.pagination{{padding:6px 12px;border-top:1px solid var(--bdr);display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:10px;color:var(--mt);background:var(--surf2);}}
+.pagination button{{padding:3px 10px;background:var(--surf);border:1px solid var(--bdr2);color:var(--tx);font-family:var(--mono);font-size:10px;cursor:pointer;border-radius:4px;transition:all .1s;}}
 .pagination button:disabled{{opacity:.35;cursor:default;}}
 .pagination button:not(:disabled):hover{{border-color:var(--ac);color:var(--ac);background:var(--ac-bg);}}
 .pginfo{{flex:1;text-align:center;}}
-
-/* ── Right panel ── */
 .panel-right{{display:flex;flex-direction:column;overflow:hidden;background:var(--bg);}}
-
-/* ── Detail header ── */
-.chart-hdr{{padding:14px 20px 12px;border-bottom:1px solid var(--bdr);
-  background:var(--surf);box-shadow:var(--shadow);display:flex;align-items:flex-start;gap:16px;}}
+.chart-hdr{{padding:14px 20px 12px;border-bottom:1px solid var(--bdr);background:var(--surf);box-shadow:var(--shadow);display:flex;align-items:flex-start;gap:16px;}}
 .chdr-left{{display:flex;flex-direction:column;gap:5px;min-width:0;flex:1;}}
-.ctitle{{font-family:var(--mono);font-size:12px;color:var(--tx);font-weight:600;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+.ctitle{{font-family:var(--mono);font-size:12px;color:var(--tx);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
 .csub{{font-family:var(--mono);font-size:10px;color:var(--mt);}}
 .stat-grid{{display:flex;gap:14px;flex-shrink:0;flex-wrap:wrap;}}
 .stat-item{{text-align:right;}}
 .slbl{{font-size:9px;color:var(--mt);font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em;}}
 .sval{{font-size:15px;font-family:var(--mono);font-weight:600;color:var(--tx);margin-top:1px;}}
 .sval.wt-val{{color:var(--wt);}}
-
-/* ── Chart tabs ── */
-.chart-tabs{{display:flex;gap:0;border-bottom:1px solid var(--bdr);
-  background:var(--surf);padding:0 20px;}}
-.ctab{{padding:8px 16px;font-family:var(--mono);font-size:11px;color:var(--mt);
-  cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;
-  transition:color .15s,border-color .15s;user-select:none;}}
+.chart-tabs{{display:flex;gap:0;border-bottom:1px solid var(--bdr);background:var(--surf);padding:0 20px;}}
+.ctab{{padding:8px 16px;font-family:var(--mono);font-size:11px;color:var(--mt);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color .15s,border-color .15s;user-select:none;}}
 .ctab:hover{{color:var(--tx);}}
 .ctab.active{{color:var(--ac);border-bottom-color:var(--ac);font-weight:600;}}
 .ctab.wt-tab.active{{color:var(--wt);border-bottom-color:var(--wt);}}
-.ctab[data-tab="wt"]{{display:none;}}  /* hidden until weight is confirmed present */
+.ctab[data-tab="wt"]{{display:none;}}
 .ctab[data-tab="wt"].show{{display:block;}}
-
-/* ── Chart area ── */
 .chart-area{{flex:1;padding:16px 24px 14px;display:flex;flex-direction:column;gap:10px;overflow:hidden;}}
 .chart-wrap{{flex:1;position:relative;min-height:0;}}
 .chart-wrap canvas{{position:absolute;inset:0;}}
 .chart-panel{{display:none;flex:1;flex-direction:column;gap:10px;}}
 .chart-panel.active{{display:flex;}}
-.placeholder{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
-  gap:10px;color:var(--mt2);font-family:var(--mono);}}
+.placeholder{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--mt2);font-family:var(--mono);}}
 .phi{{font-size:40px;opacity:.25;}}
 .placeholder p{{font-size:11px;}}
 .legend{{display:flex;gap:20px;font-family:var(--mono);font-size:10px;color:var(--mt);flex-wrap:wrap;}}
 .li{{display:flex;align-items:center;gap:6px;}}
 .ld{{width:8px;height:8px;border-radius:50%;}}
 .ld.gn{{background:#2563eb;}} .ld.al{{background:#7c3aed;}} .ld.wt{{background:#0891b2;}}
-
-/* ── Weight mini-bar in list ── */
 .wt-bar{{position:absolute;bottom:0;left:0;height:2px;background:var(--wt);opacity:.5;border-radius:0 1px 1px 0;}}
-
-/* ── Meta info bar (right panel, below chart-hdr) ── */
-.meta-bar{{padding:8px 20px;border-bottom:1px solid var(--bdr);background:var(--surf2);
-  display:none;flex-wrap:wrap;gap:6px 18px;font-family:var(--mono);font-size:10px;}}
+.meta-bar{{padding:8px 20px;border-bottom:1px solid var(--bdr);background:var(--surf2);display:none;flex-wrap:wrap;gap:6px 18px;font-family:var(--mono);font-size:10px;}}
 .meta-bar.show{{display:flex;}}
 .meta-kv{{display:flex;gap:5px;align-items:baseline;min-width:0;}}
 .meta-k{{color:var(--mt2);text-transform:uppercase;font-size:9px;letter-spacing:.04em;white-space:nowrap;}}
@@ -629,7 +555,7 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
           <option value="3">↓ easy_redundant</option>
           <option value="4">· normal</option>
         </select>
-        <select id="wt-f" onchange="rebuild()" style="display:none;" id="wt-filter-sel">
+        <select id="wt-f" onchange="rebuild()" style="display:none;">
           <option value="0">全部 Weight</option>
           <option value="1">高权重 (≥0.75)</option>
           <option value="2">中权重 (0.25–0.75)</option>
@@ -638,15 +564,9 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
         <button class="export-btn" onclick="exportCSV()">⬇ CSV</button>
       </div>
       <div class="filter-row" id="meta-filters" style="display:none;">
-        <select id="label-f" onchange="rebuild()">
-          <option value="">全部 Label</option>
-        </select>
-        <select id="detector-f" onchange="rebuild()">
-          <option value="">全部 Detector</option>
-        </select>
-        <select id="project-f" onchange="rebuild()">
-          <option value="">全部 Project</option>
-        </select>
+        <select id="label-f" onchange="rebuild()"><option value="">全部 Label</option></select>
+        <select id="detector-f" onchange="rebuild()"><option value="">全部 Detector</option></select>
+        <select id="project-f" onchange="rebuild()"><option value="">全部 Project</option></select>
       </div>
     </div>
 
@@ -660,9 +580,7 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
       <span class="th th-r" onclick="setSort('tag')" id="th-tag">tag<span class="arrow"></span></span>
     </div>
 
-    <div class="vlist" id="vlist">
-      <div id="vinner"></div>
-    </div>
+    <div class="vlist" id="vlist"><div id="vinner"></div></div>
 
     <div class="pagination">
       <button id="bp" onclick="prevPage()" disabled>◀</button>
@@ -675,12 +593,11 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
     <div class="chart-hdr">
       <div class="chdr-left">
         <div class="ctitle" id="ctitle">— 点击左侧选择一条 utterance —</div>
-        <div class="csub"   id="csub"></div>
+        <div class="csub" id="csub"></div>
       </div>
       <div class="stat-grid" id="stat-grid"></div>
     </div>
 
-    <!-- Meta info bar -->
     <div class="meta-bar" id="meta-bar">
       <div class="meta-kv"><span class="meta-k">label</span><span class="meta-v" id="m-label"></span></div>
       <div class="meta-kv"><span class="meta-k">detector</span><span class="meta-v" id="m-detector"></span></div>
@@ -692,20 +609,16 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
         <span class="meta-v fp" id="m-path" title="点击复制" onclick="copyPath(this)"></span></div>
     </div>
 
-    <!-- Chart tabs -->
     <div class="chart-tabs" id="chart-tabs" style="display:none;">
       <div class="ctab active" data-tab="traj" onclick="switchTab('traj')">梯度 / 对齐 轨迹</div>
       <div class="ctab wt-tab" data-tab="wt" onclick="switchTab('wt')">权重轨迹</div>
     </div>
 
     <div class="chart-area">
-      <!-- placeholder -->
       <div id="ph" class="placeholder">
         <div class="phi">◈</div>
         <p>选择 utterance 后，此处显示各 epoch 的梯度均值轨迹</p>
       </div>
-
-      <!-- traj panel -->
       <div id="panel-traj" class="chart-panel">
         <div class="chart-wrap"><canvas id="chartTraj"></canvas></div>
         <div class="legend">
@@ -713,8 +626,6 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
           <div class="li"><div class="ld al"></div>align 均值（右轴）</div>
         </div>
       </div>
-
-      <!-- weight panel -->
       <div id="panel-wt" class="chart-panel">
         <div class="chart-wrap"><canvas id="chartWt"></canvas></div>
         <div class="legend">
@@ -731,54 +642,34 @@ const META_URL  = "{meta_filename}";
 const EPOCHS    = {epochs};
 const TAG_NAMES = ["harmful_suspect","hard","high_influence","easy_redundant","normal"];
 
-// ── 全局数据 ──
-let _N, _NE, HAS_TRAJ, HAS_WEIGHT;
-let _GN_MIN, _GN_SC, _WT_MIN, _WT_SC;
-let N_CHUNKS, MEAN_SI, MAX_SI, MEAN_GN, MAX_GN, GN_STD, MEAN_AL, MEAN_FN;
-let MEAN_WT, WT_STD, TAGS, UTT_IDS;
-let GN_U8=null, AL_U8=null, WT_U8=null;
-let META=null;  // array of {{file_path,label,detector_id,...}}
+let _N,_NE,HAS_TRAJ,HAS_WEIGHT;
+let _GN_MIN,_GN_SC,_WT_MIN,_WT_SC;
+let N_CHUNKS,MEAN_SI,MAX_SI,MEAN_GN,MAX_GN,GN_STD,MEAN_AL,MEAN_FN;
+let MEAN_WT,WT_STD,TAGS,UTT_IDS;
+let GN_U8=null,AL_U8=null,WT_U8=null;
+let META=null;
 
-// ── 状态 ──
-const PAGE=100, ROW_H=36;
-let filtered=null, pageStart=0, selIdx=-1;
-let chartTraj=null, chartWt=null;
-let stimer=null;
-let sortKey='si', sortAsc=false;
-let activeTab='traj';
-let wtMax=1.0; // for normalizing bar widths
+const PAGE=100,ROW_H=36;
+let filtered=null,pageStart=0,selIdx=-1;
+let chartTraj=null,chartWt=null,stimer=null;
+let sortKey='si',sortAsc=false,activeTab='traj',wtMax=1.0;
 
-// ── 列头 id 映射 ──
 const TH_IDS={{rank:'th-rank',uid:'th-uid',nc:'th-nc',gn:'th-gn',al:'th-al',wt:'th-wt',tag:'th-tag'}};
 
-// ── 数据加载 ──
 async function loadBinaryData(){{
   try{{
-    const res = await fetch(DATA_URL);
+    const res=await fetch(DATA_URL);
     if(!res.ok) throw new Error("无法读取 .bin，请用 Web Server 打开（python -m http.server）");
-    const buf = await res.arrayBuffer();
-
-    // Header: 80 bytes
-    // int32[4] = n_u, ne, utt_len, flags   (flags: bit0=has_traj, bit1=has_weight)
-    // float32[2] = gn_min, gn_scale
-    // float32[2] = wt_min, wt_scale
-    // padding 48 bytes
+    const buf=await res.arrayBuffer();
     const mi=new Int32Array(buf,0,4);
-    _N=mi[0]; _NE=mi[1]; const uttLen=mi[2]; const flags=mi[3];
-    HAS_TRAJ  =(flags&1)===1;
-    HAS_WEIGHT=(flags&2)===2;
-
+    _N=mi[0];_NE=mi[1];const uttLen=mi[2];const flags=mi[3];
+    HAS_TRAJ=(flags&1)===1; HAS_WEIGHT=(flags&2)===2;
     const mf=new Float32Array(buf,16,4);
-    _GN_MIN=mf[0]; _GN_SC=mf[1];
-    _WT_MIN=mf[2]; _WT_SC=mf[3];
-
+    _GN_MIN=mf[0];_GN_SC=mf[1];_WT_MIN=mf[2];_WT_SC=mf[3];
     document.getElementById('hmeta').textContent=
-      `${{_N.toLocaleString()}} utterances · ${{_NE}} epochs`+
-      (HAS_WEIGHT?' · weight ✓':'');
-
-    // 数值数组（偏移 80 bytes）
+      `${{_N.toLocaleString()}} utterances · ${{_NE}} epochs`+(HAS_WEIGHT?' · weight ✓':'');
     let o=80;
-    N_CHUNKS=new Int16Array  (buf,o,_N); o+=_N*2;
+    N_CHUNKS=new Int16Array(buf,o,_N);   o+=_N*2;
     MEAN_SI =new Float32Array(buf,o,_N); o+=_N*4;
     MAX_SI  =new Float32Array(buf,o,_N); o+=_N*4;
     MEAN_GN =new Float32Array(buf,o,_N); o+=_N*4;
@@ -788,41 +679,27 @@ async function loadBinaryData(){{
     MEAN_FN =new Float32Array(buf,o,_N); o+=_N*4;
     MEAN_WT =new Float32Array(buf,o,_N); o+=_N*4;
     WT_STD  =new Float32Array(buf,o,_N); o+=_N*4;
-    TAGS    =new Uint8Array  (buf,o,_N); o+=_N*1;
-
+    TAGS    =new Uint8Array(buf,o,_N);   o+=_N*1;
     UTT_IDS=new TextDecoder("utf-8").decode(new Uint8Array(buf,o,uttLen)).split('\\n'); o+=uttLen;
-
     if(HAS_TRAJ&&_NE>0){{
       const ts=_N*_NE;
       GN_U8=new Uint8Array(buf,o,ts); o+=ts;
       AL_U8=new Uint8Array(buf,o,ts); o+=ts;
-      if(HAS_WEIGHT){{
-        WT_U8=new Uint8Array(buf,o,ts);
-      }}
+      if(HAS_WEIGHT){{ WT_U8=new Uint8Array(buf,o,ts); }}
     }}
-
-    // compute weight range for bar display
     if(HAS_WEIGHT){{
       let mx=0;
       for(let i=0;i<_N;i++){{ if(!isNaN(MEAN_WT[i])&&MEAN_WT[i]>mx) mx=MEAN_WT[i]; }}
       wtMax=mx||1.0;
-      // show weight UI
-      document.getElementById('wt-filter-sel')&&(document.getElementById('wt-f').style.display='');
+      document.getElementById('wt-f').style.display='';
       document.getElementById('th-wt').style.display='flex';
       document.querySelectorAll('.ctab[data-tab="wt"]').forEach(t=>t.classList.add('show'));
     }}
-
     buildTagBadges();
-
-    // load meta JSON
     try{{
       const mr=await fetch(META_URL);
-      if(mr.ok){{
-        META=await mr.json();
-        buildMetaFilters();
-      }}
-    }}catch(e){{ /* meta optional */ }}
-
+      if(mr.ok){{ META=await mr.json(); buildMetaFilters(); }}
+    }}catch(e){{}}
     filtered=Int32Array.from({{length:_N}},(_,i)=>i);
     renderPage();
     document.getElementById('hstatus').style.display='none';
@@ -832,7 +709,6 @@ async function loadBinaryData(){{
   }}
 }}
 
-// ── Tag 统计徽章 ──
 function buildTagBadges(){{
   const cnt=[0,0,0,0,0];
   for(let i=0;i<_N;i++) cnt[TAGS[i]]++;
@@ -846,28 +722,22 @@ function buildTagBadges(){{
   }});
 }}
 
-// ── Meta 筛选器动态构建 ──
 function buildMetaFilters(){{
   if(!META||!META.length) return;
-  const labels=new Set(), detectors=new Set(), projects=new Set();
+  const labels=new Set(),detectors=new Set(),projects=new Set();
   META.forEach(m=>{{
-    if(m.label)      labels.add(m.label);
+    if(m.label)       labels.add(m.label);
     if(m.detector_id) detectors.add(m.detector_id);
-    if(m.project)    projects.add(m.project);
+    if(m.project)     projects.add(m.project);
   }});
-  function fill(selId, vals){{
+  function fill(selId,vals){{
     const sel=document.getElementById(selId); if(!sel) return;
-    [...vals].sort().forEach(v=>{{
-      const o=document.createElement('option'); o.value=v; o.textContent=v; sel.appendChild(o);
-    }});
+    [...vals].sort().forEach(v=>{{ const o=document.createElement('option'); o.value=v; o.textContent=v; sel.appendChild(o); }});
   }}
-  fill('label-f', labels);
-  fill('detector-f', detectors);
-  fill('project-f', projects);
+  fill('label-f',labels); fill('detector-f',detectors); fill('project-f',projects);
   document.getElementById('meta-filters').style.display='flex';
 }}
 
-// ── 排序值 ──
 function getVal(sk,i){{
   if(sk==='si'||sk==='rank') return MEAN_SI[i];
   if(sk==='maxsi') return MAX_SI[i];
@@ -879,16 +749,13 @@ function getVal(sk,i){{
   return 0;
 }}
 
-// ── 列头点击排序 ──
 function setSort(key){{
   const realKey=key==='rank'?'si':key;
   if(sortKey===realKey){{ sortAsc=!sortAsc; }}
   else{{ sortKey=realKey; sortAsc=(realKey==='al'); }}
   Object.entries(TH_IDS).forEach(([k,id])=>{{
-    const el=document.getElementById(id);
-    if(!el) return;
-    el.classList.remove('active');
-    el.querySelector('.arrow').textContent='';
+    const el=document.getElementById(id); if(!el) return;
+    el.classList.remove('active'); el.querySelector('.arrow').textContent='';
   }});
   const activeId=TH_IDS[key];
   if(activeId){{
@@ -898,7 +765,6 @@ function setSort(key){{
   rebuild();
 }}
 
-// ── 搜索框初始化 ──
 document.addEventListener('DOMContentLoaded',()=>{{
   const inp=document.getElementById('search');
   const clr=document.getElementById('search-clear');
@@ -913,45 +779,44 @@ function clearSearch(){{
   rebuild();
 }}
 
-// ── 重建过滤+排序 ──
 function rebuild(){{
   const tagF=parseInt(document.getElementById('tag-f').value);
-  const wtF =parseInt(document.getElementById('wt-f')?.value||'0');
+  const wtF=parseInt(document.getElementById('wt-f')?.value||'0');
   const q=document.getElementById('search').value.trim().toLowerCase();
-
+  const labelF=document.getElementById('label-f')?.value||'';
+  const detectorF=document.getElementById('detector-f')?.value||'';
+  const projectF=document.getElementById('project-f')?.value||'';
   let arr=[];
   for(let i=0;i<_N;i++){{
-    if(tagF>=0 && TAGS[i]!==tagF) continue;
+    if(tagF>=0&&TAGS[i]!==tagF) continue;
     if(HAS_WEIGHT&&wtF>0){{
       const w=MEAN_WT[i]/wtMax;
       if(wtF===1&&w<0.75) continue;
       if(wtF===2&&(w<0.25||w>=0.75)) continue;
       if(wtF===3&&w>=0.25) continue;
     }}
-    if(q && !((UTT_IDS[i]||'').toLowerCase().includes(q))) continue;
+    if(q&&!((UTT_IDS[i]||'').toLowerCase().includes(q))) continue;
+    if(META){{
+      const m=META[i]||{{}};
+      if(labelF&&m.label!==labelF) continue;
+      if(detectorF&&m.detector_id!==detectorF) continue;
+      if(projectF&&m.project!==projectF) continue;
+    }}
     arr.push(i);
   }}
-
   if(sortKey==='uid'){{
-    arr.sort((a,b)=>{{
-      const r=(UTT_IDS[a]||'').localeCompare(UTT_IDS[b]||'');
-      return sortAsc?r:-r;
-    }});
+    arr.sort((a,b)=>{{ const r=(UTT_IDS[a]||'').localeCompare(UTT_IDS[b]||''); return sortAsc?r:-r; }});
   }}else{{
     arr.sort((a,b)=>{{
-      const va=getVal(sortKey,a), vb=getVal(sortKey,b);
+      const va=getVal(sortKey,a),vb=getVal(sortKey,b);
       if(isNaN(va)&&isNaN(vb)) return 0;
       if(isNaN(va)) return 1; if(isNaN(vb)) return -1;
       return sortAsc?(va-vb):(vb-va);
     }});
   }}
-
-  filtered=arr;
-  pageStart=0;
-  renderPage();
+  filtered=arr; pageStart=0; renderPage();
 }}
 
-// ── 渲染列表 ──
 function escH(s){{return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
 function highlight(text,q){{
   if(!q) return escH(text);
@@ -966,30 +831,24 @@ function renderPage(){{
   const page=Math.floor(pageStart/PAGE)+1;
   const slice=filtered.slice(pageStart,pageStart+PAGE);
   const q=document.getElementById('search').value.trim().toLowerCase();
-
   document.getElementById('pginfo').textContent=`${{page}}/${{pages}} (${{total.toLocaleString()}})`;
   document.getElementById('bp').disabled=pageStart<=0;
   document.getElementById('bn').disabled=pageStart+PAGE>=total;
-
   const inner=document.getElementById('vinner');
   inner.style.height=(slice.length*ROW_H)+'px';
   inner.innerHTML='';
-
   for(let vi=0;vi<slice.length;vi++){{
     const i=slice[vi];
     const row=document.createElement('div');
     row.className='srow'+(i===selIdx?' sel':'');
     row.style.top=(vi*ROW_H)+'px';
     const uid=UTT_IDS[i]||String(i);
-    const gn=MEAN_GN[i], al=MEAN_AL[i], wt=MEAN_WT[i];
+    const gn=MEAN_GN[i],al=MEAN_AL[i],wt=MEAN_WT[i];
     const tag=TAG_NAMES[TAGS[i]];
     const alc=isNaN(al)?'':(al>=0?'pos':'neg');
     const wtc=(!HAS_WEIGHT||isNaN(wt))?'':(wt/wtMax>=0.75?'hi':'');
     const wtStr=(!HAS_WEIGHT||isNaN(wt))?'':wt.toFixed(3);
-
-    // weight bottom bar width %
     const barW=HAS_WEIGHT&&!isNaN(wt)?Math.round(wt/wtMax*100):0;
-
     row.innerHTML=
       `<div class="s-rank">${{i+1}}</div>`+
       `<div class="s-uid" title="${{escH(uid)}}">${{highlight(uid,q)}}</div>`+
@@ -1008,22 +867,18 @@ function renderPage(){{
 function prevPage(){{ if(pageStart>0){{ pageStart=Math.max(0,pageStart-PAGE); renderPage(); }} }}
 function nextPage(){{ if(pageStart+PAGE<filtered.length){{ pageStart+=PAGE; renderPage(); }} }}
 
-// ── Tab 切换 ──
 function switchTab(tab){{
   activeTab=tab;
   document.querySelectorAll('.ctab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
   document.querySelectorAll('.chart-panel').forEach(p=>p.classList.toggle('active',p.id===`panel-${{tab}}`));
-  // resize charts after display change
   if(tab==='traj'&&chartTraj) chartTraj.resize();
-  if(tab==='wt'&&chartWt)     chartWt.resize();
+  if(tab==='wt'&&chartWt) chartWt.resize();
 }}
 
-// ── 选中样本 ──
 function selectSample(idx,el){{
   selIdx=idx;
   document.querySelectorAll('.srow').forEach(r=>r.classList.remove('sel'));
   el.classList.add('sel');
-
   const uid=UTT_IDS[idx]||String(idx);
   const tag=TAG_NAMES[TAGS[idx]];
   const wt=MEAN_WT[idx];
@@ -1031,25 +886,21 @@ function selectSample(idx,el){{
   document.getElementById('csub').textContent=
     `tag: ${{tag}}  ·  chunks: ${{N_CHUNKS[idx]}}  ·  mean_si: ${{MEAN_SI[idx].toFixed(2)}}  ·  max_si: ${{MAX_SI[idx].toFixed(2)}}`+
     (HAS_WEIGHT&&!isNaN(wt)?`  ·  mean_wt: ${{wt.toFixed(4)}}  ±${{WT_STD[idx].toFixed(4)}}`:'');
-
   const stats=[
-    {{l:'MEAN SI',    v:MEAN_SI[idx].toFixed(2)}},
-    {{l:'MAX SI',     v:MAX_SI[idx].toFixed(2)}},
-    {{l:'MEAN GN',    v:MEAN_GN[idx].toFixed(4)}},
-    {{l:'GN STD',     v:GN_STD[idx].toFixed(4)}},
-    {{l:'MEAN ALIGN', v:MEAN_AL[idx].toFixed(4)}},
-    {{l:'NEG ALIGN',  v:(MEAN_FN[idx]*100).toFixed(0)+'%'}},
+    {{l:'MEAN SI',v:MEAN_SI[idx].toFixed(2)}},
+    {{l:'MAX SI',v:MAX_SI[idx].toFixed(2)}},
+    {{l:'MEAN GN',v:MEAN_GN[idx].toFixed(4)}},
+    {{l:'GN STD',v:GN_STD[idx].toFixed(4)}},
+    {{l:'MEAN ALIGN',v:MEAN_AL[idx].toFixed(4)}},
+    {{l:'NEG ALIGN',v:(MEAN_FN[idx]*100).toFixed(0)+'%'}},
   ];
   if(HAS_WEIGHT&&!isNaN(wt)){{
-    stats.push({{l:'MEAN WT',  v:wt.toFixed(4), cls:'wt-val'}});
-    stats.push({{l:'WT STD',   v:WT_STD[idx].toFixed(4), cls:'wt-val'}});
+    stats.push({{l:'MEAN WT',v:wt.toFixed(4),cls:'wt-val'}});
+    stats.push({{l:'WT STD',v:WT_STD[idx].toFixed(4),cls:'wt-val'}});
   }}
   document.getElementById('stat-grid').innerHTML=stats.map(s=>
-    `<div class="stat-item"><div class="slbl">${{s.l}}</div>`+
-    `<div class="sval ${{s.cls||''}}">${{s.v}}</div></div>`
+    `<div class="stat-item"><div class="slbl">${{s.l}}</div><div class="sval ${{s.cls||''}}">${{s.v}}</div></div>`
   ).join('');
-
-  // meta bar
   const mb=document.getElementById('meta-bar');
   if(META&&META[idx]){{
     const m=META[idx];
@@ -1065,24 +916,18 @@ function selectSample(idx,el){{
     const fp=document.getElementById('m-path');
     fp.textContent=m.file_path||'—'; fp.title='点击复制: '+(m.file_path||'');
     mb.classList.add('show');
-  }}else{{
-    mb.classList.remove('show');
-  }}
-
-  // show tabs
+  }}else{{ mb.classList.remove('show'); }}
   document.getElementById('chart-tabs').style.display=HAS_TRAJ?'flex':'none';
   document.getElementById('ph').style.display='none';
   document.getElementById('panel-traj').classList.add('active');
-
   drawTrajChart(idx);
   if(HAS_WEIGHT) drawWeightChart(idx);
 }}
 
-// ── 梯度/对齐轨迹图 ──
 function drawTrajChart(idx){{
   if(!HAS_TRAJ||!GN_U8){{
     document.getElementById('ph').style.display='flex';
-    document.getElementById('ph').querySelector('p').textContent='无轨迹数据（未找到 .npz 文件）';
+    document.getElementById('ph').querySelector('p').textContent='无轨迹数据';
     document.getElementById('panel-traj').classList.remove('active');
     return;
   }}
@@ -1092,7 +937,6 @@ function drawTrajChart(idx){{
     gn.push(GN_U8[b]===255?null:_GN_MIN+(GN_U8[b]/255)*_GN_SC);
     al.push(AL_U8[b]===254?null:(AL_U8[b]/253)*2-1);
   }}
-
   if(chartTraj) chartTraj.destroy();
   chartTraj=new Chart(document.getElementById('chartTraj').getContext('2d'),{{
     type:'line',
@@ -1114,12 +958,12 @@ function drawTrajChart(idx){{
           backgroundColor:'#fff',borderColor:'#dde3ee',borderWidth:1,
           titleColor:'#1a2035',bodyColor:'#6b7a99',
           titleFont:{{family:'IBM Plex Mono',size:11}},bodyFont:{{family:'IBM Plex Mono',size:10}},
-          callbacks:{{label:c=>`  ${{c.dataset.label}}: ${{c.parsed.y?.toFixed(5)??'—'}}`}}
+          callbacks:{{label:c=>`  ${{c.dataset.label}}: ${{c.parsed.y!=null?c.parsed.y.toExponential(3):'—'}}`}}
         }}
       }},
       scales:{{
         x:{{grid:{{color:'#eef1f7'}},ticks:{{color:'#6b7a99',font:{{family:'IBM Plex Mono',size:10}}}}}},
-        y:{{grid:{{color:'#eef1f7'}},ticks:{{color:'#2563eb',font:{{family:'IBM Plex Mono',size:9}}}},
+        y:{{type:'logarithmic',grid:{{color:'#eef1f7'}},ticks:{{color:'#2563eb',font:{{family:'IBM Plex Mono',size:9}},callback:v=>v.toExponential(1)}},
           title:{{display:true,text:'grad_norm',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}}}},
         y2:{{position:'right',grid:{{display:false}},ticks:{{color:'#7c3aed',font:{{family:'IBM Plex Mono',size:9}}}},
           title:{{display:true,text:'align',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}}}}
@@ -1128,7 +972,6 @@ function drawTrajChart(idx){{
   }});
 }}
 
-// ── Weight 轨迹图 ──
 function drawWeightChart(idx){{
   if(!HAS_WEIGHT||!WT_U8) return;
   const wt=[];
@@ -1136,17 +979,14 @@ function drawWeightChart(idx){{
     const b=idx*_NE+e;
     wt.push(WT_U8[b]===254?null:_WT_MIN+(WT_U8[b]/253)*_WT_SC);
   }}
-
   if(chartWt) chartWt.destroy();
   chartWt=new Chart(document.getElementById('chartWt').getContext('2d'),{{
     type:'line',
     data:{{
       labels:EPOCHS.map(e=>`ep${{e}}`),
       datasets:[
-        {{label:'weight(均值)',data:wt,
-          borderColor:'#0891b2',backgroundColor:'rgba(8,145,178,.10)',
-          borderWidth:2.5,pointRadius:5,pointBackgroundColor:'#0891b2',
-          tension:.35,fill:true,yAxisID:'y'}}
+        {{label:'weight(均值)',data:wt,borderColor:'#0891b2',backgroundColor:'rgba(8,145,178,.10)',
+          borderWidth:2.5,pointRadius:5,pointBackgroundColor:'#0891b2',tension:.35,fill:true,yAxisID:'y'}}
       ]
     }},
     options:{{
@@ -1159,27 +999,17 @@ function drawWeightChart(idx){{
           titleColor:'#1a2035',bodyColor:'#6b7a99',
           titleFont:{{family:'IBM Plex Mono',size:11}},bodyFont:{{family:'IBM Plex Mono',size:10}},
           callbacks:{{label:c=>`  weight: ${{c.parsed.y?.toFixed(6)??'—'}}`}}
-        }},
-        // horizontal reference lines at common threshold values
-        annotation: undefined
+        }}
       }},
       scales:{{
-        x:{{
-          grid:{{color:'#eef1f7'}},
-          ticks:{{color:'#6b7a99',font:{{family:'IBM Plex Mono',size:10}}}}
-        }},
-        y:{{
-          grid:{{color:'#eef1f7'}},
-          ticks:{{color:'#0891b2',font:{{family:'IBM Plex Mono',size:9}}}},
-          title:{{display:true,text:'weight',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}},
-          beginAtZero:true
-        }}
+        x:{{grid:{{color:'#eef1f7'}},ticks:{{color:'#6b7a99',font:{{family:'IBM Plex Mono',size:10}}}}}},
+        y:{{grid:{{color:'#eef1f7'}},ticks:{{color:'#0891b2',font:{{family:'IBM Plex Mono',size:9}}}},
+          title:{{display:true,text:'weight',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}},beginAtZero:true}}
       }}
     }}
   }});
 }}
 
-// ── 复制路径 ──
 function copyPath(el){{
   const txt=el.title.replace('点击复制: ','');
   navigator.clipboard?.writeText(txt).then(()=>{{
@@ -1188,7 +1018,6 @@ function copyPath(el){{
   }});
 }}
 
-// ── 导出当前视图 CSV ──
 function exportCSV(){{
   if(!filtered||!UTT_IDS) return;
   const hdr=['utt_id','n_chunks','mean_si','max_si','mean_gn','gn_std','mean_al','mean_fn'];
@@ -1198,18 +1027,14 @@ function exportCSV(){{
   for(let i=0;i<filtered.length;i++){{
     const idx=filtered[i];
     const r=[
-      UTT_IDS[idx]||idx,
-      N_CHUNKS[idx],
-      MEAN_SI[idx].toFixed(4),
-      MAX_SI[idx].toFixed(4),
-      MEAN_GN[idx].toFixed(4),
-      GN_STD[idx].toFixed(4),
-      MEAN_AL[idx].toFixed(4),
-      MEAN_FN[idx].toFixed(4),
+      UTT_IDS[idx]||idx, N_CHUNKS[idx],
+      MEAN_SI[idx].toFixed(4), MAX_SI[idx].toFixed(4),
+      MEAN_GN[idx].toFixed(4), GN_STD[idx].toFixed(4),
+      MEAN_AL[idx].toFixed(4), MEAN_FN[idx].toFixed(4),
     ];
     if(HAS_WEIGHT) r.push(
       isNaN(MEAN_WT[idx])?'':MEAN_WT[idx].toFixed(4),
-      isNaN(WT_STD[idx]) ?'':WT_STD[idx].toFixed(4)
+      isNaN(WT_STD[idx])?'':WT_STD[idx].toFixed(4)
     );
     r.push(TAG_NAMES[TAGS[idx]]);
     rows.push(r);
