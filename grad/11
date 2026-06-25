@@ -5,3 +5,15 @@ ids_in_csv = {r["id"] for r in rows}
 print("309172 in csv:", "309172" in ids_in_csv)
 print("n_egs:", len(rows))
 print("309172 as int >= n_egs:", int("309172") >= len(rows))
+
+import csv, numpy as np
+
+with open("contrib_summary.csv") as f:
+    rows = list(csv.DictReader(f))
+
+# summary CSV 第 309172 行（按行顺序）的 id 是什么
+print("csv row 309172 id:", rows[309172]["id"])
+
+# id=309172 这行在 CSV 里实际是第几行
+id2idx = {r["id"]: i for i, r in enumerate(rows)}
+print("id=309172 在 csv 里的行号:", id2idx.get("309172", "不存在"))
