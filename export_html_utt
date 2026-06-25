@@ -43,10 +43,10 @@ def strip_label_prefix(utt_id):
 
 def main():
     print("\n" + "="*60)
-    print("🚀 [START] Utterance 级聚合分析脚本 v4.3 启动...")
+    print("🚀 [START] Utterance 级聚合分析脚本 v4.4 启动...")
     print("="*60)
 
-    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v4.3")
+    ap = argparse.ArgumentParser(description="Utterance 级样本贡献度可视化 HTML 生成器 v4.4")
     ap.add_argument("--contrib", required=True, help="包含 contrib_epoch*.npz 和 summary CSV 的目录")
     ap.add_argument("--egs",     default="", help="可选：train.egs.csv 路径")
     ap.add_argument("--summary", default="", help="可选：明确指定 summary CSV 路径")
@@ -332,7 +332,7 @@ def main():
 
         valid_gn = gn_s[~np.isnan(gn_s)]
         if len(valid_gn):
-            gn_min   = float(np.nanmin(gn_s))
+            gn_min   = float(np.nanpercentile(valid_gn, 1))   # p1 作下限，防极小值撑宽量化区间
             gn_scale = max(float(np.nanpercentile(valid_gn, 99)) - gn_min, 1e-9)
         gq = np.clip((gn_s - gn_min) / gn_scale * 254, 0, 254); gq[np.isnan(gn_s)] = 255
         aq = np.clip((al_s + 1.0) / 2.0 * 253, 0, 253);          aq[np.isnan(al_s)] = 254
@@ -497,18 +497,17 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
 .slbl{{font-size:9px;color:var(--mt);font-family:var(--mono);text-transform:uppercase;letter-spacing:.05em;}}
 .sval{{font-size:15px;font-family:var(--mono);font-weight:600;color:var(--tx);margin-top:1px;}}
 .sval.wt-val{{color:var(--wt);}}
-.chart-tabs{{display:flex;gap:0;border-bottom:1px solid var(--bdr);background:var(--surf);padding:0 20px;}}
-.ctab{{padding:8px 16px;font-family:var(--mono);font-size:11px;color:var(--mt);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color .15s,border-color .15s;user-select:none;}}
-.ctab:hover{{color:var(--tx);}}
-.ctab.active{{color:var(--ac);border-bottom-color:var(--ac);font-weight:600;}}
-.ctab.wt-tab.active{{color:var(--wt);border-bottom-color:var(--wt);}}
-.ctab[data-tab="wt"]{{display:none;}}
-.ctab[data-tab="wt"].show{{display:block;}}
-.chart-area{{flex:1;padding:16px 24px 14px;display:flex;flex-direction:column;gap:10px;overflow:hidden;}}
+/* tabs removed: all metrics shown in single chart */
+.chart-area{{flex:1;padding:12px 20px 10px;display:flex;flex-direction:column;gap:0;overflow:hidden;}}
+.chart-block{{display:flex;flex-direction:column;flex:1;min-height:0;padding:4px 0;}}
+.chart-block+.chart-block{{border-top:1px solid var(--bdr);}}
+.chart-block-title{{font-family:var(--mono);font-size:9px;color:var(--mt);text-transform:uppercase;letter-spacing:.05em;padding:2px 0 4px;}}
 .chart-wrap{{flex:1;position:relative;min-height:0;}}
 .chart-wrap canvas{{position:absolute;inset:0;}}
-.chart-panel{{display:none;flex:1;flex-direction:column;gap:10px;}}
+.chart-panel{{display:flex;flex:1;flex-direction:column;gap:0;}}
 .chart-panel.active{{display:flex;}}
+.chart-block-wt{{display:none;}}
+.chart-block-wt.show{{display:flex;}}
 .placeholder{{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--mt2);font-family:var(--mono);}}
 .phi{{font-size:40px;opacity:.25;}}
 .placeholder p{{font-size:11px;}}
@@ -609,27 +608,26 @@ html,body{{height:100%;background:var(--bg);color:var(--tx);font-family:var(--sa
         <span class="meta-v fp" id="m-path" title="点击复制" onclick="copyPath(this)"></span></div>
     </div>
 
-    <div class="chart-tabs" id="chart-tabs" style="display:none;">
-      <div class="ctab active" data-tab="traj" onclick="switchTab('traj')">梯度 / 对齐 轨迹</div>
-      <div class="ctab wt-tab" data-tab="wt" onclick="switchTab('wt')">权重轨迹</div>
-    </div>
-
     <div class="chart-area">
       <div id="ph" class="placeholder">
         <div class="phi">◈</div>
-        <p>选择 utterance 后，此处显示各 epoch 的梯度均值轨迹</p>
+        <p>选择 utterance 后，此处显示各 epoch 的轨迹</p>
       </div>
-      <div id="panel-traj" class="chart-panel">
-        <div class="chart-wrap"><canvas id="chartTraj"></canvas></div>
-        <div class="legend">
-          <div class="li"><div class="ld gn"></div>grad_norm 均值（左轴）</div>
-          <div class="li"><div class="ld al"></div>align 均值（右轴）</div>
+      <div id="panel-main" class="chart-panel" style="display:none;">
+        <!-- 上图：grad_norm + align -->
+        <div class="chart-block">
+          <div class="chart-block-title">
+            <span style="color:#2563eb">● grad_norm</span>（左轴·对数）&nbsp;&nbsp;
+            <span style="color:#7c3aed">● align</span>（右轴·线性）
+          </div>
+          <div class="chart-wrap"><canvas id="chartGnAl"></canvas></div>
         </div>
-      </div>
-      <div id="panel-wt" class="chart-panel">
-        <div class="chart-wrap"><canvas id="chartWt"></canvas></div>
-        <div class="legend">
-          <div class="li"><div class="ld wt"></div>weight 均值（左轴）</div>
+        <!-- 下图：weight，无 weight 数据时隐藏 -->
+        <div class="chart-block chart-block-wt" id="block-wt">
+          <div class="chart-block-title">
+            <span style="color:#0891b2">● weight</span>（左轴·线性）
+          </div>
+          <div class="chart-wrap"><canvas id="chartWt"></canvas></div>
         </div>
       </div>
     </div>
@@ -651,7 +649,7 @@ let META=null;
 
 const PAGE=100,ROW_H=36;
 let filtered=null,pageStart=0,selIdx=-1;
-let chartTraj=null,chartWt=null,stimer=null;
+let chartGnAl=null,chartWt=null,stimer=null;
 let sortKey='si',sortAsc=false,activeTab='traj',wtMax=1.0;
 
 const TH_IDS={{rank:'th-rank',uid:'th-uid',nc:'th-nc',gn:'th-gn',al:'th-al',wt:'th-wt',tag:'th-tag'}};
@@ -867,13 +865,7 @@ function renderPage(){{
 function prevPage(){{ if(pageStart>0){{ pageStart=Math.max(0,pageStart-PAGE); renderPage(); }} }}
 function nextPage(){{ if(pageStart+PAGE<filtered.length){{ pageStart+=PAGE; renderPage(); }} }}
 
-function switchTab(tab){{
-  activeTab=tab;
-  document.querySelectorAll('.ctab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
-  document.querySelectorAll('.chart-panel').forEach(p=>p.classList.toggle('active',p.id===`panel-${{tab}}`));
-  if(tab==='traj'&&chartTraj) chartTraj.resize();
-  if(tab==='wt'&&chartWt) chartWt.resize();
-}}
+/* switchTab removed */
 
 function selectSample(idx,el){{
   selIdx=idx;
@@ -917,36 +909,35 @@ function selectSample(idx,el){{
     fp.textContent=m.file_path||'—'; fp.title='点击复制: '+(m.file_path||'');
     mb.classList.add('show');
   }}else{{ mb.classList.remove('show'); }}
-  document.getElementById('chart-tabs').style.display=HAS_TRAJ?'flex':'none';
   document.getElementById('ph').style.display='none';
-  document.getElementById('panel-traj').classList.add('active');
-  drawTrajChart(idx);
-  if(HAS_WEIGHT) drawWeightChart(idx);
+  document.getElementById('panel-main').style.display='flex';
+  if(HAS_WEIGHT) document.getElementById('block-wt').classList.add('show');
+  drawGnAlChart(idx);
+  if(HAS_WEIGHT) drawWtChart(idx);
 }}
 
-function drawTrajChart(idx){{
-  if(!HAS_TRAJ||!GN_U8){{
-    document.getElementById('ph').style.display='flex';
-    document.getElementById('ph').querySelector('p').textContent='无轨迹数据';
-    document.getElementById('panel-traj').classList.remove('active');
-    return;
-  }}
+function drawGnAlChart(idx){{
+  if(!HAS_TRAJ||!GN_U8) return;
   const gn=[],al=[];
   for(let e=0;e<_NE;e++){{
     const b=idx*_NE+e;
-    gn.push(GN_U8[b]===255?null:_GN_MIN+(GN_U8[b]/254)*_GN_SC);
+    const gnv=GN_U8[b]===255?null:_GN_MIN+(GN_U8[b]/254)*_GN_SC;
+    // 对数轴不能有 0 或负值；p1 截断以下的极小值显示为 gn_min（仍为正数）
+    gn.push(gnv!=null&&gnv>0?gnv:gnv!=null?_GN_MIN:null);
     al.push(AL_U8[b]===254?null:(AL_U8[b]/253)*2-1);
   }}
-  if(chartTraj) chartTraj.destroy();
-  chartTraj=new Chart(document.getElementById('chartTraj').getContext('2d'),{{
+  if(chartGnAl) chartGnAl.destroy();
+  chartGnAl=new Chart(document.getElementById('chartGnAl').getContext('2d'),{{
     type:'line',
     data:{{
       labels:EPOCHS.map(e=>`ep${{e}}`),
       datasets:[
-        {{label:'grad_norm(均值)',data:gn,borderColor:'#2563eb',backgroundColor:'rgba(37,99,235,.08)',
-          borderWidth:2,pointRadius:4,pointBackgroundColor:'#2563eb',tension:.3,yAxisID:'y'}},
-        {{label:'align(均值)',data:al,borderColor:'#7c3aed',backgroundColor:'rgba(124,58,237,.08)',
-          borderWidth:2,pointRadius:4,pointBackgroundColor:'#7c3aed',tension:.3,yAxisID:'y2'}}
+        {{label:'grad_norm',data:gn,borderColor:'#2563eb',backgroundColor:'rgba(37,99,235,.07)',
+          borderWidth:2,pointRadius:3.5,pointBackgroundColor:'#2563eb',tension:.3,
+          yAxisID:'yGn',spanGaps:false}},
+        {{label:'align',data:al,borderColor:'#7c3aed',backgroundColor:'rgba(124,58,237,.07)',
+          borderWidth:2,pointRadius:3.5,pointBackgroundColor:'#7c3aed',tension:.3,
+          yAxisID:'yAl',spanGaps:false}},
       ]
     }},
     options:{{
@@ -958,21 +949,39 @@ function drawTrajChart(idx){{
           backgroundColor:'#fff',borderColor:'#dde3ee',borderWidth:1,
           titleColor:'#1a2035',bodyColor:'#6b7a99',
           titleFont:{{family:'IBM Plex Mono',size:11}},bodyFont:{{family:'IBM Plex Mono',size:10}},
-          callbacks:{{label:c=>`  ${{c.dataset.label}}: ${{c.parsed.y!=null?c.parsed.y.toExponential(3):'—'}}`}}
+          callbacks:{{
+            label:c=>{{
+              const v=c.parsed.y;
+              if(v==null) return `  ${{c.dataset.label}}: —`;
+              if(c.dataset.label==='grad_norm') return `  grad_norm: ${{v.toExponential(3)}}`;
+              return `  align: ${{v.toFixed(4)}}`;
+            }}
+          }}
         }}
       }},
       scales:{{
         x:{{grid:{{color:'#eef1f7'}},ticks:{{color:'#6b7a99',font:{{family:'IBM Plex Mono',size:10}}}}}},
-        y:{{type:'logarithmic',min:1e-9,grid:{{color:'#eef1f7'}},ticks:{{color:'#2563eb',font:{{family:'IBM Plex Mono',size:9}},callback:v=>v.toExponential(1)}},
-          title:{{display:true,text:'grad_norm (log)',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}}}},
-        y2:{{position:'right',grid:{{display:false}},ticks:{{color:'#7c3aed',font:{{family:'IBM Plex Mono',size:9}}}},
-          title:{{display:true,text:'align',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}}}}
+        yGn:{{
+          type:'logarithmic',
+          position:'left',
+          grid:{{color:'#eef1f7'}},
+          ticks:{{color:'#2563eb',font:{{family:'IBM Plex Mono',size:9}},callback:v=>v.toExponential(1)}},
+          title:{{display:true,text:'grad_norm',color:'#2563eb',font:{{family:'IBM Plex Mono',size:9}}}}
+        }},
+        yAl:{{
+          type:'linear',
+          position:'right',
+          grid:{{display:false}},
+          min:-1,max:1,
+          ticks:{{color:'#7c3aed',font:{{family:'IBM Plex Mono',size:9}}}},
+          title:{{display:true,text:'align',color:'#7c3aed',font:{{family:'IBM Plex Mono',size:9}}}}
+        }}
       }}
     }}
   }});
 }}
 
-function drawWeightChart(idx){{
+function drawWtChart(idx){{
   if(!HAS_WEIGHT||!WT_U8) return;
   const wt=[];
   for(let e=0;e<_NE;e++){{
@@ -985,8 +994,9 @@ function drawWeightChart(idx){{
     data:{{
       labels:EPOCHS.map(e=>`ep${{e}}`),
       datasets:[
-        {{label:'weight(均值)',data:wt,borderColor:'#0891b2',backgroundColor:'rgba(8,145,178,.10)',
-          borderWidth:2.5,pointRadius:5,pointBackgroundColor:'#0891b2',tension:.35,fill:true,yAxisID:'y'}}
+        {{label:'weight',data:wt,borderColor:'#0891b2',backgroundColor:'rgba(8,145,178,.10)',
+          borderWidth:2.5,pointRadius:4,pointBackgroundColor:'#0891b2',
+          tension:.35,fill:true,spanGaps:false}}
       ]
     }},
     options:{{
@@ -998,13 +1008,19 @@ function drawWeightChart(idx){{
           backgroundColor:'#fff',borderColor:'#dde3ee',borderWidth:1,
           titleColor:'#1a2035',bodyColor:'#6b7a99',
           titleFont:{{family:'IBM Plex Mono',size:11}},bodyFont:{{family:'IBM Plex Mono',size:10}},
-          callbacks:{{label:c=>`  weight: ${{c.parsed.y?.toFixed(6)??'—'}}`}}
+          callbacks:{{label:c=>`  weight: ${{c.parsed.y!=null?c.parsed.y.toFixed(6):'—'}}`}}
         }}
       }},
       scales:{{
         x:{{grid:{{color:'#eef1f7'}},ticks:{{color:'#6b7a99',font:{{family:'IBM Plex Mono',size:10}}}}}},
-        y:{{grid:{{color:'#eef1f7'}},ticks:{{color:'#0891b2',font:{{family:'IBM Plex Mono',size:9}}}},
-          title:{{display:true,text:'weight',color:'#9aa3ba',font:{{family:'IBM Plex Mono',size:9}}}},beginAtZero:true}}
+        y:{{
+          type:'linear',
+          position:'left',
+          beginAtZero:true,
+          grid:{{color:'#eef1f7'}},
+          ticks:{{color:'#0891b2',font:{{family:'IBM Plex Mono',size:9}}}},
+          title:{{display:true,text:'weight',color:'#0891b2',font:{{family:'IBM Plex Mono',size:9}}}}
+        }}
       }}
     }}
   }});
