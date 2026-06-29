@@ -646,8 +646,8 @@ def make_html(model_names, bin_filenames, meta_filename,
               epochs_list, n_u, has_weight_any, colors, colors_alpha):
 
     n_models = len(model_names)
-    per_model_cols = " ".join(["64px 76px"] * n_models)
-    grid_cols      = "36px 1fr " + per_model_cols + " 52px"
+    per_model_cols = " ".join(["88px"] * n_models)  # 每模型一列 tag
+    grid_cols      = "36px 1fr " + per_model_cols + " 36px"
 
     model_names_js   = json.dumps(model_names)
     bin_filenames_js = json.dumps(bin_filenames)
@@ -660,24 +660,19 @@ def make_html(model_names, bin_filenames, meta_filename,
     th_cells  = '<span class="th" onclick="setSort(' + SQ + 'rank' + SQ + ')" id="th-rank">#<span class="arrow"></span></span>'
     th_cells += '<span class="th" onclick="setSort(' + SQ + 'uid'  + SQ + ')" id="th-uid">utt_id<span class="arrow"></span></span>'
     for i, nm in enumerate(model_names):
-        sort_si  = "si_"  + str(i)
         sort_tag = "tag_" + str(i)
         col = colors[i]
         th_cells += (
-            '<span class="th th-r model-th" onclick="setSort(' + SQ + sort_si + SQ + ')"'
-            ' id="th-si-' + str(i) + '" style="color:' + col + '">'
+            '<span class="th th-c" onclick="setSort(' + SQ + sort_tag + SQ + ')" '
+            ' id="th-tag-' + str(i) + '" style="color:' + col + '">'
             '<span class="th-dot" style="background:' + col + '"></span>'
-            + nm[:8] + ' si<span class="arrow"></span></span>'
-        )
-        th_cells += (
-            '<span class="th th-c" onclick="setSort(' + SQ + sort_tag + SQ + ')"'
-            ' id="th-tag-' + str(i) + '">tag<span class="arrow"></span></span>'
+            + nm[:8] + '<span class="arrow"></span></span>'
         )
 
-    # Δsi column header
+    # tag diff column header
     th_cells += (
-        '<span class="th th-r" onclick="setSort(' + SQ + 'delta' + SQ + ')"'
-        ' id="th-delta">&Delta;al<span class="arrow"></span></span>'
+        '<span class="th th-c" onclick="setSort(' + SQ + 'delta' + SQ + ')" '
+        ' id="th-delta">≠<span class="arrow"></span></span>'
     )
 
     weight_tab_html = (
