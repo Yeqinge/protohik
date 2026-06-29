@@ -81,6 +81,10 @@ html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--san
 .s-si{text-align:right;font-size:10px;font-family:var(--mono);color:var(--mt);font-weight:500;}
 .s-si.best{font-weight:700;}
 .col-tag{justify-self:center;}
+.s-delta{text-align:right;font-size:10px;font-family:var(--mono);font-weight:600;color:var(--mt2);white-space:nowrap;}
+.s-delta.hi{color:#dc2626;}
+.s-delta.md{color:#ea580c;}
+.s-delta.lo{color:#6b7a99;}
 .pagination{padding:6px 12px;border-top:1px solid var(--bdr);display:flex;align-items:center;
   gap:8px;font-family:var(--mono);font-size:10px;color:var(--mt);background:var(--surf2);}
 .pagination button{padding:3px 10px;background:var(--surf);border:1px solid var(--bdr2);
@@ -384,6 +388,7 @@ function getVal(sk,idx){
     if(key==='al')  return (MDL[mi].MEAN_AL &&MDL[mi].MEAN_AL[idx]) ??NaN;
     if(key==='wt')  return (MDL[mi].MEAN_WT &&MDL[mi].MEAN_WT[idx]) ??NaN;
   }
+  if(sk==='delta') return getSiSpread(idx);
   if(sk==='rank') return (MDL[0].MEAN_SI&&MDL[0].MEAN_SI[idx])??NaN;
   if(sk==='uid')  return (MDL[0].UTT_IDS&&MDL[0].UTT_IDS[idx])||'';
   return NaN;
@@ -396,7 +401,9 @@ function setSort(key){
     t.classList.remove('active');
     const a=t.querySelector('.arrow'); if(a) a.textContent='';
   });
-  const el=document.getElementById('th-'+key.replace(/_/g,'-'));
+  // map delta sort key to element id
+  const sortElId = key==='delta' ? 'th-delta' : 'th-'+key.replace(/_/g,'-');
+  const el=document.getElementById(sortElId);
   if(el){el.classList.add('active');const ar=el.querySelector('.arrow');if(ar) ar.textContent=sortAsc?' \u2191':' \u2193';}
   rebuild();
 }
@@ -506,6 +513,12 @@ function renderPage(){
       cells+='<div class="s-si'+(isBest?' best':'')+'" style="'+siStyle+'">'+(absent?'\u2014':si.toFixed(3))+'</div>';
       cells+='<div class="col-tag"><span class="badge '+(absent?'absent':tagName)+'">'+(absent?'n/a':tagName.replace(/_/g,' '))+'</span></div>';
     }
+    // Δsi cell
+    const sp=getSiSpread(idx);
+    let dCls='lo';
+    if(siRanges&&sp>siRanges[1]) dCls='hi';
+    else if(siRanges&&sp>siRanges[0]) dCls='md';
+    cells+='<div class="s-delta '+dCls+'">'+(isFinite(sp)&&sp>0?sp.toFixed(2):'\u2014')+'</div>';
     row.innerHTML=cells;
     row.addEventListener('click',(function(i,r){return function(){selectSample(i,r);};})(idx,row));
     inner.appendChild(row);
