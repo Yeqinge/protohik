@@ -604,7 +604,7 @@ def make_html(model_names, bin_filenames, meta_filename,
 
     n_models = len(model_names)
     per_model_cols = " ".join(["64px 76px"] * n_models)
-    grid_cols      = "36px 1fr " + per_model_cols
+    grid_cols      = "36px 1fr " + per_model_cols + " 52px"
 
     model_names_js   = json.dumps(model_names)
     bin_filenames_js = json.dumps(bin_filenames)
@@ -630,6 +630,12 @@ def make_html(model_names, bin_filenames, meta_filename,
             '<span class="th th-c" onclick="setSort(' + SQ + sort_tag + SQ + ')"'
             ' id="th-tag-' + str(i) + '">tag<span class="arrow"></span></span>'
         )
+
+    # Δsi column header
+    th_cells += (
+        '<span class="th th-r" onclick="setSort(' + SQ + 'delta' + SQ + ')"'
+        ' id="th-delta">&Delta;si<span class="arrow"></span></span>'
+    )
 
     weight_tab_html = (
         '<div class="tab" data-tab="wt" onclick="switchTab(' + SQ + 'wt' + SQ + ')">weight</div>'
