@@ -203,8 +203,10 @@ html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--san
     <div class="meta-bar" id="meta-bar">
       <div class="meta-kv"><span class="meta-k">label</span><span class="meta-v" id="m-label"></span></div>
       <div class="meta-kv"><span class="meta-k">detector</span><span class="meta-v" id="m-detector"></span></div>
+      <div class="meta-kv"><span class="meta-k">channel</span><span class="meta-v" id="m-channel"></span></div>
       <div class="meta-kv"><span class="meta-k">project</span><span class="meta-v" id="m-project"></span></div>
       <div class="meta-kv"><span class="meta-k">duration</span><span class="meta-v" id="m-duration"></span></div>
+      <div class="meta-kv"><span class="meta-k">time</span><span class="meta-v" id="m-time"></span></div>
       <div class="meta-kv" style="flex-basis:100%"><span class="meta-k">path</span>
         <span class="meta-v fp" id="m-path" onclick="copyPath(this)"></span></div>
     </div>
@@ -213,7 +215,7 @@ html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--san
       <div class="tab active" data-tab="gn" onclick="switchTab('gn')">grad_norm</div>
       <div class="tab" data-tab="al" onclick="switchTab('al')">align</div>
       @@WEIGHT_TAB_HTML@@
-      <div class="tab" data-tab="scatter" onclick="switchTab('scatter')">SI 对比散点</div>
+      <div class="tab" data-tab="scatter" onclick="switchTab('scatter')">SI 分布对比</div>
     </div>
 
     <div class="chart-area">
@@ -221,23 +223,23 @@ html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--san
         <div class="phi">&#x2295;</div>
         <p>选择 utterance 后，此处叠加显示各模型轨迹</p>
       </div>
-      <div id="tab-gn" class="tab-panel active" style="display:none;">
+      <div id="tab-gn" class="tab-panel active">
         <div class="chart-block">
           <div class="chart-block-title">grad_norm 轨迹（各模型叠加&#xB7;对数轴）</div>
           <div class="chart-wrap"><canvas id="chartGn"></canvas></div>
         </div>
       </div>
-      <div id="tab-al" class="tab-panel" style="display:none;">
+      <div id="tab-al" class="tab-panel">
         <div class="chart-block">
           <div class="chart-block-title">align 轨迹（各模型叠加）</div>
           <div class="chart-wrap"><canvas id="chartAl"></canvas></div>
         </div>
       </div>
       @@WEIGHT_PANEL_HTML@@
-      <div id="tab-scatter" class="tab-panel" style="display:none;">
+      <div id="tab-scatter" class="tab-panel">
         <div class="chart-block">
-          <div class="chart-block-title">mean_si 对比（当前 utterance 相对全局分布）</div>
-          <div class="chart-wrap"><canvas id="chartScatter"></canvas></div>
+          <div class="chart-block-title">mean_si 分布对比（各模型直方图，竖线=当前选中）</div>
+          <div class="chart-wrap"><canvas id="chartSIDist"></canvas></div>
         </div>
       </div>
     </div>
@@ -514,16 +516,6 @@ function renderPage(){
 function prevPage(){if(pageStart>0){pageStart=Math.max(0,pageStart-PAGE);renderPage();}}
 function nextPage(){if(pageStart+PAGE<filtered.length){pageStart+=PAGE;renderPage();}}
 
-function switchTab(t){
-  activeTab=t;
-  document.querySelectorAll('.tab').forEach(function(el){el.classList.toggle('active',el.dataset.tab===t);});
-  document.querySelectorAll('.tab-panel').forEach(function(el){
-    const show=el.id==='tab-'+t;
-    el.classList.toggle('active',show);
-    el.style.display=show?'flex':'none';
-  });
-  if(selIdx>=0) drawTab(t,selIdx);
-}
 
 function selectSample(idx,el){
   selIdx=idx;
@@ -553,16 +545,22 @@ function selectSample(idx,el){
     sg.appendChild(card);
   });
   const mb=document.getElementById('meta-bar');
-  if(META&&META[idx]){
-    const m=META[idx];
+  const _m=META&&META[idx];
+  const _hasAny=_m&&((_m.label||'')+(_m.file_path||'')+(_m.detector_id||'')+
+                      (_m.channel_id||'')+(_m.project||'')+(_m.duration||'')+(_m.time_point||'')).trim()!=='';
+  if(_hasAny){
+    const m=_m;
     const lc=(m.label||'').toLowerCase();
     const bc=lc==='normal'?'normal':(lc==='anomaly'||lc==='abnormal'?'anomaly':'unknown');
-    document.getElementById('m-label').innerHTML='<span class="meta-badge '+bc+'">'+(m.label||'\u2014')+'</span>';
+    document.getElementById('m-label').innerHTML=m.label?('<span class="meta-badge '+bc+'">'+m.label+'</span>'):'\u2014';
     document.getElementById('m-detector').textContent=m.detector_id||'\u2014';
+    document.getElementById('m-channel').textContent=m.channel_id||'\u2014';
     document.getElementById('m-project').textContent=m.project||'\u2014';
     document.getElementById('m-duration').textContent=m.duration?(m.duration+'s'):'\u2014';
+    document.getElementById('m-time').textContent=m.time_point||'\u2014';
     const fp=document.getElementById('m-path');
-    fp.textContent=m.file_path||'\u2014'; fp.title='\u70b9\u51fb\u590d\u5236: '+(m.file_path||'');
+    fp.textContent=m.file_path||'\u2014';
+    fp.title='\u70b9\u51fb\u590d\u5236: '+(m.file_path||'');
     mb.classList.add('show');
   }else{ mb.classList.remove('show'); }
   document.getElementById('ph').style.display='none';
@@ -571,14 +569,33 @@ function selectSample(idx,el){
     p.style.display=show?'flex':'none';
     p.classList.toggle('active',show);
   });
-  drawTab(activeTab,idx);
+  // Use rAF so the panel is fully visible (with correct dimensions) before Chart.js measures canvas
+  requestAnimationFrame(function(){
+    requestAnimationFrame(function(){ drawTab(activeTab,idx); });
+  });
 }
 
 function drawTab(tab,idx){
   if(tab==='gn')      drawGnChart(idx);
   else if(tab==='al') drawAlChart(idx);
   else if(tab==='wt') drawWtChart(idx);
-  else if(tab==='scatter') drawScatter(idx);
+  else if(tab==='scatter') drawSIDist(idx);
+}
+
+function switchTab(t){
+  activeTab=t;
+  document.querySelectorAll('.tab').forEach(function(el){el.classList.toggle('active',el.dataset.tab===t);});
+  document.querySelectorAll('.tab-panel').forEach(function(el){
+    const show=el.id==='tab-'+t;
+    el.classList.toggle('active',show);
+    el.style.display=show?'flex':'none';
+  });
+  if(selIdx>=0){
+    // double rAF: first frame shows panel, second frame canvas has correct dimensions
+    requestAnimationFrame(function(){
+      requestAnimationFrame(function(){ drawTab(t,selIdx); });
+    });
+  }
 }
 
 function getEpochLabels(mi){
@@ -672,53 +689,173 @@ function drawWtChart(idx){
   });
 }
 
-function drawScatter(selIdx){
+function drawSIDist(curIdx){
   destroyChart('scatter');
-  const el=document.getElementById('chartScatter'); if(!el) return;
-  const N=MDL[0].N||0;
-  if(N_MODELS<2){
-    el.getContext('2d').fillText('\u9700\u8981\u81f3\u5c11 2 \u4e2a\u6a21\u578b',40,40);
+  const el=document.getElementById('chartSIDist'); if(!el) return;
+
+  // --- build histogram for each model ---
+  const BINS=30;
+  // 1. collect all SI values per model, find global range
+  let gmin=Infinity, gmax=-Infinity;
+  const modelVals=[];
+  for(let mi=0;mi<N_MODELS;mi++){
+    const arr=[];
+    const sv=MDL[mi].MEAN_SI;
+    const N=MDL[mi].N||0;
+    if(sv){
+      for(let i=0;i<N;i++){
+        const v=Number(sv[i]);
+        if(isFinite(v)){
+          arr.push(v);
+          if(v<gmin) gmin=v;
+          if(v>gmax) gmax=v;
+        }
+      }
+    }
+    modelVals.push(arr);
+  }
+
+  if(!isFinite(gmin)){
+    const ctx=el.getContext('2d');
+    ctx.clearRect(0,0,el.width,el.height);
+    ctx.fillStyle='#6b7a99'; ctx.font='13px IBM Plex Mono';
+    ctx.fillText('No valid SI data',20,40);
     return;
   }
-  const m0=MDL[0],m1=MDL[1];
-  const pts=[],selPts=[];
-  for(let i=0;i<N;i++){
-    const x=(m0.MEAN_SI&&m0.MEAN_SI[i])??NaN;
-    const y=(m1.MEAN_SI&&m1.MEAN_SI[i])??NaN;
-    if(isNaN(x)||isNaN(y)) continue;
-    (i===selIdx?selPts:pts).push({x:x,y:y});
-  }
-  const allX=pts.map(function(p){return p.x;}).concat(selPts.map(function(p){return p.x;}));
-  const allY=pts.map(function(p){return p.y;}).concat(selPts.map(function(p){return p.y;}));
-  const mn=Math.min.apply(null,allX.concat(allY));
-  const mx=Math.max.apply(null,allX.concat(allY));
+
+  // 2. build bin edges
+  const pad=(gmax-gmin)*0.02||0.01;
+  gmin-=pad; gmax+=pad;
+  const binW=(gmax-gmin)/BINS;
+  const edges=Array.from({length:BINS+1},function(_,i){return gmin+i*binW;});
+  const labels=Array.from({length:BINS},function(_,i){
+    return ((gmin+(i+0.5)*binW)).toFixed(3);
+  });
+
+  // 3. fill counts → normalize to density (% of model total)
+  const datasets=MODEL_NAMES.map(function(nm,mi){
+    const vals=modelVals[mi];
+    const counts=new Array(BINS).fill(0);
+    vals.forEach(function(v){
+      let b=Math.floor((v-gmin)/binW);
+      if(b>=BINS) b=BINS-1;
+      if(b>=0) counts[b]++;
+    });
+    const total=vals.length||1;
+    return {
+      label:nm,
+      data:counts.map(function(c){return parseFloat((c/total*100).toFixed(3));}),
+      borderColor:COLORS[mi],
+      backgroundColor:COLORS_ALPHA[mi],
+      borderWidth:2,
+      pointRadius:0,
+      fill:true,
+      tension:0.35,
+      order:mi+1
+    };
+  });
+
+  // 4. selected utterance vertical marker — find its bin per model
+  // We annotate via a dataset of a single-bin spike
+  const selAnnotations=[];
+  MODEL_NAMES.forEach(function(nm,mi){
+    const sv=MDL[mi].MEAN_SI;
+    if(!sv) return;
+    const v=Number(sv[curIdx]);
+    if(!isFinite(v)) return;
+    let b=Math.floor((v-gmin)/binW);
+    if(b>=BINS) b=BINS-1;
+    if(b<0) return;
+    // vertical line: spike dataset with 0 everywhere except bin b
+    const spike=new Array(BINS).fill(null);
+    spike[b]=100; // full height
+    selAnnotations.push({
+      label:nm+' (sel)',
+      data:spike,
+      borderColor:COLORS[mi],
+      backgroundColor:'transparent',
+      borderWidth:2.5,
+      borderDash:[4,3],
+      pointRadius:0,
+      fill:false,
+      tension:0,
+      spanGaps:false,
+      order:0
+    });
+  });
+
+  if(charts.scatter) charts.scatter.destroy();
   charts.scatter=new Chart(el.getContext('2d'),{
-    type:'scatter',
-    data:{datasets:[
-      {label:'all',data:pts,backgroundColor:'rgba(107,122,153,0.18)',pointRadius:2.5,pointBorderWidth:0},
-      {label:'selected',data:selPts,backgroundColor:COLORS[0],pointRadius:8,pointBorderColor:'#fff',pointBorderWidth:2},
-      {type:'line',label:'y=x',data:[{x:mn,y:mn},{x:mx,y:mx}],
-       borderColor:'#c8d0e0',borderWidth:1.5,borderDash:[4,4],pointRadius:0,fill:false}
-    ]},
+    type:'line',
+    data:{labels:labels, datasets:datasets.concat(selAnnotations)},
     options:{
-      responsive:true,maintainAspectRatio:false,animation:{duration:150},
-      plugins:{legend:{display:false},tooltip:{backgroundColor:'#fff',borderColor:'#dde3ee',borderWidth:1,
-        callbacks:{label:function(c){
-          return c.dataset.label==='selected'?
-            '  sel: ('+MODEL_NAMES[0]+'='+c.parsed.x.toFixed(3)+', '+MODEL_NAMES[1]+'='+c.parsed.y.toFixed(3)+')':
-            '  ('+c.parsed.x.toFixed(3)+', '+c.parsed.y.toFixed(3)+')';
-        }}}},
+      responsive:true,
+      maintainAspectRatio:false,
+      animation:{duration:200},
+      interaction:{mode:'index',intersect:false},
+      plugins:{
+        legend:{
+          display:true,
+          position:'top',
+          labels:{
+            font:{family:'IBM Plex Mono',size:10},
+            color:'#6b7a99',
+            boxWidth:12,
+            padding:10,
+            filter:function(item){
+              return item.text.indexOf('(sel)')<0;
+            }
+          }
+        },
+        tooltip:{
+          backgroundColor:'#fff',
+          borderColor:'#dde3ee',
+          borderWidth:1,
+          titleColor:'#1a2035',
+          bodyColor:'#6b7a99',
+          titleFont:{family:'IBM Plex Mono',size:10},
+          bodyFont:{family:'IBM Plex Mono',size:10},
+          callbacks:{
+            title:function(items){
+              if(!items.length) return '';
+              const b=items[0].dataIndex;
+              return 'SI \u533a\u95f4: ['+edges[b].toFixed(3)+', '+edges[b+1].toFixed(3)+']';
+            },
+            label:function(c){
+              if(c.dataset.label.indexOf('(sel)')>=0) return null;
+              return '  '+c.dataset.label+': '+c.parsed.y.toFixed(2)+'%';
+            }
+          }
+        }
+      },
       scales:{
-        x:{grid:{color:'#eef1f7'},title:{display:true,text:MODEL_NAMES[0]+' mean_si',
-           font:{family:'IBM Plex Mono',size:10},color:COLORS[0]},
-           ticks:{font:{family:'IBM Plex Mono',size:9},color:'#6b7a99'}},
-        y:{grid:{color:'#eef1f7'},title:{display:true,text:MODEL_NAMES[1]+' mean_si',
-           font:{family:'IBM Plex Mono',size:10},color:COLORS[1]},
-           ticks:{font:{family:'IBM Plex Mono',size:9},color:'#6b7a99'}}
+        x:{
+          grid:{color:'#eef1f7'},
+          ticks:{
+            font:{family:'IBM Plex Mono',size:9},
+            color:'#6b7a99',
+            maxTicksLimit:10,
+            maxRotation:0
+          },
+          title:{display:true,text:'mean_si',
+                 font:{family:'IBM Plex Mono',size:10},color:'#6b7a99'}
+        },
+        y:{
+          grid:{color:'#eef1f7'},
+          beginAtZero:true,
+          ticks:{
+            font:{family:'IBM Plex Mono',size:9},
+            color:'#6b7a99',
+            callback:function(v){return v+'%';}
+          },
+          title:{display:true,text:'\u5360\u6bd4 (%)',
+                 font:{family:'IBM Plex Mono',size:10},color:'#6b7a99'}
+        }
       }
     }
   });
 }
+
 
 function copyPath(el){
   const txt=(el.title||'').replace('\u70b9\u51fb\u590d\u5236: ','');
