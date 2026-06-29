@@ -78,13 +78,13 @@ html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--san
 .s-rank{font-family:var(--mono);font-size:10px;color:var(--mt2);}
 .s-uid{font-family:var(--mono);font-size:10px;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .s-uid mark{background:rgba(37,99,235,.15);color:var(--ac);border-radius:2px;padding:0 1px;}
-.s-si{text-align:right;font-size:10px;font-family:var(--mono);color:var(--mt);font-weight:500;}
-.s-si.best{font-weight:700;}
 .col-tag{justify-self:center;}
-.s-delta{text-align:right;font-size:10px;font-family:var(--mono);font-weight:600;color:var(--mt2);white-space:nowrap;}
-.s-delta.hi{color:#dc2626;}
-.s-delta.md{color:#ea580c;}
-.s-delta.lo{color:#6b7a99;}
+.s-tagdiff{text-align:center;font-size:11px;font-weight:700;font-family:var(--mono);}
+.s-tagdiff.same{color:var(--mt2);}
+.s-tagdiff.diff{color:#dc2626;}
+.srow.has-diff{background:rgba(220,38,38,0.04);}
+.srow.has-diff:hover{background:rgba(220,38,38,0.09);}
+.srow.has-diff.sel{background:rgba(220,38,38,0.10);}
 .pagination{padding:6px 12px;border-top:1px solid var(--bdr);display:flex;align-items:center;
   gap:8px;font-family:var(--mono);font-size:10px;color:var(--mt);background:var(--surf2);}
 .pagination button{padding:3px 10px;background:var(--surf);border:1px solid var(--bdr2);
@@ -172,14 +172,11 @@ html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--san
       </div>
       <div class="filter-row">
         <select id="diff-f" onchange="rebuild()">
-          <option value="0">全部（不按差值过滤）</option>
-          <option value="1">SI 分歧大（模型间差值 &gt; P75）</option>
-          <option value="2">SI 分歧小（模型间差值 &le; P25）</option>
-        </select>
-        <select id="absent-f" onchange="rebuild()">
-          <option value="0">包含仅部分模型覆盖的</option>
-          <option value="1">仅显示全模型覆盖</option>
-          <option value="2">仅显示部分模型覆盖</option>
+          <option value="0">全部样本</option>
+          <option value="1">&#x2757; 仅 Tag 不一致</option>
+          <option value="2">&#x2714; 仅 Tag 一致</option>
+          <option value="3">&#x26D4; 含 harmful（任意模型）</option>
+          <option value="4">&#x26A0; 模型间 Tag 冲突（高危）</option>
         </select>
       </div>
     </div>
@@ -267,10 +264,11 @@ const PAGE=100, ROW_H=36;
 let filtered=null, pageStart=0, selIdx=-1;
 let charts={};
 let stimer=null;
-let sortKey='si_0', sortAsc=false;
+let sortKey='delta', sortAsc=false;
 let activeTab='gn';
 let META=null;
 let siRanges=null;
+let alRanges=null;
 
 async function loadAll(){
   let _N=0;
@@ -334,6 +332,7 @@ async function loadAll(){
   document.getElementById('hstatus').style.display='none';
 
   computeSiRanges(MDL[0].N||0);
+  computeAlRanges(MDL[0].N||0);
   filtered=Int32Array.from({length:MDL[0].N||0},(_,i)=>i);
   renderPage();
 
@@ -359,6 +358,18 @@ function computeSiRanges(N){
   siRanges=[q(.25),q(.75)];
 }
 
+function computeAlRanges(N){
+  if(N===0||N_MODELS<2){alRanges=[0,0];return;}
+  const spreads=[];
+  for(let idx=0;idx<N;idx++){
+    const sp=getAlSpread(idx);
+    if(sp>0) spreads.push(sp);
+  }
+  spreads.sort(function(a,b){return a-b;});
+  const q=function(p){return spreads[Math.floor(p*spreads.length)]||0;};
+  alRanges=[q(.25),q(.75)];
+}
+
 function getSiSpread(idx){
   let mn=Infinity,mx=-Infinity;
   for(let mi=0;mi<N_MODELS;mi++){
@@ -366,6 +377,53 @@ function getSiSpread(idx){
     if(v!=null&&!isNaN(v)){mn=Math.min(mn,v);mx=Math.max(mx,v);}
   }
   return mx>mn?mx-mn:0;
+}
+
+function getAlSpread(idx){
+  // 两模型 mean_align 的差值（有方向：model0 - model1）
+  // 绝对值大说明 align 判断分歧大
+  if(N_MODELS<2) return 0;
+  const a0=MDL[0].MEAN_AL&&MDL[0].MEAN_AL[idx];
+  const a1=MDL[1].MEAN_AL&&MDL[1].MEAN_AL[idx];
+  if(a0==null||a1==null||isNaN(a0)||isNaN(a1)) return 0;
+  return Math.abs(a0-a1);
+}
+
+// tag 差异度：0=完全一致，越大分歧越严重
+// 用优先级距离：harmful=0,hard=1,high_inf=2,easy=3,normal=4
+const TAG_PRI=[3,2,1,0,4]; // TAG_NAMES顺序对应的优先级值
+function getTagDiff(idx){
+  if(N_MODELS<2) return 0;
+  let mn=99,mx=-99;
+  for(let mi=0;mi<N_MODELS;mi++){
+    const t=(MDL[mi].TAGS&&MDL[mi].TAGS[idx])??4;
+    const p=TAG_PRI[t]; if(p<mn) mn=p; if(p>mx) mx=p;
+  }
+  return mx-mn;
+}
+function tagsAllSame(idx){
+  if(N_MODELS<2) return true;
+  const t0=(MDL[0].TAGS&&MDL[0].TAGS[idx])??4;
+  for(let mi=1;mi<N_MODELS;mi++){
+    if(((MDL[mi].TAGS&&MDL[mi].TAGS[idx])??4)!==t0) return false;
+  }
+  return true;
+}
+function hasHarmful(idx){
+  for(let mi=0;mi<N_MODELS;mi++){
+    if(((MDL[mi].TAGS&&MDL[mi].TAGS[idx])??4)===0) return true;
+  }
+  return false;
+}
+// high_influence ↔ harmful_suspect 冲突
+function hasHighHarmfulConflict(idx){
+  let hasHI=false,hasHS=false;
+  for(let mi=0;mi<N_MODELS;mi++){
+    const t=(MDL[mi].TAGS&&MDL[mi].TAGS[idx])??4;
+    if(t===0) hasHS=true;
+    if(t===2) hasHI=true;
+  }
+  return hasHI&&hasHS;
 }
 
 function getModelCoverage(idx){
@@ -388,14 +446,14 @@ function getVal(sk,idx){
     if(key==='al')  return (MDL[mi].MEAN_AL &&MDL[mi].MEAN_AL[idx]) ??NaN;
     if(key==='wt')  return (MDL[mi].MEAN_WT &&MDL[mi].MEAN_WT[idx]) ??NaN;
   }
-  if(sk==='delta') return getSiSpread(idx);
+  if(sk==='delta') return getTagDiff(idx);
   if(sk==='rank') return (MDL[0].MEAN_SI&&MDL[0].MEAN_SI[idx])??NaN;
   if(sk==='uid')  return (MDL[0].UTT_IDS&&MDL[0].UTT_IDS[idx])||'';
   return NaN;
 }
 
 function setSort(key){
-  const rk=key==='rank'?'si_0':key;
+  const rk=key==='rank'?'delta':key;
   if(sortKey===rk){sortAsc=!sortAsc;}else{sortKey=rk;sortAsc=(key==='uid');}
   document.querySelectorAll('.th').forEach(function(t){
     t.classList.remove('active');
@@ -427,7 +485,6 @@ function rebuild(){
   const tagF =parseInt(document.getElementById('tag-f').value);
   const mtagF=parseInt(document.getElementById('model-tag-f').value);
   const diffF =parseInt(document.getElementById('diff-f').value);
-  const absentF=parseInt(document.getElementById('absent-f').value);
   const q=document.getElementById('search').value.trim().toLowerCase();
   const N=MDL[0].N||0;
   const arr=[];
@@ -442,16 +499,10 @@ function rebuild(){
       }
     }
     if(q&&!((MDL[0].UTT_IDS&&MDL[0].UTT_IDS[idx])||'').toLowerCase().includes(q)) continue;
-    if(diffF>0&&siRanges){
-      const sp=getSiSpread(idx);
-      if(diffF===1&&sp<=siRanges[1]) continue;
-      if(diffF===2&&sp>siRanges[0]) continue;
-    }
-    if(absentF>0){
-      const cov=getModelCoverage(idx);
-      if(absentF===1&&cov<N_MODELS) continue;
-      if(absentF===2&&cov===N_MODELS) continue;
-    }
+    if(diffF===1&&tagsAllSame(idx)) continue;       // 仅不一致
+    if(diffF===2&&!tagsAllSame(idx)) continue;      // 仅一致
+    if(diffF===3&&!hasHarmful(idx)) continue;       // 含harmful
+    if(diffF===4&&!hasHighHarmfulConflict(idx)) continue; // 冲突
     arr.push(idx);
   }
   if(sortKey==='uid'){
@@ -496,29 +547,31 @@ function renderPage(){
     row.className='srow'+(idx===selIdx?' sel':'');
     row.style.top=(vi*ROW_H)+'px';
     const uid=(MDL[0].UTT_IDS&&MDL[0].UTT_IDS[idx])||String(idx);
-    let maxSi=-Infinity;
+    const tagDiff=getTagDiff(idx);
+    const allSame=tagsAllSame(idx);
+    const isConflict=hasHighHarmfulConflict(idx);
+    if(!allSame) row.classList.add('has-diff');
+    // align hint in tooltip
+    let minAl=Infinity;
     for(let mi=0;mi<N_MODELS;mi++){
-      const v=(MDL[mi].MEAN_SI&&MDL[mi].MEAN_SI[idx])??NaN;
-      if(!isNaN(v)&&v>maxSi) maxSi=v;
+      const av=MDL[mi].MEAN_AL&&MDL[mi].MEAN_AL[idx];
+      if(av!=null&&!isNaN(av)&&av<minAl) minAl=av;
     }
+    const alHint=isFinite(minAl)?' al='+minAl.toFixed(3):'';
     let cells='<div class="s-rank">'+(idx+1)+'</div>';
-    cells+='<div class="s-uid" title="'+escH(uid)+'">'+highlight(uid,q)+'</div>';
+    cells+='<div class="s-uid" title="'+escH(uid)+alHint+'">'+highlight(uid,q)+'</div>';
+    // 每个模型只显示 tag badge，用模型色边框区分
     for(let mi=0;mi<N_MODELS;mi++){
-      const si=(MDL[mi].MEAN_SI&&MDL[mi].MEAN_SI[idx])??NaN;
       const tag=(MDL[mi].TAGS&&MDL[mi].TAGS[idx])??4;
       const tagName=TAG_NAMES[tag];
-      const isBest=(!isNaN(si)&&si===maxSi&&N_MODELS>1);
-      const absent=isNaN(si)||si==null;
-      const siStyle=isBest?'color:'+COLORS[mi]:absent?'color:var(--mt2)':'';
-      cells+='<div class="s-si'+(isBest?' best':'')+'" style="'+siStyle+'">'+(absent?'\u2014':si.toFixed(3))+'</div>';
-      cells+='<div class="col-tag"><span class="badge '+(absent?'absent':tagName)+'">'+(absent?'n/a':tagName.replace(/_/g,' '))+'</span></div>';
+      const absent=(MDL[mi].MEAN_AL==null||MDL[mi].MEAN_AL[idx]==null||isNaN(MDL[mi].MEAN_AL[idx]));
+      cells+='<div class="col-tag" style="border-bottom:2px solid '+(absent?'transparent':COLORS[mi])+'">'
+        +'<span class="badge '+(absent?'absent':tagName)+'">'+(absent?'n/a':tagName.replace(/_/g,' '))+'</span></div>';
     }
-    // Δsi cell
-    const sp=getSiSpread(idx);
-    let dCls='lo';
-    if(siRanges&&sp>siRanges[1]) dCls='hi';
-    else if(siRanges&&sp>siRanges[0]) dCls='md';
-    cells+='<div class="s-delta '+dCls+'">'+(isFinite(sp)&&sp>0?sp.toFixed(2):'\u2014')+'</div>';
+    // tag 差异列
+    const diffSymbol=allSame?'\u2714':(isConflict?'\u26d4':'\u2260');
+    const diffCls=allSame?'same':'diff';
+    cells+='<div class="s-tagdiff '+diffCls+'">'+diffSymbol+'</div>';
     row.innerHTML=cells;
     row.addEventListener('click',(function(i,r){return function(){selectSample(i,r);};})(idx,row));
     inner.appendChild(row);
@@ -552,7 +605,7 @@ function selectSample(idx,el){
       '<div class="mc-vals">'+
         '<div class="mc-item"><div class="mc-lbl">mean_si</div><div class="mc-val" style="color:'+COLORS[mi]+'">'+fmt(si,3)+'</div></div>'+
         '<div class="mc-item"><div class="mc-lbl">mean_gn</div><div class="mc-val">'+fmt(gn,4)+'</div></div>'+
-        '<div class="mc-item"><div class="mc-lbl">mean_al</div><div class="mc-val">'+fmt(al,4)+'</div></div>'+
+        '<div class="mc-item"><div class="mc-lbl">mean_al</div><div class="mc-val" style="color:'+(al!=null&&!isNaN(al)?(al<-0.1?'#dc2626':al>0.1?'#16a34a':'#6b7a99'):'#6b7a99')+'">'+fmt(al,4)+'</div></div>'+
         '<div class="mc-item"><div class="mc-lbl">tag</div><div class="mc-val" style="font-size:10px;font-weight:500">'+tag+'</div></div>'+
       '</div>');
     sg.appendChild(card);
