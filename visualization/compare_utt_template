@@ -215,7 +215,7 @@ html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--san
       <div class="tab active" data-tab="gn" onclick="switchTab('gn')">grad_norm</div>
       <div class="tab" data-tab="al" onclick="switchTab('al')">align</div>
       @@WEIGHT_TAB_HTML@@
-      <div class="tab" data-tab="scatter" onclick="switchTab('scatter')">SI 分布对比</div>
+      <div class="tab" data-tab="scatter" onclick="switchTab('scatter')">Tag 对比</div>
     </div>
 
     <div class="chart-area">
@@ -238,8 +238,8 @@ html,body{height:100%;background:var(--bg);color:var(--tx);font-family:var(--san
       @@WEIGHT_PANEL_HTML@@
       <div id="tab-scatter" class="tab-panel">
         <div class="chart-block">
-          <div class="chart-block-title">mean_si 分布对比（各模型直方图，竖线=当前选中）</div>
-          <div class="chart-wrap"><canvas id="chartSIDist"></canvas></div>
+          <div class="chart-block-title">Tag 分布对比（分组柱状图）·选中样本高亮显示</div>
+          <div class="chart-wrap"><canvas id="chartTagDist"></canvas></div>
         </div>
       </div>
     </div>
@@ -579,7 +579,7 @@ function drawTab(tab,idx){
   if(tab==='gn')      drawGnChart(idx);
   else if(tab==='al') drawAlChart(idx);
   else if(tab==='wt') drawWtChart(idx);
-  else if(tab==='scatter') drawSIDist(idx);
+  else if(tab==='scatter') drawTagDist(idx);
 }
 
 function switchTab(t){
@@ -689,105 +689,65 @@ function drawWtChart(idx){
   });
 }
 
-function drawSIDist(curIdx){
+function drawTagDist(curIdx){
   destroyChart('scatter');
-  const el=document.getElementById('chartSIDist'); if(!el) return;
+  const el=document.getElementById('chartTagDist'); if(!el) return;
+  const N=MDL[0].N||0;
 
-  // --- build histogram for each model ---
-  const BINS=30;
-  // 1. collect all SI values per model, find global range
-  let gmin=Infinity, gmax=-Infinity;
-  const modelVals=[];
-  for(let mi=0;mi<N_MODELS;mi++){
-    const arr=[];
-    const sv=MDL[mi].MEAN_SI;
-    const N=MDL[mi].N||0;
-    if(sv){
-      for(let i=0;i<N;i++){
-        const v=Number(sv[i]);
-        if(isFinite(v)){
-          arr.push(v);
-          if(v<gmin) gmin=v;
-          if(v>gmax) gmax=v;
-        }
-      }
-    }
-    modelVals.push(arr);
-  }
+  // TAG_NAMES order: harmful_suspect hard high_influence easy_redundant normal
+  const TAG_LABELS=['harmful', 'hard', 'high_inf', 'easy_red', 'normal'];
+  const TAG_COLORS=['#dc2626','#ea580c','#7c3aed','#16a34a','#9aa3ba'];
 
-  if(!isFinite(gmin)){
-    const ctx=el.getContext('2d');
-    ctx.clearRect(0,0,el.width,el.height);
-    ctx.fillStyle='#6b7a99'; ctx.font='13px IBM Plex Mono';
-    ctx.fillText('No valid SI data',20,40);
-    return;
-  }
-
-  // 2. build bin edges
-  const pad=(gmax-gmin)*0.02||0.01;
-  gmin-=pad; gmax+=pad;
-  const binW=(gmax-gmin)/BINS;
-  const edges=Array.from({length:BINS+1},function(_,i){return gmin+i*binW;});
-  const labels=Array.from({length:BINS},function(_,i){
-    return ((gmin+(i+0.5)*binW)).toFixed(3);
-  });
-
-  // 3. fill counts → normalize to density (% of model total)
+  // count tags per model (% of total valid)
   const datasets=MODEL_NAMES.map(function(nm,mi){
-    const vals=modelVals[mi];
-    const counts=new Array(BINS).fill(0);
-    vals.forEach(function(v){
-      let b=Math.floor((v-gmin)/binW);
-      if(b>=BINS) b=BINS-1;
-      if(b>=0) counts[b]++;
-    });
-    const total=vals.length||1;
+    const tv=MDL[mi].TAGS;
+    if(!tv) return {label:nm,data:[0,0,0,0,0],backgroundColor:COLORS[mi]+'99',
+                    borderColor:COLORS[mi],borderWidth:1.5,borderRadius:3};
+    const cnt=[0,0,0,0,0];
+    let total=0;
+    for(let i=0;i<N;i++){
+      const t=tv[i]; if(t>=0&&t<=4){cnt[t]++;total++;}
+    }
     return {
       label:nm,
-      data:counts.map(function(c){return parseFloat((c/total*100).toFixed(3));}),
+      data:cnt.map(function(c){return total?parseFloat((c/total*100).toFixed(2)):0;}),
+      backgroundColor:COLORS[mi]+'99',
       borderColor:COLORS[mi],
-      backgroundColor:COLORS_ALPHA[mi],
-      borderWidth:2,
-      pointRadius:0,
-      fill:true,
-      tension:0.35,
-      order:mi+1
+      borderWidth:1.5,
+      borderRadius:3,
+      borderSkipped:false
     };
   });
 
-  // 4. selected utterance vertical marker — find its bin per model
-  // We annotate via a dataset of a single-bin spike
-  const selAnnotations=[];
-  MODEL_NAMES.forEach(function(nm,mi){
+  // selected utterance: which tag does each model assign?
+  // draw as separate dataset with full opacity and thick border
+  const selDatasets=MODEL_NAMES.map(function(nm,mi){
+    const tv=MDL[mi].TAGS;
     const sv=MDL[mi].MEAN_SI;
-    if(!sv) return;
-    const v=Number(sv[curIdx]);
-    if(!isFinite(v)) return;
-    let b=Math.floor((v-gmin)/binW);
-    if(b>=BINS) b=BINS-1;
-    if(b<0) return;
-    // vertical line: spike dataset with 0 everywhere except bin b
-    const spike=new Array(BINS).fill(null);
-    spike[b]=100; // full height
-    selAnnotations.push({
-      label:nm+' (sel)',
-      data:spike,
-      borderColor:COLORS[mi],
+    const absent=!tv||!sv||(sv[curIdx]==null)||isNaN(Number(sv[curIdx]));
+    const selTag=absent?-1:(tv[curIdx]??-1);
+    // bar only at the selected tag bin, 0 elsewhere
+    const d=[0,0,0,0,0];
+    if(selTag>=0&&selTag<=4) d[selTag]=100; // marker height (shown on secondary axis)
+    return {
+      label:nm+' \u9009\u4e2d',
+      data:d,
       backgroundColor:'transparent',
-      borderWidth:2.5,
-      borderDash:[4,3],
-      pointRadius:0,
-      fill:false,
-      tension:0,
-      spanGaps:false,
-      order:0
-    });
+      borderColor:absent?'transparent':COLORS[mi],
+      borderWidth:3,
+      borderRadius:4,
+      borderSkipped:false,
+      yAxisID:'yMark'
+    };
   });
 
-  if(charts.scatter) charts.scatter.destroy();
+  destroyChart('scatter');
   charts.scatter=new Chart(el.getContext('2d'),{
-    type:'line',
-    data:{labels:labels, datasets:datasets.concat(selAnnotations)},
+    type:'bar',
+    data:{
+      labels:TAG_LABELS,
+      datasets:datasets.concat(selDatasets)
+    },
     options:{
       responsive:true,
       maintainAspectRatio:false,
@@ -800,10 +760,10 @@ function drawSIDist(curIdx){
           labels:{
             font:{family:'IBM Plex Mono',size:10},
             color:'#6b7a99',
-            boxWidth:12,
+            boxWidth:10,
             padding:10,
             filter:function(item){
-              return item.text.indexOf('(sel)')<0;
+              return item.text.indexOf('\u9009\u4e2d')<0;
             }
           }
         },
@@ -813,17 +773,12 @@ function drawSIDist(curIdx){
           borderWidth:1,
           titleColor:'#1a2035',
           bodyColor:'#6b7a99',
-          titleFont:{family:'IBM Plex Mono',size:10},
+          titleFont:{family:'IBM Plex Mono',size:11},
           bodyFont:{family:'IBM Plex Mono',size:10},
           callbacks:{
-            title:function(items){
-              if(!items.length) return '';
-              const b=items[0].dataIndex;
-              return 'SI \u533a\u95f4: ['+edges[b].toFixed(3)+', '+edges[b+1].toFixed(3)+']';
-            },
             label:function(c){
-              if(c.dataset.label.indexOf('(sel)')>=0) return null;
-              return '  '+c.dataset.label+': '+c.parsed.y.toFixed(2)+'%';
+              if(c.dataset.label.indexOf('\u9009\u4e2d')>=0) return null;
+              return '  '+c.dataset.label+': '+c.parsed.y.toFixed(1)+'%';
             }
           }
         }
@@ -831,18 +786,13 @@ function drawSIDist(curIdx){
       scales:{
         x:{
           grid:{color:'#eef1f7'},
-          ticks:{
-            font:{family:'IBM Plex Mono',size:9},
-            color:'#6b7a99',
-            maxTicksLimit:10,
-            maxRotation:0
-          },
-          title:{display:true,text:'mean_si',
-                 font:{family:'IBM Plex Mono',size:10},color:'#6b7a99'}
+          ticks:{font:{family:'IBM Plex Mono',size:10},color:'#6b7a99'}
         },
         y:{
-          grid:{color:'#eef1f7'},
+          type:'linear',
+          position:'left',
           beginAtZero:true,
+          grid:{color:'#eef1f7'},
           ticks:{
             font:{family:'IBM Plex Mono',size:9},
             color:'#6b7a99',
@@ -850,6 +800,13 @@ function drawSIDist(curIdx){
           },
           title:{display:true,text:'\u5360\u6bd4 (%)',
                  font:{family:'IBM Plex Mono',size:10},color:'#6b7a99'}
+        },
+        yMark:{
+          type:'linear',
+          position:'right',
+          min:0,max:100,
+          display:false,
+          grid:{display:false}
         }
       }
     }
