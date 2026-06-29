@@ -99,140 +99,183 @@ def normalize_uid(raw):
 
 
 def load_model_data(name, contrib_dir, egs_path=""):
-    """加载单个模型的所有数据，返回 dict。"""
+    """
+    完全从 npz 重新计算所有指标和 tag，不依赖 summary CSV。
+    tag 判断逻辑与 sample_tracker.summarize 完全一致。
+    """
     print(f"\n  ── 模型 [{name}] ──")
     print(f"     目录: {os.path.abspath(contrib_dir)}")
 
-    # 1. Summary CSV
-    sp = ""
-    for nm in ("contrib_summary_with_uttid.csv", "contrib_summary.csv"):
-        p = os.path.join(contrib_dir, nm)
-        if os.path.exists(p):
-            sp = p
-            break
-    if not sp:
-        print(f"  ❌ [{name}] 找不到 summary CSV，跳过")
+    # ── 1. 找所有 npz ──
+    files = sorted(glob.glob(os.path.join(contrib_dir, "contrib_epoch*.npz")))
+    if not files:
+        print(f"  ❌ [{name}] 没有找到 contrib_epoch*.npz，跳过")
         return None
+    ne = len(files)
+    print(f"     .npz 文件数: {ne}")
 
-    egs_rows = []
-    with open(sp, newline="", encoding="utf-8") as f:
-        for r in csv.DictReader(f):
-            egs_rows.append(r)
-    n_egs = len(egs_rows)
-    print(f"     egs 样本数: {n_egs}")
+    # ── 2. 收集所有 sample id，建立 id → 行号 映射 ──
+    d0    = np.load(files[0], allow_pickle=True)
+    all_ids = list(d0["ids"].astype(str))
+    id2idx  = {sid: i for i, sid in enumerate(all_ids)}
+    for fp in files[1:]:
+        d = np.load(fp, allow_pickle=True)
+        for sid in d["ids"].astype(str):
+            if sid not in id2idx:
+                id2idx[sid] = len(all_ids)
+                all_ids.append(sid)
+    n_samples = len(all_ids)
+    print(f"     样本总数: {n_samples}")
 
-    # 2. idx → utt_id 映射
-    idx2utt = {}
+    # ── 3. utt_id 映射（优先 egs，其次 npz utt_ids 字段）──
+    id2utt = {}
     if egs_path and os.path.exists(egs_path):
         with open(egs_path, encoding="utf-8") as f:
             first = f.readline()
             delim = "\t" if "\t" in first else " "
-        egs_uttid2lineno = {}
         with open(egs_path, encoding="utf-8") as f:
-            data_i = 0
-            for line in f:
+            for li, line in enumerate(f):
                 p = line.strip().split(delim)
-                if not p or not p[0]: continue
-                if not any(c.isdigit() for c in p[0]): continue
-                egs_uttid2lineno[p[0]] = data_i
-                data_i += 1
-        lineno2uttid = {v: k for k, v in egs_uttid2lineno.items()}
-        for i, row in enumerate(egs_rows):
-            csv_id = row.get("id", "")
-            try:
-                lineno = int(csv_id)
-                raw = lineno2uttid.get(lineno)
-                if raw:
-                    idx2utt[i] = raw
-            except (ValueError, TypeError):
-                pass
-    elif egs_rows and "utt_id" in egs_rows[0]:
-        idx2utt = {i: r["utt_id"] for i, r in enumerate(egs_rows) if r.get("utt_id")}
+                if p and p[0]:
+                    id2utt[str(li)] = p[0]
+        print(f"     egs utt_id: {len(id2utt)} 条")
+    elif "utt_ids" in d0:
+        for sid, uid in zip(d0["ids"].astype(str), d0["utt_ids"].astype(str)):
+            id2utt[sid] = uid
+        print(f"     utt_id 来自 npz: {len(id2utt)} 条")
 
-    # 3. Epoch 轨迹
-    files = sorted(glob.glob(os.path.join(contrib_dir, "contrib_epoch*.npz")))
-    print(f"     .npz 文件数: {len(files)}")
-
-    id2idx_egs = {r["id"]: i for i, r in enumerate(egs_rows)}
-    epochs = []
-    gn_egs = al_egs = wt_egs = None
-    has_traj   = len(files) > 0
+    # ── 4. 读入所有 epoch 数据到矩阵 ──
+    gn_mat = np.full((n_samples, ne), np.nan, dtype=np.float32)
+    al_mat = np.full((n_samples, ne), np.nan, dtype=np.float32)
+    ls_mat = np.full((n_samples, ne), np.nan, dtype=np.float32)
+    co_mat = np.full((n_samples, ne), -1,     dtype=np.int8)
+    wt_mat = np.full((n_samples, ne), np.nan, dtype=np.float32)
     has_weight = False
+    epochs = []
 
-    if has_traj:
-        ne = len(files)
-        gn_egs = np.full((n_egs, ne), np.nan, dtype=np.float32)
-        al_egs = np.full((n_egs, ne), np.nan, dtype=np.float32)
-        wt_egs = np.full((n_egs, ne), np.nan, dtype=np.float32)
+    for ei, fp in enumerate(files):
+        ep = int(os.path.basename(fp)[len("contrib_epoch"):-len(".npz")])
+        epochs.append(ep)
+        d = np.load(fp, allow_pickle=True)
+        ids_str = d["ids"].astype(str)
+        # 统一走 id2idx 映射，避免直接用整数值当下标导致错位
+        idxs = np.array([id2idx.get(s, -1) for s in ids_str], dtype=np.int64)
+        m = idxs >= 0
+        gn_mat[idxs[m], ei] = d["grad_norm"][m]
+        al_mat[idxs[m], ei] = d["align"][m]
+        if "loss" in d:
+            ls_mat[idxs[m], ei] = d["loss"][m]
+        if "correct" in d:
+            co_mat[idxs[m], ei] = d["correct"][m]
+        if "focal_weight" in d:
+            has_weight = True
+            wt_mat[idxs[m], ei] = d["focal_weight"][m]
+        # utt_id fallback：第一个 epoch 补充映射
+        if ei == 0 and "utt_ids" in d and not id2utt:
+            for sid, uid in zip(ids_str, d["utt_ids"].astype(str)):
+                id2utt[sid] = uid
 
-        for ei, fp in enumerate(files):
-            ep = int(os.path.basename(fp)[len("contrib_epoch"):-len(".npz")])
-            epochs.append(ep)
-            d = np.load(fp, allow_pickle=True)
-            ids_str = d["ids"].astype(str)
-            idxs = np.array([id2idx_egs.get(s, -1) for s in ids_str], dtype=np.int64)
-            m = idxs >= 0
-            gn_egs[idxs[m], ei] = d["grad_norm"][m]
-            al_egs[idxs[m], ei] = d["align"][m]
-            if "focal_weight" in d:
-                has_weight = True
-                wt_egs[idxs[m], ei] = d["focal_weight"][m]
-            if ei == 0 and "utt_ids" in d and len(idx2utt) == 0:
-                utt_ids_npz = d["utt_ids"].astype(str)
-                for k in range(len(ids_str)):
-                    egs_i = idxs[k]
-                    if egs_i >= 0:
-                        idx2utt[egs_i] = utt_ids_npz[k]
-        epochs = sorted(epochs)
+    epochs = sorted(epochs)
 
-    # 4. 聚合到 utterance
-    utt2chunks = defaultdict(list)
-    for i, row in enumerate(egs_rows):
-        raw = idx2utt.get(i, row.get("id", str(i)))
+    # ── 5. 从矩阵重新计算所有统计量（与 sample_tracker.summarize 完全一致）──
+    with np.errstate(all="ignore"):
+        mean_gn  = np.nanmean(gn_mat, axis=1)
+        mean_al  = np.nanmean(al_mat, axis=1)
+        mean_ls  = np.nanmean(ls_mat, axis=1)
+        self_inf = np.nansum(gn_mat ** 2, axis=1)   # SI = Σ gn²
+
+        # frac_neg_align
+        valid_al = ~np.isnan(al_mat)
+        n_val_al = valid_al.sum(axis=1).astype(np.float32)
+        frac_neg = np.where(n_val_al > 0,
+                            ((al_mat < 0) & valid_al).sum(axis=1) / n_val_al,
+                            np.nan)
+
+        # forget events（学了又忘）
+        forget = np.zeros(n_samples, dtype=np.int32)
+        if ne > 1:
+            forget = ((co_mat[:, :-1] == 1) & (co_mat[:, 1:] == 0)).sum(axis=1)
+        final_co = co_mat[:, -1]
+
+        # focal weight
+        mean_wt = np.nanmean(wt_mat, axis=1) if has_weight else np.full(n_samples, np.nan)
+
+    # ── 6. 统一打 tag（与 sample_tracker 逻辑一致，基于全局分位数）──
+    hi_inf  = np.nanpercentile(self_inf, 90)
+    valid_ma = mean_al[~np.isnan(mean_al)]
+    lo_aln  = np.nanpercentile(valid_ma, 10) if len(valid_ma) else -np.inf
+
+    tags = np.full(n_samples, 4, dtype=np.int8)   # 4 = normal
+    easy_mask = (~np.isnan(mean_ls)) & (mean_ls < 1e-2) & (forget == 0)
+    tags[easy_mask] = 0                             # easy_redundant
+    tags[self_inf >= hi_inf] = 1                    # high_influence
+    tags[(forget >= 2) | (final_co == 0)] = 2       # hard
+    harmful = ( (~np.isnan(mean_al)) & (mean_al < 0) &
+                (mean_al <= lo_aln) &
+                ((final_co == 0) | (final_co == -1)) )
+    tags[harmful] = 3                               # harmful_suspect
+
+    print(f"     tag 分布: " + "  ".join(
+        f"{TAG_NAMES[t]}={int((tags==t).sum())}" for t in range(5)))
+
+    # ── 7. 聚合到 utterance ──
+    utt2chunks = defaultdict(list)   # utt_id → [sample行号, ...]
+    for i, sid in enumerate(all_ids):
+        raw = id2utt.get(sid, sid)
         key = normalize_uid(raw)
         utt2chunks[key].append(i)
 
     utt_ids_list = sorted(utt2chunks.keys())
     n_utt = len(utt_ids_list)
-    print(f"     utterance 数: {n_utt}  (has_traj={has_traj}, has_weight={has_weight})")
+    print(f"     utterance 数: {n_utt}  (has_weight={has_weight})")
+
+    def nanmean(arr, idxs):
+        v = arr[idxs]; v = v[~np.isnan(v)]
+        return float(np.mean(v)) if len(v) else float("nan")
+    def nanmax(arr, idxs):
+        v = arr[idxs]; v = v[~np.isnan(v)]
+        return float(np.max(v)) if len(v) else float("nan")
+    def nanstd(arr, idxs):
+        v = arr[idxs]; v = v[~np.isnan(v)]
+        return float(np.std(v)) if len(v) > 1 else 0.0
 
     utt_data = {}
     for utt_id in utt_ids_list:
-        chunk_idxs = utt2chunks[utt_id]
-        nc = len(chunk_idxs)
+        ci = np.array(utt2chunks[utt_id], dtype=np.int64)  # chunk indices
+        nc = len(ci)
 
-        def arr(key): return [fv(egs_rows[i], key) for i in chunk_idxs]
-        def sm(lst):  v=[x for x in lst if not np.isnan(x)]; return float(np.mean(v)) if v else float("nan")
-        def sx(lst):  v=[x for x in lst if not np.isnan(x)]; return float(np.max(v))  if v else float("nan")
-        def sd(lst):  v=[x for x in lst if not np.isnan(x)]; return float(np.std(v))  if len(v)>1 else 0.0
+        # utterance 级别的指标 = 对所属 chunk 的均值/最大
+        u_mean_si  = nanmean(self_inf, ci)
+        u_max_si   = nanmax(self_inf,  ci)
+        u_mean_gn  = nanmean(mean_gn,  ci)
+        u_max_gn   = nanmax(mean_gn,   ci)
+        u_gn_std   = nanstd(mean_gn,   ci)
+        u_mean_al  = nanmean(mean_al,  ci)
+        u_mean_fn  = nanmean(frac_neg, ci)
+        u_mean_fo  = float(np.mean(forget[ci]))
+        u_mean_fc  = float(np.mean((final_co[ci] == 1).astype(float)))
+        u_mean_wt  = nanmean(mean_wt,  ci) if has_weight else float("nan")
+        u_wt_std   = nanstd(mean_wt,   ci) if has_weight else 0.0
 
-        si = arr("self_influence"); gn = arr("mean_grad_norm")
-        al = arr("mean_align");     fn = arr("frac_neg_align")
-        fo = arr("forget_events");  fc = arr("final_correct")
+        # worst tag：优先级 harmful(3) > hard(2) > high_inf(1) > easy(0) > normal(4)
+        # tag 数字越小优先级越高，但 normal=4 是最低，需要特殊处理
+        chunk_tags = tags[ci]
+        # 优先级顺序：3(harmful) > 2(hard) > 1(high_inf) > 0(easy) > 4(normal)
+        PRIORITY = {3:0, 2:1, 1:2, 0:3, 4:4}
+        worst_tag = int(min(chunk_tags, key=lambda t: PRIORITY[int(t)]))
 
-        tags     = [TAG_MAP.get(egs_rows[i].get("tag", "normal"), 4) for i in chunk_idxs]
-        worst_tag = min(tags)
-
-        gn_traj = al_traj = wt_traj = None
-        mean_wt = float("nan"); wt_std = 0.0
-        if has_traj:
-            gn_traj = np.nanmean(gn_egs[chunk_idxs, :], axis=0)
-            al_traj = np.nanmean(al_egs[chunk_idxs, :], axis=0)
-            if has_weight:
-                wt_traj = np.nanmean(wt_egs[chunk_idxs, :], axis=0)
-                wt_flat  = wt_egs[chunk_idxs, :].flatten()
-                wt_valid = wt_flat[~np.isnan(wt_flat)]
-                if len(wt_valid):
-                    mean_wt = float(np.mean(wt_valid))
-                    wt_std  = float(np.std(wt_valid)) if len(wt_valid) > 1 else 0.0
+        # epoch 轨迹（utterance 内所有 chunk 的均值）
+        gn_traj = np.nanmean(gn_mat[ci, :], axis=0)
+        al_traj = np.nanmean(al_mat[ci, :], axis=0)
+        wt_traj = np.nanmean(wt_mat[ci, :], axis=0) if has_weight else None
 
         utt_data[utt_id] = dict(
             n_chunks=nc,
-            mean_si=sm(si), max_si=sx(si),
-            mean_gn=sm(gn), max_gn=sx(gn), gn_std=sd(gn),
-            mean_al=sm(al), mean_fn=sm(fn),
-            mean_fo=sm(fo), mean_fc=sm(fc),
-            mean_wt=mean_wt, wt_std=wt_std,
+            mean_si=u_mean_si, max_si=u_max_si,
+            mean_gn=u_mean_gn, max_gn=u_max_gn, gn_std=u_gn_std,
+            mean_al=u_mean_al, mean_fn=u_mean_fn,
+            mean_fo=u_mean_fo, mean_fc=u_mean_fc,
+            mean_wt=u_mean_wt, wt_std=u_wt_std,
             worst_tag=worst_tag,
             gn_traj=gn_traj, al_traj=al_traj, wt_traj=wt_traj,
         )
@@ -241,9 +284,9 @@ def load_model_data(name, contrib_dir, egs_path=""):
         name=name,
         utt_data=utt_data,
         epochs=epochs,
-        has_traj=has_traj,
+        has_traj=True,
         has_weight=has_weight,
-        n_egs=n_egs,
+        n_egs=n_samples,
     )
 
 
@@ -634,7 +677,7 @@ def make_html(model_names, bin_filenames, meta_filename,
     # Δsi column header
     th_cells += (
         '<span class="th th-r" onclick="setSort(' + SQ + 'delta' + SQ + ')"'
-        ' id="th-delta">&Delta;si<span class="arrow"></span></span>'
+        ' id="th-delta">&Delta;al<span class="arrow"></span></span>'
     )
 
     weight_tab_html = (
