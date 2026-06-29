@@ -579,12 +579,18 @@ def make_html(model_names, bin_filenames, meta_filename,
     th_cells = '<span class="th" onclick="setSort(\'rank\')" id="th-rank">#<span class="arrow"></span></span>'
     th_cells += '<span class="th" onclick="setSort(\'uid\')" id="th-uid">utt_id<span class="arrow"></span></span>'
     for i, nm in enumerate(model_names):
-        th_cells += (f'<span class="th th-r model-th" onclick="setSort(\'si_{i}\')" id="th-si-{i}" '
-                     f'style="color:{colors[i]}">'
-                     f'<span class="th-dot" style="background:{colors[i]}"></span>'
-                     f'{nm[:8]} si<span class="arrow"></span></span>')
-        th_cells += (f'<span class="th th-c" onclick="setSort(\'tag_{i}\')" id="th-tag-{i}">'
-                     f'tag<span class="arrow"></span></span>')
+        sort_si  = 'si_{}'.format(i)
+        sort_tag = 'tag_{}'.format(i)
+        th_cells += (
+            '<span class="th th-r model-th" onclick="setSort(\'{sort_si}\')" id="th-si-{i}"'
+            ' style="color:{col}">'
+            '<span class="th-dot" style="background:{col}"></span>'
+            '{nm8} si<span class="arrow"></span></span>'
+        ).format(sort_si=sort_si, i=i, col=colors[i], nm8=nm[:8])
+        th_cells += (
+            '<span class="th th-c" onclick="setSort(\'{sort_tag}\')" id="th-tag-{i}">'
+            'tag<span class="arrow"></span></span>'
+        ).format(sort_tag=sort_tag, i=i)
 
     return f"""<!DOCTYPE html>
 <html lang="zh"><head>
@@ -997,7 +1003,7 @@ function getModelCoverage(idx){{
 }}
 
 function getVal(sk,idx){{
-  const m=sk.match(/^(si|tag|gn|al|wt)_(\d+)$/);
+  const m=sk.match(/^(si|tag|gn|al|wt)_(\\d+)$/);
   if(m){{
     const mi=parseInt(m[2]);
     if(m[1]==='si')  return MDL[mi].MEAN_SI?.[idx]??NaN;
