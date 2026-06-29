@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>Scatter Test</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+body{background:#f4f6fa;font-family:monospace;padding:20px;}
+.wrap{display:flex;gap:20px;flex-wrap:wrap;}
+.box{background:#fff;border:1px solid #dde3ee;border-radius:6px;padding:12px;width:480px;height:400px;position:relative;}
+canvas{position:absolute;inset:12px;}
+h3{margin:0 0 8px;font-size:12px;color:#6b7a99;}
+</style>
+</head><body>
+<h2 style="font-size:14px;color:#2563eb;margin-bottom:16px">散点图独立测试 — Chart.js 4.4.1</h2>
+<div class="wrap">
+  <div>
+    <h3>Test 1: 基础 scatter（静态假数据）</h3>
+    <div class="box"><canvas id="c1"></canvas></div>
+  </div>
+  <div>
+    <h3>Test 2: 含高亮选中点 + 对角线（点阵模拟）</h3>
+    <div class="box"><canvas id="c2"></canvas></div>
+  </div>
+  <div>
+    <h3>Test 3: 从 display:none 容器切换后绘制</h3>
+    <div style="display:flex;gap:8px;margin-bottom:8px;">
+      <button onclick="show('hidden-box','c3',makeC3)">点击显示并绘制</button>
+    </div>
+    <div class="box" id="hidden-box" style="display:none;"><canvas id="c3"></canvas></div>
+  </div>
+</div>
+<div id="log" style="margin-top:20px;font-size:11px;color:#6b7a99;white-space:pre;"></div>
+
+<script>
+function log(msg){ document.getElementById('log').textContent += msg + '\n'; }
+
+// ── Test 1: plain scatter ──
+(function(){
+  const pts = Array.from({length:200}, function(){ return {x:Math.random()*10, y:Math.random()*10}; });
+  new Chart(document.getElementById('c1').getContext('2d'),{
+    type:'scatter',
+    data:{datasets:[{
+      label:'points', data:pts,
+      backgroundColor:'rgba(37,99,235,0.25)', pointRadius:3, pointBorderWidth:0
+    }]},
+    options:{responsive:true,maintainAspectRatio:false,animation:{duration:0},
+      plugins:{legend:{display:false}},
+      scales:{x:{grid:{color:'#eef1f7'}},y:{grid:{color:'#eef1f7'}}}}
+  });
+  log('Test 1 rendered: '+pts.length+' points');
+})();
+
+// ── Test 2: multi-dataset scatter with diagonal dot-line ──
+(function(){
+  const all = Array.from({length:300}, function(){
+    const x=Math.random()*10; return {x:x, y:x*(0.8+Math.random()*0.4)+Math.random()*2-1};
+  });
+  const sel = [{x:5.5, y:5.8}];
+  const diag = Array.from({length:50}, function(_,i){ const v=i*10/49; return {x:v,y:v}; });
+  new Chart(document.getElementById('c2').getContext('2d'),{
+    type:'scatter',
+    data:{datasets:[
+      {label:'diag',  data:diag, backgroundColor:'rgba(180,192,210,0.6)', pointRadius:1.2, pointBorderWidth:0, order:10},
+      {label:'all',   data:all,  backgroundColor:'rgba(107,122,153,0.25)', pointRadius:2.5, pointBorderWidth:0, order:2},
+      {label:'sel',   data:sel,  backgroundColor:'#2563eb', pointRadius:9, pointBorderColor:'#fff', pointBorderWidth:2, order:1},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,animation:{duration:0},
+      plugins:{legend:{display:false},
+        tooltip:{callbacks:{label:function(c){
+          return c.datasetIndex===2?'selected: ('+c.parsed.x.toFixed(2)+', '+c.parsed.y.toFixed(2)+')':
+                 c.datasetIndex===0?null:'('+c.parsed.x.toFixed(2)+', '+c.parsed.y.toFixed(2)+')';}}}},
+      scales:{x:{grid:{color:'#eef1f7'},min:-0.5,max:10.5},y:{grid:{color:'#eef1f7'},min:-0.5,max:10.5}}}
+  });
+  log('Test 2 rendered: all='+all.length+' sel='+sel.length+' diag='+diag.length);
+})();
+
+// ── Test 3: show hidden container then draw ──
+var c3chart = null;
+function makeC3(){
+  const el = document.getElementById('c3');
+  log('Test 3 canvas size: '+el.offsetWidth+'x'+el.offsetHeight);
+  const pts = Array.from({length:100}, function(){ return {x:Math.random()*10, y:Math.random()*10}; });
+  c3chart = new Chart(el.getContext('2d'),{
+    type:'scatter',
+    data:{datasets:[{label:'pts',data:pts,backgroundColor:'rgba(220,38,38,0.3)',pointRadius:4,pointBorderWidth:0}]},
+    options:{responsive:true,maintainAspectRatio:false,animation:{duration:0},
+      plugins:{legend:{display:false}},scales:{x:{},y:{}}}
+  });
+  log('Test 3 rendered');
+}
+function show(boxId, canvasId, fn){
+  const box=document.getElementById(boxId);
+  box.style.display='block';
+  requestAnimationFrame(function(){
+    requestAnimationFrame(function(){
+      const el=document.getElementById(canvasId);
+      log('Test 3 after rAF: canvas='+el.offsetWidth+'x'+el.offsetHeight);
+      fn();
+    });
+  });
+}
+log('Page loaded. Chart.js version: '+Chart.version);
+</script>
+</body></html>
