@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-export_html_utt_compare.py —— 多模型 Utterance 级贡献度对比可视化工具 v1.0
+export_html_utt_compare.py —— 多模型 Utterance 级贡献度对比可视化工具 v1.1
 
-用法：
+用法（推荐）：只传模型 ID，脚本自动拼路径
   python export_html_utt_compare.py \
-    --models modelA:/path/to/A modelB:/path/to/B modelC:/path/to/C \
+    --ids 260612z7 260612z8 260612z9 \
     --output compare.html
 
-每个 --models 条目格式：  <模型名>:<contrib目录>
+  路径自动解析为：
+    <BASE_DIR>/<model_id>/contrib
+  BASE_DIR 默认为 model_exp/fbank_20k_test5/fiber_train
+  可通过 --base 覆盖：
+    --base /data/model_exp/fbank_20k_test5/fiber_train
+
+用法（兼容旧版）：完整指定路径
+  python export_html_utt_compare.py \
+    --models modelA:/path/to/A/contrib modelB:/path/to/B/contrib \
+    --output compare.html
+
 contrib目录内需含：
   - contrib_epoch*.npz
   - contrib_summary_with_uttid.csv 或 contrib_summary.csv
 
 可选参数：
-  --egs   <name>:<path>,...   各模型的 train.egs.csv
-  --meta  <path>              共用 JSON 元信息（含 file_path/label 等）
+  --base   <基础目录>           模型根目录，默认 model_exp/fbank_20k_test5/fiber_train
+  --ids    <id1> <id2> ...      模型 ID 列表（自动拼路径，与 --models 二选一）
+  --models <name:path> ...      完整路径模式（兼容旧版）
+  --egs    <name:path> ...      各模型的 train.egs.csv（可选）
+  --meta   <path>               共用 JSON 元信息（可选）
   --output <html文件名>
 
 对比特性：
@@ -340,35 +353,82 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
 
 def main():
     print("\n" + "="*60)
-    print("🚀 [START] 多模型对比分析脚本 v1.0 启动...")
+    print("🚀 [START] 多模型对比分析脚本 v1.1 启动...")
     print("="*60)
 
-    ap = argparse.ArgumentParser(description="多模型 Utterance 级贡献度对比 HTML 生成器")
-    ap.add_argument("--models", required=True, nargs="+",
-                    help="格式：<名称>:<contrib目录>，可多个，例如 modelA:/path/A modelB:/path/B")
-    ap.add_argument("--egs",   default="", nargs="*",
-                    help="各模型 egs 路径，格式同 --models：<名称>:<egs.csv>")
-    ap.add_argument("--meta",  default="", help="可选：共用 JSON 元信息文件")
-    ap.add_argument("--output", default="compare_utt.html", help="输出 HTML 文件名")
+    DEFAULT_BASE = "model_exp/fbank_20k_test5/fiber_train"
+    CONTRIB_SUB  = "contrib"
+
+    ap = argparse.ArgumentParser(
+        description="多模型 Utterance 级贡献度对比 HTML 生成器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例（推荐）:\n"
+            "  %(prog)s --ids 260612z7 260612z8 260612z9\n\n"
+            "  路径自动解析为 BASE/ID/contrib\n"
+            "  BASE 默认为 model_exp/fbank_20k_test5/fiber_train\n\n"
+            "示例（自定义 BASE）:\n"
+            "  %(prog)s --ids 260612z7 260612z8 --base /data/models/fiber_train\n\n"
+            "示例（完整路径，兼容旧版）:\n"
+            "  %(prog)s --models A:/path/to/A/contrib B:/path/to/B/contrib"
+        ),
+    )
+    ap.add_argument("--ids", nargs="+", default=[],
+                    metavar="MODEL_ID",
+                    help="模型 ID，例如 260612z7 260612z8；自动拼接 BASE/ID/contrib 路径")
+    ap.add_argument("--base", default=DEFAULT_BASE,
+                    metavar="DIR",
+                    help=f"模型根目录（默认: {DEFAULT_BASE}）")
+    ap.add_argument("--models", nargs="*", default=[],
+                    metavar="NAME:PATH",
+                    help="完整路径模式：<名称>:<contrib目录>，与 --ids 可混用")
+    ap.add_argument("--egs", nargs="*", default=[],
+                    metavar="NAME:PATH",
+                    help="各模型 egs 路径：<名称>:<egs.csv>")
+    ap.add_argument("--meta", default="", metavar="FILE",
+                    help="可选：共用 JSON 元信息文件")
+    ap.add_argument("--output", default="compare_utt.html", metavar="FILE",
+                    help="输出 HTML 文件名（默认: compare_utt.html）")
     args = ap.parse_args()
 
-    # 解析模型列表
+    if not args.ids and not args.models:
+        ap.error("请至少提供 --ids <模型ID...> 或 --models <名称:路径...> 之一")
+
+    # ── 解析模型列表 ──
     model_specs = {}
-    for spec in args.models:
+
+    # --ids：自动拼路径，模型名即为 ID
+    for model_id in args.ids:
+        contrib_path = os.path.join(args.base, model_id, CONTRIB_SUB)
+        abs_path = os.path.abspath(contrib_path)
+        if not os.path.isdir(abs_path):
+            print(f"  ⚠️  [{model_id}] 目录不存在，已跳过: {abs_path}")
+            continue
+        model_specs[model_id] = abs_path
+
+    # --models：旧格式 name:path，允许与 --ids 混用
+    for spec in (args.models or []):
         if ":" not in spec:
-            print(f"❌ --models 格式错误: {spec}，应为 <名称>:<路径>")
+            print(f"❌ --models 格式错误: {spec!r}，应为 <名称>:<路径>")
             sys.exit(1)
-        name, path = spec.split(":", 1)
-        model_specs[name] = path
+        name, pth = spec.split(":", 1)
+        model_specs[name] = pth
+
+    if not model_specs:
+        print(f"❌ 没有可用的模型目录。")
+        print(f"   BASE = {os.path.abspath(args.base)}")
+        print(f"   请确认 --ids 中的 ID 在该目录下存在 <ID>/contrib/ 子目录")
+        sys.exit(1)
 
     egs_map = {}
-    if args.egs:
-        for spec in args.egs:
-            if ":" in spec:
-                name, path = spec.split(":", 1)
-                egs_map[name] = path
+    for spec in (args.egs or []):
+        if ":" in spec:
+            name, pth = spec.split(":", 1)
+            egs_map[name] = pth
 
-    print(f"\n📋 模型列表: {list(model_specs.keys())}")
+    print(f"\n📋 模型列表:")
+    for name, pth in model_specs.items():
+        print(f"   [{name}]  →  {os.path.abspath(pth)}")
 
     # ── 0. 加载 meta ──
     meta_map = {}
