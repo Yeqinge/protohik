@@ -293,23 +293,24 @@ def load_model_data(name, contrib_dir, egs_path=""):
 def pack_model_bin(model_info, utt_ids_union, out_prefix):
     """把单个模型数据打包为 .bin，返回参数 dict 供 HTML 使用。"""
     utt_data = model_info["utt_data"]
-    epochs   = model_info["epochs"]
-    ne       = len(epochs)
-    n_u      = len(utt_ids_union)
-    has_traj   = model_info["has_traj"] and ne > 0
+    epochs = model_info["epochs"]
+    ne = len(epochs)
+    n_u = len(utt_ids_union)
+    has_traj = model_info["has_traj"] and ne > 0
     has_weight = model_info["has_weight"]
 
+    # 构造所有数组（保持你原来的逻辑不变）
     n_chunks_arr = np.zeros(n_u, dtype=np.int16)
-    mean_si_arr  = np.full(n_u, np.nan, dtype=np.float32)
-    max_si_arr   = np.full(n_u, np.nan, dtype=np.float32)
-    mean_gn_arr  = np.full(n_u, np.nan, dtype=np.float32)
-    max_gn_arr   = np.full(n_u, np.nan, dtype=np.float32)
-    gn_std_arr   = np.zeros(n_u, dtype=np.float32)
-    mean_al_arr  = np.full(n_u, np.nan, dtype=np.float32)
-    mean_fn_arr  = np.full(n_u, np.nan, dtype=np.float32)
-    mean_wt_arr  = np.full(n_u, np.nan, dtype=np.float32)
-    wt_std_arr   = np.zeros(n_u, dtype=np.float32)
-    tags_arr     = np.full(n_u, 4, dtype=np.uint8)
+    mean_si_arr = np.full(n_u, np.nan, dtype=np.float32)
+    max_si_arr = np.full(n_u, np.nan, dtype=np.float32)
+    mean_gn_arr = np.full(n_u, np.nan, dtype=np.float32)
+    max_gn_arr = np.full(n_u, np.nan, dtype=np.float32)
+    gn_std_arr = np.zeros(n_u, dtype=np.float32)
+    mean_al_arr = np.full(n_u, np.nan, dtype=np.float32)
+    mean_fn_arr = np.full(n_u, np.nan, dtype=np.float32)
+    mean_wt_arr = np.full(n_u, np.nan, dtype=np.float32)
+    wt_std_arr = np.zeros(n_u, dtype=np.float32)
+    tags_arr = np.full(n_u, 4, dtype=np.uint8)
 
     gn_mat = np.full((n_u, ne), np.nan, dtype=np.float32) if has_traj else None
     al_mat = np.full((n_u, ne), np.nan, dtype=np.float32) if has_traj else None
@@ -320,16 +321,16 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
         if d is None:
             continue
         n_chunks_arr[ui] = d["n_chunks"]
-        mean_si_arr[ui]  = d["mean_si"]
-        max_si_arr[ui]   = d["max_si"]
-        mean_gn_arr[ui]  = d["mean_gn"]
-        max_gn_arr[ui]   = d["max_gn"]
-        gn_std_arr[ui]   = d["gn_std"]
-        mean_al_arr[ui]  = d["mean_al"]
-        mean_fn_arr[ui]  = d["mean_fn"]
-        mean_wt_arr[ui]  = d["mean_wt"]
-        wt_std_arr[ui]   = d["wt_std"]
-        tags_arr[ui]     = d["worst_tag"]
+        mean_si_arr[ui] = d["mean_si"]
+        max_si_arr[ui] = d["max_si"]
+        mean_gn_arr[ui] = d["mean_gn"]
+        max_gn_arr[ui] = d["max_gn"]
+        gn_std_arr[ui] = d["gn_std"]
+        mean_al_arr[ui] = d["mean_al"]
+        mean_fn_arr[ui] = d["mean_fn"]
+        mean_wt_arr[ui] = d["mean_wt"]
+        wt_std_arr[ui] = d["wt_std"]
+        tags_arr[ui] = d["worst_tag"]
         if has_traj and d.get("gn_traj") is not None:
             t_ne = len(d["gn_traj"])
             gn_mat[ui, :t_ne] = d["gn_traj"][:t_ne]
@@ -337,56 +338,62 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
             if has_weight and d.get("wt_traj") is not None:
                 wt_mat[ui, :t_ne] = d["wt_traj"][:t_ne]
 
-    # 量化
+    # 量化（保持不变）
     gn_min = 0.0; gn_scale = 1.0
     wt_min = 0.0; wt_scale = 1.0
     gn_mat_u8 = al_mat_u8 = wt_mat_u8 = None
+    utt_bytes = "\n".join(utt_ids_union).encode("utf-8")
+    utt_len = len(utt_bytes)
 
     if has_traj:
         valid_gn = gn_mat[~np.isnan(gn_mat)]
         if len(valid_gn):
-            gn_min   = float(np.nanpercentile(valid_gn, 1))
+            gn_min = float(np.nanpercentile(valid_gn, 1))
             gn_scale = max(float(np.nanpercentile(valid_gn, 99)) - gn_min, 1e-9)
-        gq = np.clip((gn_mat - gn_min) / gn_scale * 254, 0, 254); gq[np.isnan(gn_mat)] = 255
-        aq = np.clip((al_mat + 1.0) / 2.0 * 253, 0, 253);          aq[np.isnan(al_mat)] = 254
+        gq = np.clip((gn_mat - gn_min) / gn_scale * 254, 0, 254)
+        gq[np.isnan(gn_mat)] = 255
         gn_mat_u8 = gq.astype(np.uint8)
+
+        aq = np.clip((al_mat + 1.0) / 2.0 * 253, 0, 253)
+        aq[np.isnan(al_mat)] = 254
         al_mat_u8 = aq.astype(np.uint8)
 
         if has_weight and wt_mat is not None:
             valid_wt = wt_mat[~np.isnan(wt_mat)]
             if len(valid_wt):
-                wt_min   = float(np.nanmin(wt_mat))
+                wt_min = float(np.nanmin(wt_mat))
                 wt_scale = max(float(np.nanpercentile(valid_wt, 99)) - wt_min, 1e-9)
-            wq = np.clip((wt_mat - wt_min) / wt_scale * 253, 0, 253); wq[np.isnan(wt_mat)] = 254
+            wq = np.clip((wt_mat - wt_min) / wt_scale * 253, 0, 253)
+            wq[np.isnan(wt_mat)] = 254
             wt_mat_u8 = wq.astype(np.uint8)
 
     flags = (1 if has_traj else 0) | (2 if has_weight else 0)
-    utt_bytes = "\n".join(utt_ids_union).encode("utf-8")
-    utt_len   = len(utt_bytes)
 
+    # ====================== 关键修复 ======================
     bin_path = out_prefix + ".bin"
     with open(bin_path, "wb") as fb:
-        # Header
-        header = np.array([n_u, ne, utt_len, flags], dtype=np.int32)
-        fb.write(header.tobytes())
+        # 1. Header (保证 16 字节对齐)
+        fb.write(np.array([n_u, ne, utt_len, flags], dtype=np.int32).tobytes())
         
-        # Scaling factors
-        scales = np.array([gn_min, gn_scale, wt_min, wt_scale], dtype=np.float32)
-        fb.write(scales.tobytes())
+        # 2. Scaling factors (float32 × 4)
+        fb.write(np.array([gn_min, gn_scale, wt_min, wt_scale], dtype=np.float32).tobytes())
         
-        # Padding to make sure next offset is multiple of 4 (actually 8 or 16 is safer)
-        fb.write(b"\x00" * 48)   # 保持较大 padding 更保险
+        # 3. 大量 padding，确保后续所有数组从 8 的倍数位置开始
+        current_pos = fb.tell()
+        pad_needed = (8 - (current_pos % 8)) % 8
+        fb.write(b"\x00" * (48 + pad_needed))
         
-        # 写入所有数组
-        for a in [n_chunks_arr, mean_si_arr, max_si_arr,
-                  mean_gn_arr, max_gn_arr, gn_std_arr,
-                  mean_al_arr, mean_fn_arr,
-                  mean_wt_arr, wt_std_arr,
-                  tags_arr]:
+        print(f"   [DEBUG] Header end at {fb.tell()} bytes (should be multiple of 8)")
+
+        # 4. 写入所有主要数组
+        arrays = [n_chunks_arr, mean_si_arr, max_si_arr, mean_gn_arr, max_gn_arr,
+                  gn_std_arr, mean_al_arr, mean_fn_arr, mean_wt_arr, wt_std_arr, tags_arr]
+        for a in arrays:
             fb.write(a.tobytes())
-        
+
         fb.write(utt_bytes)
-        
+
+        # 5. 轨迹数据（uint8 对齐要求较低）
         if has_traj and gn_mat_u8 is not None:
             fb.write(gn_mat_u8.flatten().tobytes())
             fb.write(al_mat_u8.flatten().tobytes())
@@ -394,7 +401,8 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
                 fb.write(wt_mat_u8.flatten().tobytes())
 
     size_mb = os.path.getsize(bin_path) / 1e6
-    print(f"     → {os.path.basename(bin_path)}  {size_mb:.2f} MB")
+    print(f" → {os.path.basename(bin_path)} {size_mb:.2f} MB")
+    
     return dict(
         bin_filename=os.path.basename(bin_path),
         epochs=epochs,
@@ -402,7 +410,6 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
         has_weight=has_weight,
         flags=flags,
     )
-
 
 def main():
     print("\n" + "="*60)
