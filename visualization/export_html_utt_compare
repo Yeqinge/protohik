@@ -291,7 +291,7 @@ def load_model_data(name, contrib_dir, egs_path=""):
 
 
 def pack_model_bin(model_info, utt_ids_union, out_prefix):
-    """把单个模型数据打包为 .bin，返回参数 dict 供 HTML 使用。"""
+    """精确匹配 JS 读取逻辑的打包函数"""
     utt_data = model_info["utt_data"]
     epochs = model_info["epochs"]
     ne = len(epochs)
@@ -299,7 +299,7 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
     has_traj = model_info["has_traj"] and ne > 0
     has_weight = model_info["has_weight"]
 
-    # === 数组构造（和你原来完全一致）===
+    # 构造数组（保持和你原来一致）
     n_chunks_arr = np.zeros(n_u, dtype=np.int16)
     mean_si_arr = np.full(n_u, np.nan, dtype=np.float32)
     max_si_arr = np.full(n_u, np.nan, dtype=np.float32)
@@ -350,10 +350,12 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
         if len(valid_gn):
             gn_min = float(np.nanpercentile(valid_gn, 1))
             gn_scale = max(float(np.nanpercentile(valid_gn, 99)) - gn_min, 1e-9)
-        gq = np.clip((gn_mat - gn_min) / gn_scale * 254, 0, 254); gq[np.isnan(gn_mat)] = 255
+        gq = np.clip((gn_mat - gn_min) / gn_scale * 254, 0, 254)
+        gq[np.isnan(gn_mat)] = 255
         gn_mat_u8 = gq.astype(np.uint8)
 
-        aq = np.clip((al_mat + 1.0) / 2.0 * 253, 0, 253); aq[np.isnan(al_mat)] = 254
+        aq = np.clip((al_mat + 1.0) / 2.0 * 253, 0, 253)
+        aq[np.isnan(al_mat)] = 254
         al_mat_u8 = aq.astype(np.uint8)
 
         if has_weight and wt_mat is not None:
@@ -361,31 +363,34 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
             if len(valid_wt):
                 wt_min = float(np.nanmin(wt_mat))
                 wt_scale = max(float(np.nanpercentile(valid_wt, 99)) - wt_min, 1e-9)
-            wq = np.clip((wt_mat - wt_min) / wt_scale * 253, 0, 253); wq[np.isnan(wt_mat)] = 254
+            wq = np.clip((wt_mat - wt_min) / wt_scale * 253, 0, 253)
+            wq[np.isnan(wt_mat)] = 254
             wt_mat_u8 = wq.astype(np.uint8)
 
     flags = (1 if has_traj else 0) | (2 if has_weight else 0)
 
-    # ====================== 最终保守写入版本 ======================
+    # ====================== 精确匹配 JS ======================
     bin_path = out_prefix + ".bin"
     with open(bin_path, "wb") as fb:
-        # Header
+        # 1. Header: 4 个 int32 (16 bytes)
         fb.write(np.array([n_u, ne, utt_len, flags], dtype=np.int32).tobytes())
+        
+        # 2. Scales: 4 个 float32 (16 bytes) —— JS 从字节16开始读
         fb.write(np.array([gn_min, gn_scale, wt_min, wt_scale], dtype=np.float32).tobytes())
         
-        # 强力 padding（关键）
-        fb.write(b"\x00" * 64)
+        # 3. Padding 到 80 字节（JS 固定从 o=80 开始读）
+        fb.write(b"\x00" * (80 - 32))   # 32 + 48 = 80
         
-        print(f" [DEBUG] {out_prefix} Header end at {fb.tell()} bytes")
+        print(f" [DEBUG] {out_prefix} Header end at {fb.tell()} bytes (必须是80)")
 
-        # 所有 float/int 数组
-        for a in [n_chunks_arr, mean_si_arr, max_si_arr, mean_gn_arr, max_gn_arr, 
-                  gn_std_arr, mean_al_arr, mean_fn_arr, mean_wt_arr, wt_std_arr, tags_arr]:
+        # 4. 数据数组（必须严格按这个顺序）
+        for a in [n_chunks_arr, mean_si_arr, max_si_arr, mean_gn_arr, max_gn_arr,
+                  gn_std_arr, mean_al_arr, mean_fn_arr,
+                  mean_wt_arr, wt_std_arr, tags_arr]:
             fb.write(a.tobytes())
 
         fb.write(utt_bytes)
 
-        # 轨迹数据
         if has_traj and gn_mat_u8 is not None:
             fb.write(gn_mat_u8.flatten().tobytes())
             fb.write(al_mat_u8.flatten().tobytes())
