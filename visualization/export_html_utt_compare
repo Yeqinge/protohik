@@ -32,10 +32,10 @@ contrib目录内需含：
   --output <html文件名>
 
 对比特性：
-  - 左侧列表：同一 utterance，并排显示各模型 tag / mean_si / mean_gn
+  - 左侧列表：同一 utterance，并排显示各模型 tag（一行一个标签列 + 末尾 ≠ 差异列）
   - 右侧：同坐标系叠加各模型轨迹曲线（grad_norm / align / weight）
   - 颜色差异化区分模型
-  - 支持按"某模型 tag"或"模型间 si 差值"排序/过滤
+  - 支持按"某模型 tag"或"模型间 Tag 差异度"排序/过滤
   - 导出包含所有模型列的 CSV
 """
 
@@ -291,26 +291,25 @@ def load_model_data(name, contrib_dir, egs_path=""):
 
 
 def pack_model_bin(model_info, utt_ids_union, out_prefix):
-    """精确匹配 JS 读取逻辑的打包函数"""
+    """把单个模型数据打包为 .bin，返回参数 dict 供 HTML 使用。"""
     utt_data = model_info["utt_data"]
-    epochs = model_info["epochs"]
-    ne = len(epochs)
-    n_u = len(utt_ids_union)
-    has_traj = model_info["has_traj"] and ne > 0
+    epochs   = model_info["epochs"]
+    ne       = len(epochs)
+    n_u      = len(utt_ids_union)
+    has_traj   = model_info["has_traj"] and ne > 0
     has_weight = model_info["has_weight"]
 
-    # 构造数组（保持和你原来一致）
     n_chunks_arr = np.zeros(n_u, dtype=np.int16)
-    mean_si_arr = np.full(n_u, np.nan, dtype=np.float32)
-    max_si_arr = np.full(n_u, np.nan, dtype=np.float32)
-    mean_gn_arr = np.full(n_u, np.nan, dtype=np.float32)
-    max_gn_arr = np.full(n_u, np.nan, dtype=np.float32)
-    gn_std_arr = np.zeros(n_u, dtype=np.float32)
-    mean_al_arr = np.full(n_u, np.nan, dtype=np.float32)
-    mean_fn_arr = np.full(n_u, np.nan, dtype=np.float32)
-    mean_wt_arr = np.full(n_u, np.nan, dtype=np.float32)
-    wt_std_arr = np.zeros(n_u, dtype=np.float32)
-    tags_arr = np.full(n_u, 4, dtype=np.uint8)
+    mean_si_arr  = np.full(n_u, np.nan, dtype=np.float32)
+    max_si_arr   = np.full(n_u, np.nan, dtype=np.float32)
+    mean_gn_arr  = np.full(n_u, np.nan, dtype=np.float32)
+    max_gn_arr   = np.full(n_u, np.nan, dtype=np.float32)
+    gn_std_arr   = np.zeros(n_u, dtype=np.float32)
+    mean_al_arr  = np.full(n_u, np.nan, dtype=np.float32)
+    mean_fn_arr  = np.full(n_u, np.nan, dtype=np.float32)
+    mean_wt_arr  = np.full(n_u, np.nan, dtype=np.float32)
+    wt_std_arr   = np.zeros(n_u, dtype=np.float32)
+    tags_arr     = np.full(n_u, 4, dtype=np.uint8)
 
     gn_mat = np.full((n_u, ne), np.nan, dtype=np.float32) if has_traj else None
     al_mat = np.full((n_u, ne), np.nan, dtype=np.float32) if has_traj else None
@@ -321,16 +320,16 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
         if d is None:
             continue
         n_chunks_arr[ui] = d["n_chunks"]
-        mean_si_arr[ui] = d["mean_si"]
-        max_si_arr[ui] = d["max_si"]
-        mean_gn_arr[ui] = d["mean_gn"]
-        max_gn_arr[ui] = d["max_gn"]
-        gn_std_arr[ui] = d["gn_std"]
-        mean_al_arr[ui] = d["mean_al"]
-        mean_fn_arr[ui] = d["mean_fn"]
-        mean_wt_arr[ui] = d["mean_wt"]
-        wt_std_arr[ui] = d["wt_std"]
-        tags_arr[ui] = d["worst_tag"]
+        mean_si_arr[ui]  = d["mean_si"]
+        max_si_arr[ui]   = d["max_si"]
+        mean_gn_arr[ui]  = d["mean_gn"]
+        max_gn_arr[ui]   = d["max_gn"]
+        gn_std_arr[ui]   = d["gn_std"]
+        mean_al_arr[ui]  = d["mean_al"]
+        mean_fn_arr[ui]  = d["mean_fn"]
+        mean_wt_arr[ui]  = d["mean_wt"]
+        wt_std_arr[ui]   = d["wt_std"]
+        tags_arr[ui]     = d["worst_tag"]
         if has_traj and d.get("gn_traj") is not None:
             t_ne = len(d["gn_traj"])
             gn_mat[ui, :t_ne] = d["gn_traj"][:t_ne]
@@ -342,55 +341,46 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
     gn_min = 0.0; gn_scale = 1.0
     wt_min = 0.0; wt_scale = 1.0
     gn_mat_u8 = al_mat_u8 = wt_mat_u8 = None
-    utt_bytes = "\n".join(utt_ids_union).encode("utf-8")
-    utt_len = len(utt_bytes)
 
     if has_traj:
         valid_gn = gn_mat[~np.isnan(gn_mat)]
         if len(valid_gn):
-            gn_min = float(np.nanpercentile(valid_gn, 1))
+            gn_min   = float(np.nanpercentile(valid_gn, 1))
             gn_scale = max(float(np.nanpercentile(valid_gn, 99)) - gn_min, 1e-9)
-        gq = np.clip((gn_mat - gn_min) / gn_scale * 254, 0, 254)
-        gq[np.isnan(gn_mat)] = 255
+        gq = np.clip((gn_mat - gn_min) / gn_scale * 254, 0, 254); gq[np.isnan(gn_mat)] = 255
+        aq = np.clip((al_mat + 1.0) / 2.0 * 253, 0, 253);          aq[np.isnan(al_mat)] = 254
         gn_mat_u8 = gq.astype(np.uint8)
-
-        aq = np.clip((al_mat + 1.0) / 2.0 * 253, 0, 253)
-        aq[np.isnan(al_mat)] = 254
         al_mat_u8 = aq.astype(np.uint8)
 
         if has_weight and wt_mat is not None:
             valid_wt = wt_mat[~np.isnan(wt_mat)]
             if len(valid_wt):
-                wt_min = float(np.nanmin(wt_mat))
+                wt_min   = float(np.nanmin(wt_mat))
                 wt_scale = max(float(np.nanpercentile(valid_wt, 99)) - wt_min, 1e-9)
-            wq = np.clip((wt_mat - wt_min) / wt_scale * 253, 0, 253)
-            wq[np.isnan(wt_mat)] = 254
+            wq = np.clip((wt_mat - wt_min) / wt_scale * 253, 0, 253); wq[np.isnan(wt_mat)] = 254
             wt_mat_u8 = wq.astype(np.uint8)
 
     flags = (1 if has_traj else 0) | (2 if has_weight else 0)
+    utt_bytes = "\n".join(utt_ids_union).encode("utf-8")
+    utt_len   = len(utt_bytes)
 
-    # ====================== 精确匹配 JS ======================
     bin_path = out_prefix + ".bin"
     with open(bin_path, "wb") as fb:
         # 1. Header: 4 个 int32 (16 bytes)
         fb.write(np.array([n_u, ne, utt_len, flags], dtype=np.int32).tobytes())
-        
         # 2. Scales: 4 个 float32 (16 bytes) —— JS 从字节16开始读
-        fb.write(np.array([gn_min, gn_scale, wt_min, wt_scale], dtype=np.float32).tobytes())
-        
+        fb.write(np.array([gn_min, gn_scale], dtype=np.float32).tobytes())
+        fb.write(np.array([wt_min, wt_scale], dtype=np.float32).tobytes())
         # 3. Padding 到 80 字节（JS 固定从 o=80 开始读）
-        fb.write(b"\x00" * (80 - 32))   # 32 + 48 = 80
-        
-        print(f" [DEBUG] {out_prefix} Header end at {fb.tell()} bytes (必须是80)")
-
+        fb.write(b"\x00" * 48)   # 16 + 16 + 48 = 80
         # 4. 数据数组（必须严格按这个顺序）
-        for a in [n_chunks_arr, mean_si_arr, max_si_arr, mean_gn_arr, max_gn_arr,
-                  gn_std_arr, mean_al_arr, mean_fn_arr,
-                  mean_wt_arr, wt_std_arr, tags_arr]:
+        for a in [n_chunks_arr, mean_si_arr, max_si_arr,
+                  mean_gn_arr, max_gn_arr, gn_std_arr,
+                  mean_al_arr, mean_fn_arr,
+                  mean_wt_arr, wt_std_arr,
+                  tags_arr]:
             fb.write(a.tobytes())
-
         fb.write(utt_bytes)
-
         if has_traj and gn_mat_u8 is not None:
             fb.write(gn_mat_u8.flatten().tobytes())
             fb.write(al_mat_u8.flatten().tobytes())
@@ -398,8 +388,7 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
                 fb.write(wt_mat_u8.flatten().tobytes())
 
     size_mb = os.path.getsize(bin_path) / 1e6
-    print(f" → {os.path.basename(bin_path)} {size_mb:.2f} MB")
-    
+    print(f"     → {os.path.basename(bin_path)}  {size_mb:.2f} MB")
     return dict(
         bin_filename=os.path.basename(bin_path),
         epochs=epochs,
@@ -407,6 +396,7 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
         has_weight=has_weight,
         flags=flags,
     )
+
 
 def main():
     print("\n" + "="*60)
@@ -654,6 +644,12 @@ def main():
 
 # ─────────────────────────────────────────────────────────────────
 #  HTML 生成（读取外部模板文件 compare_utt_template.html）
+#  ⚠️ 本函数的列布局必须与 compare_utt_template.html 中的 JS（renderPage()）
+#     完全匹配：每个模型只渲染 1 列 tag 徽章（.col-tag），
+#     末尾追加 1 列 Tag 差异标记（.s-tagdiff，符号为 ✔/≠/⛔）。
+#     如果改成"每模型 2 列（si+tag）"，必须同步修改模板的 JS 渲染逻辑，
+#     否则 grid-template-columns 与实际渲染的 DOM 列数不一致，
+#     会导致左侧列表整体错位甚至显示为空。
 # ─────────────────────────────────────────────────────────────────
 
 def make_html(model_names, bin_filenames, meta_filename,
