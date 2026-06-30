@@ -299,7 +299,7 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
     has_traj = model_info["has_traj"] and ne > 0
     has_weight = model_info["has_weight"]
 
-    # 构造所有数组（保持你原来的逻辑不变）
+    # === 数组构造（和你原来完全一致）===
     n_chunks_arr = np.zeros(n_u, dtype=np.int16)
     mean_si_arr = np.full(n_u, np.nan, dtype=np.float32)
     max_si_arr = np.full(n_u, np.nan, dtype=np.float32)
@@ -338,7 +338,7 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
             if has_weight and d.get("wt_traj") is not None:
                 wt_mat[ui, :t_ne] = d["wt_traj"][:t_ne]
 
-    # 量化（保持不变）
+    # 量化
     gn_min = 0.0; gn_scale = 1.0
     wt_min = 0.0; wt_scale = 1.0
     gn_mat_u8 = al_mat_u8 = wt_mat_u8 = None
@@ -350,12 +350,10 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
         if len(valid_gn):
             gn_min = float(np.nanpercentile(valid_gn, 1))
             gn_scale = max(float(np.nanpercentile(valid_gn, 99)) - gn_min, 1e-9)
-        gq = np.clip((gn_mat - gn_min) / gn_scale * 254, 0, 254)
-        gq[np.isnan(gn_mat)] = 255
+        gq = np.clip((gn_mat - gn_min) / gn_scale * 254, 0, 254); gq[np.isnan(gn_mat)] = 255
         gn_mat_u8 = gq.astype(np.uint8)
 
-        aq = np.clip((al_mat + 1.0) / 2.0 * 253, 0, 253)
-        aq[np.isnan(al_mat)] = 254
+        aq = np.clip((al_mat + 1.0) / 2.0 * 253, 0, 253); aq[np.isnan(al_mat)] = 254
         al_mat_u8 = aq.astype(np.uint8)
 
         if has_weight and wt_mat is not None:
@@ -363,37 +361,31 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
             if len(valid_wt):
                 wt_min = float(np.nanmin(wt_mat))
                 wt_scale = max(float(np.nanpercentile(valid_wt, 99)) - wt_min, 1e-9)
-            wq = np.clip((wt_mat - wt_min) / wt_scale * 253, 0, 253)
-            wq[np.isnan(wt_mat)] = 254
+            wq = np.clip((wt_mat - wt_min) / wt_scale * 253, 0, 253); wq[np.isnan(wt_mat)] = 254
             wt_mat_u8 = wq.astype(np.uint8)
 
     flags = (1 if has_traj else 0) | (2 if has_weight else 0)
 
-    # ====================== 关键修复 ======================
+    # ====================== 最终保守写入版本 ======================
     bin_path = out_prefix + ".bin"
     with open(bin_path, "wb") as fb:
-        # 1. Header (保证 16 字节对齐)
+        # Header
         fb.write(np.array([n_u, ne, utt_len, flags], dtype=np.int32).tobytes())
-        
-        # 2. Scaling factors (float32 × 4)
         fb.write(np.array([gn_min, gn_scale, wt_min, wt_scale], dtype=np.float32).tobytes())
         
-        # 3. 大量 padding，确保后续所有数组从 8 的倍数位置开始
-        current_pos = fb.tell()
-        pad_needed = (8 - (current_pos % 8)) % 8
-        fb.write(b"\x00" * (48 + pad_needed))
+        # 强力 padding（关键）
+        fb.write(b"\x00" * 64)
         
-        print(f"   [DEBUG] Header end at {fb.tell()} bytes (should be multiple of 8)")
+        print(f" [DEBUG] {out_prefix} Header end at {fb.tell()} bytes")
 
-        # 4. 写入所有主要数组
-        arrays = [n_chunks_arr, mean_si_arr, max_si_arr, mean_gn_arr, max_gn_arr,
-                  gn_std_arr, mean_al_arr, mean_fn_arr, mean_wt_arr, wt_std_arr, tags_arr]
-        for a in arrays:
+        # 所有 float/int 数组
+        for a in [n_chunks_arr, mean_si_arr, max_si_arr, mean_gn_arr, max_gn_arr, 
+                  gn_std_arr, mean_al_arr, mean_fn_arr, mean_wt_arr, wt_std_arr, tags_arr]:
             fb.write(a.tobytes())
 
         fb.write(utt_bytes)
 
-        # 5. 轨迹数据（uint8 对齐要求较低）
+        # 轨迹数据
         if has_traj and gn_mat_u8 is not None:
             fb.write(gn_mat_u8.flatten().tobytes())
             fb.write(al_mat_u8.flatten().tobytes())
