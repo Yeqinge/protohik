@@ -366,17 +366,27 @@ def pack_model_bin(model_info, utt_ids_union, out_prefix):
 
     bin_path = out_prefix + ".bin"
     with open(bin_path, "wb") as fb:
-        fb.write(np.array([n_u, ne, utt_len, flags], dtype=np.int32).tobytes())
-        fb.write(np.array([gn_min, gn_scale], dtype=np.float32).tobytes())
-        fb.write(np.array([wt_min, wt_scale], dtype=np.float32).tobytes())
-        fb.write(b"\x00" * 48)
+        # Header
+        header = np.array([n_u, ne, utt_len, flags], dtype=np.int32)
+        fb.write(header.tobytes())
+        
+        # Scaling factors
+        scales = np.array([gn_min, gn_scale, wt_min, wt_scale], dtype=np.float32)
+        fb.write(scales.tobytes())
+        
+        # Padding to make sure next offset is multiple of 4 (actually 8 or 16 is safer)
+        fb.write(b"\x00" * 48)   # 保持较大 padding 更保险
+        
+        # 写入所有数组
         for a in [n_chunks_arr, mean_si_arr, max_si_arr,
                   mean_gn_arr, max_gn_arr, gn_std_arr,
                   mean_al_arr, mean_fn_arr,
                   mean_wt_arr, wt_std_arr,
                   tags_arr]:
             fb.write(a.tobytes())
+        
         fb.write(utt_bytes)
+        
         if has_traj and gn_mat_u8 is not None:
             fb.write(gn_mat_u8.flatten().tobytes())
             fb.write(al_mat_u8.flatten().tobytes())
