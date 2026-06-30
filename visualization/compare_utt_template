@@ -380,8 +380,6 @@ function getSiSpread(idx){
 }
 
 function getAlSpread(idx){
-  // 两模型 mean_align 的差值（有方向：model0 - model1）
-  // 绝对值大说明 align 判断分歧大
   if(N_MODELS<2) return 0;
   const a0=MDL[0].MEAN_AL&&MDL[0].MEAN_AL[idx];
   const a1=MDL[1].MEAN_AL&&MDL[1].MEAN_AL[idx];
@@ -389,9 +387,7 @@ function getAlSpread(idx){
   return Math.abs(a0-a1);
 }
 
-// tag 差异度：0=完全一致，越大分歧越严重
-// 用优先级距离：harmful=0,hard=1,high_inf=2,easy=3,normal=4
-const TAG_PRI=[3,2,1,0,4]; // TAG_NAMES顺序对应的优先级值
+const TAG_PRI=[3,2,1,0,4];
 function getTagDiff(idx){
   if(N_MODELS<2) return 0;
   let mn=99,mx=-99;
@@ -415,7 +411,6 @@ function hasHarmful(idx){
   }
   return false;
 }
-// high_influence ↔ harmful_suspect 冲突
 function hasHighHarmfulConflict(idx){
   let hasHI=false,hasHS=false;
   for(let mi=0;mi<N_MODELS;mi++){
@@ -459,7 +454,6 @@ function setSort(key){
     t.classList.remove('active');
     const a=t.querySelector('.arrow'); if(a) a.textContent='';
   });
-  // map delta sort key to element id
   const sortElId = key==='delta' ? 'th-delta' : 'th-'+key.replace(/_/g,'-');
   const el=document.getElementById(sortElId);
   if(el){el.classList.add('active');const ar=el.querySelector('.arrow');if(ar) ar.textContent=sortAsc?' \u2191':' \u2193';}
@@ -499,10 +493,10 @@ function rebuild(){
       }
     }
     if(q&&!((MDL[0].UTT_IDS&&MDL[0].UTT_IDS[idx])||'').toLowerCase().includes(q)) continue;
-    if(diffF===1&&tagsAllSame(idx)) continue;       // 仅不一致
-    if(diffF===2&&!tagsAllSame(idx)) continue;      // 仅一致
-    if(diffF===3&&!hasHarmful(idx)) continue;       // 含harmful
-    if(diffF===4&&!hasHighHarmfulConflict(idx)) continue; // 冲突
+    if(diffF===1&&tagsAllSame(idx)) continue;
+    if(diffF===2&&!tagsAllSame(idx)) continue;
+    if(diffF===3&&!hasHarmful(idx)) continue;
+    if(diffF===4&&!hasHighHarmfulConflict(idx)) continue;
     arr.push(idx);
   }
   if(sortKey==='uid'){
@@ -551,7 +545,6 @@ function renderPage(){
     const allSame=tagsAllSame(idx);
     const isConflict=hasHighHarmfulConflict(idx);
     if(!allSame) row.classList.add('has-diff');
-    // align hint in tooltip
     let minAl=Infinity;
     for(let mi=0;mi<N_MODELS;mi++){
       const av=MDL[mi].MEAN_AL&&MDL[mi].MEAN_AL[idx];
@@ -560,7 +553,6 @@ function renderPage(){
     const alHint=isFinite(minAl)?' al='+minAl.toFixed(3):'';
     let cells='<div class="s-rank">'+(idx+1)+'</div>';
     cells+='<div class="s-uid" title="'+escH(uid)+alHint+'">'+highlight(uid,q)+'</div>';
-    // 每个模型只显示 tag badge，用模型色边框区分
     for(let mi=0;mi<N_MODELS;mi++){
       const tag=(MDL[mi].TAGS&&MDL[mi].TAGS[idx])??4;
       const tagName=TAG_NAMES[tag];
@@ -568,7 +560,6 @@ function renderPage(){
       cells+='<div class="col-tag" style="border-bottom:2px solid '+(absent?'transparent':COLORS[mi])+'">'
         +'<span class="badge '+(absent?'absent':tagName)+'">'+(absent?'n/a':tagName.replace(/_/g,' '))+'</span></div>';
     }
-    // tag 差异列
     const diffSymbol=allSame?'\u2714':(isConflict?'\u26d4':'\u2260');
     const diffCls=allSame?'same':'diff';
     cells+='<div class="s-tagdiff '+diffCls+'">'+diffSymbol+'</div>';
@@ -635,7 +626,6 @@ function selectSample(idx,el){
     p.style.display=show?'flex':'none';
     p.classList.toggle('active',show);
   });
-  // Use rAF so the panel is fully visible (with correct dimensions) before Chart.js measures canvas
   requestAnimationFrame(function(){
     requestAnimationFrame(function(){ drawTab(activeTab,idx); });
   });
@@ -657,7 +647,6 @@ function switchTab(t){
     el.style.display=show?'flex':'none';
   });
   if(selIdx>=0){
-    // double rAF: first frame shows panel, second frame canvas has correct dimensions
     requestAnimationFrame(function(){
       requestAnimationFrame(function(){ drawTab(t,selIdx); });
     });
@@ -760,11 +749,9 @@ function drawTagDist(curIdx){
   const el=document.getElementById('chartTagDist'); if(!el) return;
   const N=MDL[0].N||0;
 
-  // TAG_NAMES order: harmful_suspect hard high_influence easy_redundant normal
   const TAG_LABELS=['harmful', 'hard', 'high_inf', 'easy_red', 'normal'];
   const TAG_COLORS=['#dc2626','#ea580c','#7c3aed','#16a34a','#9aa3ba'];
 
-  // count tags per model (% of total valid)
   const datasets=MODEL_NAMES.map(function(nm,mi){
     const tv=MDL[mi].TAGS;
     if(!tv) return {label:nm,data:[0,0,0,0,0],backgroundColor:COLORS[mi]+'99',
@@ -785,16 +772,13 @@ function drawTagDist(curIdx){
     };
   });
 
-  // selected utterance: which tag does each model assign?
-  // draw as separate dataset with full opacity and thick border
   const selDatasets=MODEL_NAMES.map(function(nm,mi){
     const tv=MDL[mi].TAGS;
     const sv=MDL[mi].MEAN_SI;
     const absent=!tv||!sv||(sv[curIdx]==null)||isNaN(Number(sv[curIdx]));
     const selTag=absent?-1:(tv[curIdx]??-1);
-    // bar only at the selected tag bin, 0 elsewhere
     const d=[0,0,0,0,0];
-    if(selTag>=0&&selTag<=4) d[selTag]=100; // marker height (shown on secondary axis)
+    if(selTag>=0&&selTag<=4) d[selTag]=100;
     return {
       label:nm+' \u9009\u4e2d',
       data:d,
