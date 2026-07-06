@@ -1,7 +1,16 @@
-class PrototypeLossGMM(nn.Module):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.mixture import GaussianMixture
+import numpy as np
+from tqdm import tqdm
+
+class PrototypeLoss(nn.Module):
     def __init__(self, input_dim, num_targets=2, temperature=0.1,
-                 warmup_epochs=3, total_epochs=20, confidence_alpha=1.5):
+                 warmup_epochs=3, total_epochs=30, confidence_alpha=1.5,
+                 gmm_update_freq=3):
         super().__init__()
+        
         self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
         nn.init.xavier_uniform_(self.prototypes)
         
@@ -10,17 +19,56 @@ class PrototypeLossGMM(nn.Module):
         self.total_epochs = total_epochs
         self.current_epoch = 0
         self.confidence_alpha = confidence_alpha
+        self.gmm_update_freq = gmm_update_freq
         
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
         self.confidences = None
+        self.last_gmm_epoch = -1
+        self.model = None          # 将在外面注入
+        self.full_dataloader = None  # 将在外面注入
+        self.device = None         # 将在外面注入
+
+    def set_training_env(self, model, full_dataloader, device):
+        """只需调用一次，注入必要环境（在 model_blueprint 中调用一次即可）"""
+        self.model = model
+        self.full_dataloader = full_dataloader
+        self.device = device
+        print("PrototypeLoss: 训练环境注入完成，GMM 已启用")
+
+    def _compute_gmm_confidence(self):
+        """内部执行 GMM"""
+        if self.full_dataloader is None or self.model is None:
+            return None
+            
+        self.model.eval()
+        all_per_sample_losses = []
+        
+        print(f"正在为 GMM 收集 loss (Epoch {self.current_epoch})...")
+        with torch.no_grad():
+            for batch_feat, batch_label, *_ in tqdm(self.full_dataloader, desc="GMM Loss"):
+                batch_feat = batch_feat.to(self.device)
+                batch_label = batch_label.to(self.device)
+                
+                # 关键：用 return_per_sample=True 获取 per-sample loss
+                _, per_sample_loss = self.forward(batch_feat, batch_label, return_per_sample=True)
+                all_per_sample_losses.append(per_sample_loss.cpu())
+        
+        all_losses = torch.cat(all_per_sample_losses)
+        
+        # GMM 计算
+        losses_np = all_losses.numpy().reshape(-1, 1)
+        gmm = GaussianMixture(n_components=2, random_state=42, max_iter=100)
+        gmm.fit(losses_np)
+        
+        probs = gmm.predict_proba(losses_np)
+        clean_idx = np.argmin(gmm.means_.flatten())
+        
+        new_conf = torch.tensor(probs[:, clean_idx], dtype=torch.float32)
+        print(f"GMM 更新完成 | Mean Conf = {new_conf.mean():.4f}")
+        return new_conf
 
     def update_confidences(self, new_confidences):
-        self.confidences = new_confidences.to(next(self.parameters()).device)
-
-    def _get_confidence_weight(self, confidences):
-        if confidences is None:
-            return torch.ones_like(confidences) if confidences is not None else None
-        return confidences ** self.confidence_alpha
+        self.confidences = new_confidences.to(self.device if self.device else 'cpu')
 
     def forward(self, inputs, targets, return_per_sample=False):
         assert len(inputs.shape) == 3 and inputs.shape[2] == 1
@@ -34,22 +82,30 @@ class PrototypeLossGMM(nn.Module):
         
         per_sample_loss = self.loss_function(logits, targets)
         
-        # 权重计算
+        # ====================== GMM 自动更新 ======================
+        if (self.current_epoch > 0 and 
+            self.current_epoch % self.gmm_update_freq == 0 and 
+            self.current_epoch != self.last_gmm_epoch):
+            
+            self.last_gmm_epoch = self.current_epoch
+            new_conf = self._compute_gmm_confidence()
+            if new_conf is not None:
+                self.update_confidences(new_conf)
+        
+        # ====================== 权重计算 ======================
         if self.confidences is not None:
-            weight = self._get_confidence_weight(self.confidences[:len(per_sample_loss)])
+            weight = (self.confidences[:len(per_sample_loss)] ** self.confidence_alpha)
         else:
             weight = torch.ones_like(per_sample_loss)
         
         weight = weight / (weight.mean() + 1e-8)
         final_loss = (weight * per_sample_loss).mean()
         
-        # 打印
-        if self.current_epoch % 1 == 0 and not return_per_sample:
+        # 日志
+        if not return_per_sample:
             conf_mean = self.confidences.mean().item() if self.confidences is not None else 0.0
-            high_conf_ratio = (self.confidences > 0.7).float().mean().item() if self.confidences is not None else 0.0
-            print(f"[ProtoLoss] Epoch {self.current_epoch:2d} | "
-                  f"loss={final_loss.item():.4f} | conf_mean={conf_mean:.4f} | "
-                  f"high_conf={high_conf_ratio:.1%}")
+            print(f"[ProtoLoss] Epoch {self.current_epoch} | Loss={final_loss.item():.4f} | "
+                  f"Conf={conf_mean:.4f}")
         
         if return_per_sample:
             return final_loss, per_sample_loss.detach()
