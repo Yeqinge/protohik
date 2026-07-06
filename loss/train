@@ -1,0 +1,62 @@
+import torch
+from tqdm import tqdm
+
+# 从你的模块导入
+from losses.prototype_loss import PrototypeLoss
+from utils.noise_utils import compute_gmm_confidence, get_all_per_sample_losses
+
+
+def is_prototype_loss(loss_fn):
+    """判断是否为 PrototypeLoss（支持多种判断方式）"""
+    if isinstance(loss_fn, PrototypeLoss):
+        return True
+    if hasattr(loss_fn, '__class__') and loss_fn.__class__.__name__ == "PrototypeLoss":
+        return True
+    return False
+
+
+# ====================== 训练主循环 ======================
+def train_model(model, loss_fn, train_loader, full_loader, optimizer, 
+                device, total_epochs=20, gmm_update_freq=3):
+    
+    use_gmm = is_prototype_loss(loss_fn)
+    print(f"使用 GMM 动态置信度: {use_gmm} (Loss 类型: {type(loss_fn).__name__})")
+    
+    for epoch in range(total_epochs):
+        loss_fn.current_epoch = getattr(loss_fn, 'current_epoch', epoch)  # 兼容其他 loss
+        
+        # ==================== GMM 更新（仅对 PrototypeLoss 生效） ====================
+        if use_gmm and (epoch == 0 or epoch % gmm_update_freq == 0):
+            print(f"\n=== Epoch {epoch}: Updating GMM Confidences ===")
+            
+            all_losses = get_all_per_sample_losses(model, loss_fn, full_loader, device)
+            new_conf = compute_gmm_confidence(all_losses)
+            loss_fn.update_confidences(new_conf)
+            
+            print(f"GMM 更新完成 | Mean Confidence: {new_conf.mean():.4f} | "
+                  f"High Conf (>0.7): {(new_conf > 0.7).float().mean():.1%}")
+        
+        # ==================== 正常训练 ====================
+        model.train()
+        epoch_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{total_epochs-1}")
+        
+        for batch_feat, batch_label, *_ in pbar:   # 使用 * _ 兼容不同 dataset 返回值
+            batch_feat = batch_feat.to(device)
+            batch_label = batch_label.to(device)
+            
+            optimizer.zero_grad()
+            
+            # 统一调用方式，兼容不同 loss
+            loss = loss_fn(batch_feat, batch_label)
+            
+            loss.backward()
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+        
+        avg_loss = epoch_loss / len(train_loader)
+        print(f"Epoch {epoch} 完成 | Avg Loss: {avg_loss:.4f}\n")
+    
+    return model
