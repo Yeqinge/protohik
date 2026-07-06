@@ -5,6 +5,16 @@ from sklearn.mixture import GaussianMixture
 import numpy as np
 from tqdm import tqdm
 
+self.loss_fn = PrototypeLoss(input_dim=xxx, num_targets=2, confidence_alpha=1.5)
+
+# 只加下面这一行
+self.loss_fn.set_training_env(model=self, 
+                              full_dataloader=your_full_train_dataloader, 
+                              device=self.device)
+
+
+
+
 class PrototypeLoss(nn.Module):
     def __init__(self, input_dim, num_targets=2, temperature=0.1,
                  warmup_epochs=3, total_epochs=30, confidence_alpha=1.5,
