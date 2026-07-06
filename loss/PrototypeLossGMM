@@ -1,0 +1,56 @@
+class PrototypeLossGMM(nn.Module):
+    def __init__(self, input_dim, num_targets=2, temperature=0.1,
+                 warmup_epochs=3, total_epochs=20, confidence_alpha=1.5):
+        super().__init__()
+        self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        
+        self.temperature = temperature
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.current_epoch = 0
+        self.confidence_alpha = confidence_alpha
+        
+        self.loss_function = nn.CrossEntropyLoss(reduction='none')
+        self.confidences = None
+
+    def update_confidences(self, new_confidences):
+        self.confidences = new_confidences.to(next(self.parameters()).device)
+
+    def _get_confidence_weight(self, confidences):
+        if confidences is None:
+            return torch.ones_like(confidences) if confidences is not None else None
+        return confidences ** self.confidence_alpha
+
+    def forward(self, inputs, targets, return_per_sample=False):
+        assert len(inputs.shape) == 3 and inputs.shape[2] == 1
+        features = torch.squeeze(inputs, dim=2)
+        
+        features_norm = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+        logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
+        
+        self.posterior = logits.unsqueeze(2).detach()
+        
+        per_sample_loss = self.loss_function(logits, targets)
+        
+        # 权重计算
+        if self.confidences is not None:
+            weight = self._get_confidence_weight(self.confidences[:len(per_sample_loss)])
+        else:
+            weight = torch.ones_like(per_sample_loss)
+        
+        weight = weight / (weight.mean() + 1e-8)
+        final_loss = (weight * per_sample_loss).mean()
+        
+        # 打印
+        if self.current_epoch % 1 == 0 and not return_per_sample:
+            conf_mean = self.confidences.mean().item() if self.confidences is not None else 0.0
+            high_conf_ratio = (self.confidences > 0.7).float().mean().item() if self.confidences is not None else 0.0
+            print(f"[ProtoLoss] Epoch {self.current_epoch:2d} | "
+                  f"loss={final_loss.item():.4f} | conf_mean={conf_mean:.4f} | "
+                  f"high_conf={high_conf_ratio:.1%}")
+        
+        if return_per_sample:
+            return final_loss, per_sample_loss.detach()
+        return final_loss
