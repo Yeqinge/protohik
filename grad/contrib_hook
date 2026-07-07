@@ -1,20 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 contrib_hook.py
-逐样本贡献追踪（适配 GMMPrototypeLoss）
-
-
-contrib = instrument(
-    model=model,
-    bunch=bunch,
-    num_targets=info["num_targets"],
-    save_dir=os.path.join(model_dir, "contrib"),
-    loader_attr="train_loader",
-    start_epoch=...,
-    real_ids=True,
-    id_source=...,           # 可选
-    egs_file="/path/to/your/egs.list"   # ← 新增支持
-)
+逐样本贡献追踪（适配 GMMPrototypeLoss + 修复 NoneType 错误）
 """
 import os
 import hashlib
@@ -41,7 +28,6 @@ def _hash_ids(feats):
 
 
 def _split_targets(batch):
-    """提取 targets 和 feats"""
     if isinstance(batch, dict):
         for k in ("label", "labels", "target", "targets", "y"):
             if k in batch:
@@ -58,7 +44,7 @@ def _find_loss_module(model):
     for name, mod in model.named_modules():
         if "GMMPrototypeLoss" in type(mod).__name__:
             return name, mod
-    # 兜底
+    # 兜底查找
     keys = ("loss", "softmax", "margin", "proto", "aam", "arc", "gmm")
     for name, mod in model.named_modules():
         if any(k in type(mod).__name__.lower() for k in keys):
@@ -66,13 +52,32 @@ def _find_loss_module(model):
     return None, None
 
 
-def _get_dataloader_with_sampler(loader):
-    if getattr(loader, "batch_sampler", None) is not None:
-        return loader
-    for attr in ("loader", "_loader", "dataloader", "_dataloader", "dl", "_dl"):
-        inner = getattr(loader, attr, None)
-        if inner is not None and getattr(inner, "batch_sampler", None) is not None:
-            return inner
+def _get_dataloader_with_sampler(loader, max_depth=10):
+    """增强版：支持多层嵌套 DataLoader"""
+    current = loader
+    visited = set()
+    depth = 0
+    
+    while depth < max_depth:
+        if id(current) in visited:
+            break
+        visited.add(id(current))
+        
+        if getattr(current, "batch_sampler", None) is not None:
+            return current
+        
+        for attr in ["loader", "_loader", "dataloader", "_dataloader", "dl", "_dl",
+                     "train_loader", "train_dataloader", "data_loader", "inner_loader"]:
+            inner = getattr(current, attr, None)
+            if inner is not None and inner is not current:
+                current = inner
+                break
+        else:
+            break
+        depth += 1
+    
+    if getattr(current, "batch_sampler", None) is not None:
+        return current
     return None
 
 
@@ -116,7 +121,7 @@ class _Instrumenter:
     def stash(self, ids, targets):
         self._stash = (ids, targets)
 
-    # ====================== Loss Pre Hook (梯度) ======================
+    # ====================== Loss Pre Hook ======================
     def _loss_pre_hook(self, module, args):
         if not self.model.training or self._stash is None:
             return
@@ -139,13 +144,12 @@ class _Instrumenter:
                 if len(ids) == gn.shape[0]:
                     self.tracker.update_grad(ids, gn.cpu().numpy(), al.cpu().numpy())
             finally:
-                h = holder.get("h")
-                if h is not None:
-                    h.remove()
+                if "h" in holder:
+                    holder["h"].remove()
 
         holder["h"] = X.register_hook(_grad_cb)
 
-    # ====================== Loss Post Hook (loss + confidence + correct) ======================
+    # ====================== Loss Post Hook（已修复 NoneType） ======================
     def _loss_post_hook(self, module, args, output):
         if not self.model.training or self._stash is None:
             return
@@ -153,46 +157,52 @@ class _Instrumenter:
         ids = list(self._stash[0])
         targets = self._stash[1]
 
-        # 1. GMMPrototypeLoss 专用路径
-        if hasattr(module, "per_sample_loss") and hasattr(module, "posterior"):
-            per_sample_loss = module.per_sample_loss.detach().cpu().numpy()
-            # confidence / weight
-            if hasattr(module, "confidence") and module.confidence is not None:
-                confidence = module.confidence.detach().cpu().numpy()
-            elif hasattr(module, "_last_focal_weight"):
-                confidence = module._last_focal_weight.detach().cpu().numpy()
-            else:
-                confidence = None
+        # 优先适配 GMMPrototypeLoss
+        if hasattr(module, "per_sample_loss"):
+            per_sample_loss = getattr(module, "per_sample_loss", None)
+            if per_sample_loss is not None:
+                try:
+                    self.tracker.update_pred(ids, per_sample_loss.detach().cpu().numpy(), targets)
+                except Exception:
+                    pass
 
-            self.tracker.update_pred(ids, per_sample_loss, targets)
-            if confidence is not None and len(ids) == len(confidence):
-                self.tracker.update_weight(ids, confidence)
+            # 获取 weight / confidence（安全处理 None）
+            weight = None
+            for attr in ["_last_focal_weight", "weight", "confidence"]:
+                candidate = getattr(module, attr, None)
+                if candidate is not None:
+                    weight = candidate
+                    break
+
+            if weight is not None:
+                try:
+                    self.tracker.update_weight(ids, weight.detach().cpu().numpy())
+                except Exception:
+                    pass
             return
 
-        # 2. 通用 fallback
+        # 通用 fallback
         fw = getattr(module, "_last_focal_weight", None)
         if fw is not None:
-            self.tracker.update_weight(ids, fw.cpu().numpy())
-
-        # 尝试从 output 提取 loss（CrossEntropyLoss 返回 scalar 时可能没有 per-sample）
-        if isinstance(output, torch.Tensor) and output.dim() == 0:
-            # scalar loss，暂时跳过 per-sample
-            pass
+            try:
+                self.tracker.update_weight(ids, fw.detach().cpu().numpy())
+            except Exception:
+                pass
 
     def attach_model(self):
         lname, lmod = _find_loss_module(self.model)
         if lmod is None:
-            print("[contrib] 警告：未定位到损失模块")
+            print("[contrib] 警告：未找到损失模块")
             return
 
         self._hooks.append(lmod.register_forward_pre_hook(self._loss_pre_hook))
         self._hooks.append(lmod.register_forward_hook(self._loss_post_hook))
-        print(f"[contrib] 梯度+loss+confidence 已挂到损失模块: {lname}")
+        print(f"[contrib] 成功挂载到损失模块: {lname}")
 
     def attach_real_ids(self, loader):
         dl = _get_dataloader_with_sampler(loader)
         if dl is None:
-            print("[contrib] 未找到 batch_sampler，回退到特征哈希")
+            print("[contrib] 未能找到有效的 DataLoader，回退到特征哈希")
             return False
 
         wrapped = _RecordingBatchSampler(dl.batch_sampler, self._idx_queue)
@@ -200,11 +210,12 @@ class _Instrumenter:
             object.__setattr__(dl, "batch_sampler", wrapped)
         except Exception:
             dl.__dict__["batch_sampler"] = wrapped
+
         if "_index_sampler" in dl.__dict__:
             dl.__dict__["_index_sampler"] = wrapped
 
         self.real_ids = True
-        print(f"[contrib] 已启用真实样本 id")
+        print(f"[contrib] ✅ 已启用真实样本ID")
         return True
 
     def finalize(self, out_csv=None):
@@ -250,7 +261,6 @@ class _LoaderWrapper:
 def instrument(model, bunch, num_targets, save_dir,
                loader_attr="train_loader", start_epoch=0,
                real_ids=True, id_source=None, egs_file=None):
-    """主入口"""
     global _ACTIVE
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
     if "RANK" in os.environ:
@@ -260,10 +270,19 @@ def instrument(model, bunch, num_targets, save_dir,
     _ACTIVE = inst
     inst.attach_model()
 
-    loader = getattr(bunch, loader_attr)
-    if real_ids:
-        inst.attach_real_ids(loader)
+    # 支持多层嵌套查找 loader
+    loader = None
+    for attr in [loader_attr, "train_loader", "train_dataloader", "loader", "dataloader"]:
+        loader = getattr(bunch, attr, None)
+        if loader is not None:
+            break
 
-    setattr(bunch, loader_attr, _LoaderWrapper(loader, inst, start_epoch))
-    print(f"[contrib] 已包装训练 loader -> {save_dir}")
+    if loader is not None:
+        if real_ids:
+            inst.attach_real_ids(loader)
+        setattr(bunch, loader_attr, _LoaderWrapper(loader, inst, start_epoch))
+        print(f"[contrib] 已包装 loader: {loader_attr} -> {save_dir}")
+    else:
+        print("[contrib] 警告：未能找到 loader，仅记录梯度信息")
+
     return inst
