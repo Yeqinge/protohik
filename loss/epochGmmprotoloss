@@ -1,21 +1,11 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+class GMMPrototypeLoss(TopVirtualLoss):
 
-from sklearn.mixture import GaussianMixture
-
-
-class PrototypeLoss(TopVirtualLoss):
-
-    def __init__(
+    def init(
             self,
             input_dim,
             num_targets,
             temperature=0.1,
             confidence_alpha=1.5):
-
-        super().__init__()
 
         # =====================================================
         # Prototype
