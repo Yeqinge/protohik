@@ -1,32 +1,13 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from sklearn.mixture import GaussianMixture
-
-
 class GMMPrototypeLoss(TopVirtualLoss):
-    def init(
-            self,
-            input_dim,
-            num_targets,
-            temperature=0.1,
-            confidence_alpha=1.5):
-        
-        # =====================================================
+    def init(self, input_dim, num_targets, temperature=0.1, confidence_alpha=1.5):
         # Prototype
-        # =====================================================
-        self.prototypes = nn.Parameter(
-            torch.randn(num_targets, input_dim)
-        )
+        self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
         nn.init.xavier_uniform_(self.prototypes)
         
         self.temperature = temperature
         self.loss_function = nn.CrossEntropyLoss(reduction='none')
         
-        # =====================================================
         # GMM
-        # =====================================================
         self.confidence_alpha = confidence_alpha
         self.gmm = None
         self.clean_mean = None
@@ -34,126 +15,87 @@ class GMMPrototypeLoss(TopVirtualLoss):
         self.current_epoch = 0
         self.epoch_losses = []
         
-        # ==================== 新增：供 contrib_hook 读取 ====================
-        self.per_sample_loss = None   # 当前 batch 的 per-sample loss
-        self.confidence = None        # 当前 batch 的 confidence weight
-        self._last_focal_weight = None  # 兼容原有 focal_weight 逻辑
+        # ==================== 供 contrib 采集 ====================
+        self.per_sample_loss = None
+        self.confidence = None        # clean class 的概率
+        self.weight = None            # 最终用于加权的 weight (confidence ** alpha)
+        self._last_focal_weight = None
 
-    # =====================================================
-    # Forward
-    # =====================================================
     def forward(self, inputs, targets):
-        assert len(inputs.shape) == 3
-        assert inputs.shape[2] == 1
+        assert len(inputs.shape) == 3 and inputs.shape[2] == 1
         features = torch.squeeze(inputs, dim=2)
 
-        # -------------------------------------------------
-        # Normalize
-        # -------------------------------------------------
         features_norm = F.normalize(features, dim=1)
         prototypes_norm = F.normalize(self.prototypes, dim=1)
 
-        # -------------------------------------------------
-        # Prototype Classification
-        # -------------------------------------------------
         logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
-        
-        # 保存 posterior（可选）
         self.posterior = logits.unsqueeze(2).detach()
 
-        # -------------------------------------------------
-        # Per-sample CE Loss
-        # -------------------------------------------------
+        # Per-sample loss
         per_sample_loss = self.loss_function(logits, targets)
         
-        # 保存供 contrib_hook 使用
-        self.per_sample_loss = per_sample_loss.detach()
-
-        # -------------------------------------------------
-        # 保存当前batch loss（用于 epoch 结束时的 GMM）
-        # -------------------------------------------------
+        # === 关键保存部分 ===
+        self.per_sample_loss = per_sample_loss.detach().clone()  # clone 更安全
+        
+        # 保存当前 batch 用于 epoch 统计
         self.epoch_losses.append(per_sample_loss.detach().cpu())
 
-        # -------------------------------------------------
-        # GMM Confidence Weighting
-        # -------------------------------------------------
+        # GMM weighting
         if self.gmm is not None:
             loss_np = per_sample_loss.detach().cpu().numpy().reshape(-1, 1)
             probs = self.gmm.predict_proba(loss_np)
             clean_idx = np.argmin(self.gmm.means_.flatten())
             
             confidence = torch.tensor(
-                probs[:, clean_idx],
-                dtype=torch.float32,
+                probs[:, clean_idx], 
+                dtype=torch.float32, 
                 device=per_sample_loss.device
             )
             
-            weight = confidence ** self.confidence_alpha
+            weight = (confidence ** self.confidence_alpha)
             weight = weight / (weight.mean() + 1e-8)
-            
-            # 保存 confidence（供 contrib_hook 读取）
+
+            # 保存给 contrib_hook
             self.confidence = confidence
-            self._last_focal_weight = weight  # 兼容原有字段
-            
+            self.weight = weight
+            self._last_focal_weight = weight   # 兼容旧逻辑
+
             final_loss = (weight * per_sample_loss).mean()
             conf_mean = confidence.mean().item()
         else:
             final_loss = per_sample_loss.mean()
             self.confidence = None
+            self.weight = None
             self._last_focal_weight = None
             conf_mean = 1.0
 
-        # -------------------------------------------------
-        # Log
-        # -------------------------------------------------
-        print(
-            f"[ProtoLoss] "
-            f"Epoch={self.current_epoch} "
-            f"| Loss={final_loss.item():.4f} "
-            f"| Conf={conf_mean:.4f}"
-        )
-        
+        print(f"[ProtoLoss] Epoch={self.current_epoch} | Loss={final_loss.item():.4f} | Conf={conf_mean:.4f}")
         return final_loss
 
-    # =====================================================
-    # Epoch End
-    # =====================================================
     def step(self, *args, **kwargs):
         self.current_epoch += 1
-        if len(self.epoch_losses) == 0:
+        if not self.epoch_losses:
             return
-
+        # ... GMM 更新逻辑保持不变 ...
         all_losses = torch.cat(self.epoch_losses, dim=0)
         losses_np = all_losses.numpy().reshape(-1, 1)
 
         try:
-            gmm = GaussianMixture(
-                n_components=2,
-                covariance_type='full',
-                random_state=42,
-                max_iter=200
-            )
+            gmm = GaussianMixture(n_components=2, covariance_type='full',
+                                  random_state=42, max_iter=200)
             gmm.fit(losses_np)
-            
             means = gmm.means_.flatten()
             clean_idx = np.argmin(means)
-            noisy_idx = 1 - clean_idx
             
             self.clean_mean = means[clean_idx]
-            self.noisy_mean = means[noisy_idx]
+            self.noisy_mean = means[1 - clean_idx]
             self.gmm = gmm
 
             probs = gmm.predict_proba(losses_np)
-            clean_prob = probs[:, clean_idx]
-
-            print(
-                f"\n[GMM Update] Epoch={self.current_epoch}\n"
-                f"Clean Mean = {self.clean_mean:.4f}\n"
-                f"Noisy Mean = {self.noisy_mean:.4f}\n"
-                f"Mean Confidence = {clean_prob.mean():.4f}\n"
-            )
+            print(f"\n[GMM Update] Epoch={self.current_epoch} | "
+                  f"Clean={self.clean_mean:.4f} | Noisy={self.noisy_mean:.4f} | "
+                  f"MeanConf={probs[:, clean_idx].mean():.4f}\n")
         except Exception as e:
             print(f"GMM Failed: {e}")
 
-        # 清空缓存
         self.epoch_losses = []
