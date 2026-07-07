@@ -2,6 +2,19 @@
 """
 contrib_hook.py
 逐样本贡献追踪（适配 GMMPrototypeLoss）
+
+
+contrib = instrument(
+    model=model,
+    bunch=bunch,
+    num_targets=info["num_targets"],
+    save_dir=os.path.join(model_dir, "contrib"),
+    loader_attr="train_loader",
+    start_epoch=...,
+    real_ids=True,
+    id_source=...,           # 可选
+    egs_file="/path/to/your/egs.list"   # ← 新增支持
+)
 """
 import os
 import hashlib
