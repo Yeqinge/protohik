@@ -1,229 +1,256 @@
 # -*- coding: utf-8 -*-
 """
-sample_tracker.py
-逐样本贡献的「存储 + 聚合」。被 contrib_hook.py 调用。
-summarize 已改为 numpy 向量化，73 万样本 × 10 epoch 几秒内完成。
+contrib_hook.py
+逐样本贡献追踪（适配 GMMPrototypeLoss）
 """
-
 import os
-import glob
-import csv
-import numpy as np
+import hashlib
+from collections import deque
+import torch
+import torch.nn.functional as F
+from sample_tracker import SampleContributionTracker
+
+_ACTIVE = None
 
 
-class SampleContributionTracker:
-    def __init__(self, save_dir, egs_file=None):
+def _to_2d(t):
+    if t.dim() == 2:
+        return t
+    if t.dim() == 3:
+        return t.mean(dim=-1) if t.shape[-1] > 1 else t[..., 0]
+    return t.reshape(t.shape[0], -1)
+
+
+def _hash_ids(feats):
+    feats = feats.detach().to("cpu").contiguous()
+    return [hashlib.blake2b(feats[i].numpy().tobytes(), digest_size=8).hexdigest()
+            for i in range(feats.shape[0])]
+
+
+def _split_targets(batch):
+    """提取 targets 和 feats"""
+    if isinstance(batch, dict):
+        for k in ("label", "labels", "target", "targets", "y"):
+            if k in batch:
+                return batch[k], batch.get("feat", batch.get("feats"))
+        return None, None
+    if isinstance(batch, (list, tuple)):
+        feats = batch[0]
+        return (batch[1] if len(batch) > 1 else None), feats
+    return None, batch
+
+
+def _find_loss_module(model):
+    """优先查找 GMMPrototypeLoss"""
+    for name, mod in model.named_modules():
+        if "GMMPrototypeLoss" in type(mod).__name__:
+            return name, mod
+    # 兜底
+    keys = ("loss", "softmax", "margin", "proto", "aam", "arc", "gmm")
+    for name, mod in model.named_modules():
+        if any(k in type(mod).__name__.lower() for k in keys):
+            return name, mod
+    return None, None
+
+
+def _get_dataloader_with_sampler(loader):
+    if getattr(loader, "batch_sampler", None) is not None:
+        return loader
+    for attr in ("loader", "_loader", "dataloader", "_dataloader", "dl", "_dl"):
+        inner = getattr(loader, attr, None)
+        if inner is not None and getattr(inner, "batch_sampler", None) is not None:
+            return inner
+    return None
+
+
+class _RecordingBatchSampler:
+    def __init__(self, bs, sink):
+        self._bs = bs
+        self._sink = sink
+
+    def __iter__(self):
+        for idxs in self._bs:
+            self._sink.append(list(idxs))
+            yield idxs
+
+    def __len__(self):
+        return len(self._bs)
+
+    def __getattr__(self, item):
+        return getattr(self._bs, item)
+
+
+class _Instrumenter:
+    def __init__(self, model, num_targets, save_dir, id_source, egs_file=None):
+        self.model = model
+        self.num_targets = num_targets
+        self.tracker = SampleContributionTracker(save_dir, egs_file=egs_file)
         self.save_dir = save_dir
-        os.makedirs(save_dir, exist_ok=True)
-        self._epoch = 0
-        self._buf = {}
-        self._id2utt = {}          # str(sample_idx) -> utt_id
-        if egs_file:
-            self._load_egs(egs_file)
+        self.id_source = id_source
+        self._stash = None
+        self._idx_queue = deque()
+        self._hooks = []
+        self.real_ids = False
 
-    def _load_egs(self, path):
-        if not os.path.exists(path):
-            print(f"[contrib] 警告: egs 文件不存在: {path}")
+    def resolve_ids(self, idxs):
+        src = self.id_source
+        if src is None:
+            return [str(i) for i in idxs]
+        if callable(src):
+            return [str(src(i)) for i in idxs]
+        return [str(src[i]) for i in idxs]
+
+    def stash(self, ids, targets):
+        self._stash = (ids, targets)
+
+    # ====================== Loss Pre Hook (梯度) ======================
+    def _loss_pre_hook(self, module, args):
+        if not self.model.training or self._stash is None:
             return
-        with open(path) as f:
-            first = f.readline()
-            delim = "\t" if "\t" in first else " "
-        with open(path) as f:
-            for i, line in enumerate(f):
-                parts = line.strip().split(delim)
-                if parts:
-                    self._id2utt[str(i)] = parts[0]
-        print(f"[contrib] egs 已加载: {len(self._id2utt)} 条 utt-id")
-
-    def _get_utt(self, sid):
-        """sample id -> utt_id，找不到时原样返回 sid。"""
-        return self._id2utt.get(str(sid), str(sid))
-
-    def set_epoch(self, epoch):
-        self._epoch = int(epoch)
-        self._buf = {}
-
-    def _ent(self, sid):
-        return self._buf.setdefault(sid, {
-            "gn": 0.0, "gn_n": 0, "al": 0.0, "al_n": 0,
-            "loss": 0.0, "loss_n": 0, "correct": -1,
-            "fw": 0.0, "fw_n": 0,   # focal_weight（无 focal 分支时不更新，存 nan）
-        })
-
-    def update_grad(self, ids, grad_norm, align):
-        for i, sid in enumerate(ids):
-            e = self._ent(str(sid))
-            e["gn"] += float(grad_norm[i]); e["gn_n"] += 1
-            e["al"] += float(align[i]);     e["al_n"] += 1
-
-    def update_pred(self, ids, loss, correct):
-        for i, sid in enumerate(ids):
-            e = self._ent(str(sid))
-            e["loss"] += float(loss[i]); e["loss_n"] += 1
-            e["correct"] = int(bool(correct[i]))
-
-    # 新增：由 contrib_hook._loss_post_hook 调用
-    def update_weight(self, ids, weights):
-        for i, sid in enumerate(ids):
-            e = self._ent(str(sid))
-            e["fw"] += float(weights[i]); e["fw_n"] += 1
-
-    def save_epoch(self):
-        ids = list(self._buf.keys())
-        if not ids:
+        X = None
+        for a in args:
+            if torch.is_tensor(a) and a.is_floating_point() and a.dim() >= 2 and a.requires_grad:
+                X = a
+                break
+        if X is None:
             return
-        def col(f):
-            return np.array([f(self._buf[i]) for i in ids], dtype=np.float32)
-        np.savez(
-            os.path.join(self.save_dir, f"contrib_epoch{self._epoch:03d}.npz"),
-            ids=np.array(ids),
-            utt_ids=np.array([self._get_utt(i) for i in ids]),
-            grad_norm=col(lambda e: e["gn"] / e["gn_n"] if e["gn_n"] else np.nan),
-            align=col(lambda e: e["al"] / e["al_n"] if e["al_n"] else np.nan),
-            loss=col(lambda e: e["loss"] / e["loss_n"] if e["loss_n"] else np.nan),
-            correct=np.array([self._buf[i]["correct"] for i in ids], dtype=np.int8),
-            focal_weight=col(lambda e: e["fw"] / e["fw_n"] if e["fw_n"] else np.nan),  # 新增
-        )
-        print(f"[contrib] epoch {self._epoch} 已保存 ({len(ids)} 样本)")
 
-    # ==================== 向量化 summarize ====================
-    @staticmethod
-    def summarize(save_dir, out_csv, egs_file=None):
-        files = sorted(glob.glob(os.path.join(save_dir, "contrib_epoch*.npz")))
-        if not files:
-            raise FileNotFoundError(f"在 {save_dir} 没找到 contrib_epoch*.npz")
-        n_epochs = len(files)
-        print(f"[contrib] 读取 {n_epochs} 个 epoch ...")
+        ids = list(self._stash[0])
+        holder = {}
 
-        # ---- 第一步：收集所有 id 并建立 id->行号 映射 ----
-        d0 = np.load(files[0], allow_pickle=True)
-        all_ids = list(d0["ids"].astype(str))
-        id2idx  = {sid: i for i, sid in enumerate(all_ids)}
-
-        # ---- utt_id 映射（三路来源，优先级从高到低）----
-        utt_id_map = {}
-        if egs_file and os.path.exists(egs_file):
-            with open(egs_file) as f:
-                first = f.readline()
-                delim = "\t" if "\t" in first else " "
-            with open(egs_file) as f:
-                for i, line in enumerate(f):
-                    parts = line.strip().split(delim)
-                    if parts:
-                        utt_id_map[str(i)] = parts[0]
-            print(f"[contrib] egs 已加载: {len(utt_id_map)} 条 utt-id")
-        elif "utt_ids" in d0:
-            for sid, uid in zip(d0["ids"].astype(str), d0["utt_ids"].astype(str)):
-                utt_id_map[sid] = uid
-            print(f"[contrib] utt_id 来自 npz: {len(utt_id_map)} 条")
-
-        for f in files[1:]:
-            d = np.load(f, allow_pickle=True)
-            for sid in d["ids"].astype(str):
-                if sid not in id2idx:
-                    id2idx[sid] = len(all_ids)
-                    all_ids.append(sid)
-
-        n_samples = len(all_ids)
-        print(f"[contrib] 共 {n_samples} 个样本，开始向量化聚合 ...")
-
-        # ---- 第二步：分配矩阵，填入数据 ----
-        gn = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
-        al = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
-        ls = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
-        co = np.full((n_samples, n_epochs), -1,      dtype=np.int8)
-        fw = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)  # 新增
-
-        for ei, f in enumerate(files):
-            d = np.load(f, allow_pickle=True)
-            ids_str = d["ids"].astype(str)
+        def _grad_cb(grad):
             try:
-                idxs = ids_str.astype(np.int64)
-                if idxs.max() >= n_samples or idxs.min() < 0:
-                    raise ValueError
-            except (ValueError, OverflowError):
-                idxs = np.array([id2idx[s] for s in ids_str], dtype=np.int64)
-            gn[idxs, ei] = d["grad_norm"]
-            al[idxs, ei] = d["align"]
-            ls[idxs, ei] = d["loss"]
-            co[idxs, ei] = d["correct"]
-            if "focal_weight" in d:                  # 新增；旧 npz 没有此字段时静默跳过
-                fw[idxs, ei] = d["focal_weight"]
-            print(f"  epoch {ei}: {len(ids_str)} 样本已加载")
+                g = grad.detach().reshape(grad.shape[0], -1).float()
+                gn = g.norm(dim=1)
+                al = F.cosine_similarity(g, g.sum(0, keepdim=True).expand_as(g), dim=1)
+                if len(ids) == gn.shape[0]:
+                    self.tracker.update_grad(ids, gn.cpu().numpy(), al.cpu().numpy())
+            finally:
+                h = holder.get("h")
+                if h is not None:
+                    h.remove()
 
-        # ---- 第三步：全量向量化计算 ----
-        print("[contrib] 计算统计量 ...")
-        with np.errstate(all="ignore"):
-            mean_gn    = np.nanmean(gn, axis=1)
-            early_gn   = gn[:, 0]
-            self_inf   = np.nansum(gn ** 2, axis=1)
-            mean_al    = np.nanmean(al, axis=1)
-            mean_ls    = np.nanmean(ls, axis=1)
-            last_ls    = ls[:, -1]
-            n_ep_valid = np.sum(~np.isnan(gn), axis=1)
-            mean_fw    = np.nanmean(fw, axis=1)      # 新增
-            last_fw    = fw[:, -1]                   # 新增
+        holder["h"] = X.register_hook(_grad_cb)
 
-            # frac_neg_align
-            valid_al = ~np.isnan(al)
-            neg_al   = (al < 0) & valid_al
-            n_val_al = valid_al.sum(axis=1).astype(np.float32)
-            frac_neg = np.where(n_val_al > 0, neg_al.sum(axis=1) / n_val_al, np.nan)
+    # ====================== Loss Post Hook (loss + confidence + correct) ======================
+    def _loss_post_hook(self, module, args, output):
+        if not self.model.training or self._stash is None:
+            return
 
-            # forget events
-            forget = np.zeros(n_samples, dtype=np.int32)
-            if n_epochs > 1:
-                forget = ((co[:, :-1] == 1) & (co[:, 1:] == 0)).sum(axis=1)
-            final_co = co[:, -1]
+        ids = list(self._stash[0])
+        targets = self._stash[1]
 
-        # ---- 第四步：按全体分位数打标签 ----
-        print("[contrib] 打标签 ...")
-        hi_inf = np.nanpercentile(self_inf, 90)
-        valid_ma = mean_al[~np.isnan(mean_al)]
-        lo_aln = np.nanpercentile(valid_ma, 10) if len(valid_ma) else -np.inf
+        # 1. GMMPrototypeLoss 专用路径
+        if hasattr(module, "per_sample_loss") and hasattr(module, "posterior"):
+            per_sample_loss = module.per_sample_loss.detach().cpu().numpy()
+            # confidence / weight
+            if hasattr(module, "confidence") and module.confidence is not None:
+                confidence = module.confidence.detach().cpu().numpy()
+            elif hasattr(module, "_last_focal_weight"):
+                confidence = module._last_focal_weight.detach().cpu().numpy()
+            else:
+                confidence = None
 
-        tags = np.full(n_samples, 4, dtype=np.int8)  # 4=normal
-        easy_mask = (~np.isnan(mean_ls)) & (mean_ls < 1e-2) & (forget == 0)
-        tags[easy_mask] = 0                            # easy_redundant
-        tags[self_inf >= hi_inf] = 1                   # high_influence
-        tags[(forget >= 2) | (final_co == 0)] = 2      # hard
-        harmful = (~np.isnan(mean_al)) & (mean_al < 0) & (mean_al <= lo_aln) & \
-                  ((final_co == 0) | (final_co == -1))
-        tags[harmful] = 3                              # harmful_suspect
+            self.tracker.update_pred(ids, per_sample_loss, targets)
+            if confidence is not None and len(ids) == len(confidence):
+                self.tracker.update_weight(ids, confidence)
+            return
 
-        tag_names = {0: "easy_redundant", 1: "high_influence",
-                     2: "hard", 3: "harmful_suspect", 4: "normal"}
+        # 2. 通用 fallback
+        fw = getattr(module, "_last_focal_weight", None)
+        if fw is not None:
+            self.tracker.update_weight(ids, fw.cpu().numpy())
 
-        # ---- 第五步：按 self_influence 降序写 CSV ----
-        print("[contrib] 写 CSV ...")
-        order = np.argsort(-self_inf)
+        # 尝试从 output 提取 loss（CrossEntropyLoss 返回 scalar 时可能没有 per-sample）
+        if isinstance(output, torch.Tensor) and output.dim() == 0:
+            # scalar loss，暂时跳过 per-sample
+            pass
 
-        has_utt = bool(utt_id_map)
-        fields = ["id", "utt_id", "tag", "n_epochs", "mean_grad_norm", "early_grad_norm",
-                  "self_influence", "mean_align", "frac_neg_align",
-                  "mean_loss", "last_loss", "forget_events", "final_correct",
-                  "mean_focal_weight", "last_focal_weight"]   # 新增两列
-        with open(out_csv, "w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(fields)
-            for i in order:
-                sid = all_ids[i]
-                w.writerow([
-                    sid,
-                    utt_id_map.get(sid, sid) if has_utt else sid,
-                    tag_names[int(tags[i])],
-                    int(n_ep_valid[i]),
-                    f"{mean_gn[i]:.6f}",
-                    f"{early_gn[i]:.6f}",
-                    f"{self_inf[i]:.4f}",
-                    f"{mean_al[i]:.6f}",
-                    f"{frac_neg[i]:.4f}",
-                    f"{mean_ls[i]:.6f}",
-                    f"{last_ls[i]:.6f}",
-                    int(forget[i]),
-                    int(final_co[i]),
-                    f"{mean_fw[i]:.6f}",   # 新增
-                    f"{last_fw[i]:.6f}",   # 新增
-                ])
-        print(f"[contrib] 已写出 {n_samples} 个样本 -> {out_csv}")
-        return out_csv
+    def attach_model(self):
+        lname, lmod = _find_loss_module(self.model)
+        if lmod is None:
+            print("[contrib] 警告：未定位到损失模块")
+            return
+
+        self._hooks.append(lmod.register_forward_pre_hook(self._loss_pre_hook))
+        self._hooks.append(lmod.register_forward_hook(self._loss_post_hook))
+        print(f"[contrib] 梯度+loss+confidence 已挂到损失模块: {lname}")
+
+    def attach_real_ids(self, loader):
+        dl = _get_dataloader_with_sampler(loader)
+        if dl is None:
+            print("[contrib] 未找到 batch_sampler，回退到特征哈希")
+            return False
+
+        wrapped = _RecordingBatchSampler(dl.batch_sampler, self._idx_queue)
+        try:
+            object.__setattr__(dl, "batch_sampler", wrapped)
+        except Exception:
+            dl.__dict__["batch_sampler"] = wrapped
+        if "_index_sampler" in dl.__dict__:
+            dl.__dict__["_index_sampler"] = wrapped
+
+        self.real_ids = True
+        print(f"[contrib] 已启用真实样本 id")
+        return True
+
+    def finalize(self, out_csv=None):
+        self.tracker.save_epoch()
+        for h in self._hooks:
+            h.remove()
+        out_csv = out_csv or os.path.join(self.save_dir, "contrib_summary.csv")
+        return SampleContributionTracker.summarize(self.save_dir, out_csv)
+
+
+# ====================== Loader Wrapper ======================
+class _LoaderWrapper:
+    def __init__(self, loader, inst, start_epoch):
+        self._loader = loader
+        self._inst = inst
+        self._epoch = start_epoch
+        self._started = False
+
+    def __iter__(self):
+        if self._started:
+            self._inst.tracker.save_epoch()
+            self._epoch += 1
+        self._started = True
+        self._inst.tracker.set_epoch(self._epoch)
+        self._inst._idx_queue.clear()
+
+        for batch in self._loader:
+            targets, feats = _split_targets(batch)
+            if self._inst.real_ids and self._inst._idx_queue:
+                ids = self._inst.resolve_ids(self._inst._idx_queue.popleft())
+            else:
+                ids = _hash_ids(feats) if feats is not None else None
+            self._inst.stash(ids, targets)
+            yield batch
+
+    def __len__(self):
+        return len(self._loader)
+
+    def __getattr__(self, item):
+        return getattr(self._loader, item)
+
+
+def instrument(model, bunch, num_targets, save_dir,
+               loader_attr="train_loader", start_epoch=0,
+               real_ids=True, id_source=None, egs_file=None):
+    """主入口"""
+    global _ACTIVE
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    if "RANK" in os.environ:
+        save_dir = os.path.join(save_dir, f"rank{rank}")
+
+    inst = _Instrumenter(model, num_targets, save_dir, id_source, egs_file=egs_file)
+    _ACTIVE = inst
+    inst.attach_model()
+
+    loader = getattr(bunch, loader_attr)
+    if real_ids:
+        inst.attach_real_ids(loader)
+
+    setattr(bunch, loader_attr, _LoaderWrapper(loader, inst, start_epoch))
+    print(f"[contrib] 已包装训练 loader -> {save_dir}")
+    return inst
