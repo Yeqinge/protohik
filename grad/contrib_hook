@@ -1,33 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 contrib_hook.py
-逐样本贡献追踪，只改 Res_SE_Launcher.py 两行，不改 trainer/res_se_p/egs。
-依赖同目录 sample_tracker.py。
-
-真实样本 id 的拿法（不动任何源码、兼容 num_workers>0 和 shuffle）：
-  DataLoader 的 batch 采样器在【主进程】运行，每个 batch 会先吐出"这一批用了哪些
-  数据集下标"。我们把这个采样器包一层、按 FIFO 记录下标，再和每个产出的 batch 一一配对。
-  数据集下标本身就是稳定 id（__getitem__(i) 永远读 egs 第 i 行，shuffle 只改顺序）。
-  想要可读的 utt/chunk 名，给 instrument 传 id_source（list/dict/callable）即可。
-
-梯度路径：在损失模块输入张量上挂 register_hook，反传时拿到每样本真实梯度 dL/dX，
-算 grad_norm（贡献大小/难易）与 align（与本 batch 共识方向是否一致，负=有害嫌疑）。
+逐样本贡献追踪（适配 GMMPrototypeLoss）
 """
-
 import os
 import hashlib
 from collections import deque
-
 import torch
 import torch.nn.functional as F
-
 from sample_tracker import SampleContributionTracker
 
 _ACTIVE = None
-
-
-def capture(logits, targets):
-    pass  # loss 采集已移除
 
 
 def _to_2d(t):
@@ -45,7 +28,7 @@ def _hash_ids(feats):
 
 
 def _split_targets(batch):
-    """只为拿 targets（喂给可选的 loss/正确性记录）。拿不到就 None。"""
+    """提取 targets 和 feats"""
     if isinstance(batch, dict):
         for k in ("label", "labels", "target", "targets", "y"):
             if k in batch:
@@ -58,19 +41,19 @@ def _split_targets(batch):
 
 
 def _find_loss_module(model):
-    m = getattr(model, "loss", None)
-    if isinstance(m, torch.nn.Module):
-        return "loss", m
-    cand = (None, None)
-    keys = ("loss", "softmax", "margin", "proto", "aam", "arc")
+    """优先查找 GMMPrototypeLoss"""
+    for name, mod in model.named_modules():
+        if "GMMPrototypeLoss" in type(mod).__name__:
+            return name, mod
+    # 兜底
+    keys = ("loss", "softmax", "margin", "proto", "aam", "arc", "gmm")
     for name, mod in model.named_modules():
         if any(k in type(mod).__name__.lower() for k in keys):
-            cand = (name, mod)
-    return cand
+            return name, mod
+    return None, None
 
 
 def _get_dataloader_with_sampler(loader):
-    """找到真正持有 batch_sampler 的 torch DataLoader（可能被 fast loader 包了一层）。"""
     if getattr(loader, "batch_sampler", None) is not None:
         return loader
     for attr in ("loader", "_loader", "dataloader", "_dataloader", "dl", "_dl"):
@@ -81,7 +64,6 @@ def _get_dataloader_with_sampler(loader):
 
 
 class _RecordingBatchSampler:
-    """包住 batch_sampler：主进程里把每个 batch 的下标列表记进 sink（FIFO）。"""
     def __init__(self, bs, sink):
         self._bs = bs
         self._sink = sink
@@ -104,9 +86,9 @@ class _Instrumenter:
         self.num_targets = num_targets
         self.tracker = SampleContributionTracker(save_dir, egs_file=egs_file)
         self.save_dir = save_dir
-        self.id_source = id_source       # None / list / dict / callable(idx)->str
-        self._stash = None               # (ids, targets)
-        self._idx_queue = deque()        # batch 采样器记录的下标，FIFO
+        self.id_source = id_source
+        self._stash = None
+        self._idx_queue = deque()
         self._hooks = []
         self.real_ids = False
 
@@ -116,22 +98,25 @@ class _Instrumenter:
             return [str(i) for i in idxs]
         if callable(src):
             return [str(src(i)) for i in idxs]
-        return [str(src[i]) for i in idxs]   # list 或 dict
+        return [str(src[i]) for i in idxs]
 
     def stash(self, ids, targets):
         self._stash = (ids, targets)
 
-    # —— 主路径：损失模块输入梯度 ——
+    # ====================== Loss Pre Hook (梯度) ======================
     def _loss_pre_hook(self, module, args):
         if not self.model.training or self._stash is None:
             return
         X = None
         for a in args:
             if torch.is_tensor(a) and a.is_floating_point() and a.dim() >= 2 and a.requires_grad:
-                X = a; break
+                X = a
+                break
         if X is None:
             return
-        ids = list(self._stash[0]); holder = {}
+
+        ids = list(self._stash[0])
+        holder = {}
 
         def _grad_cb(grad):
             try:
@@ -147,33 +132,56 @@ class _Instrumenter:
 
         holder["h"] = X.register_hook(_grad_cb)
 
-    # —— 新增：损失模块 forward 结束后读取 focal_weight ——
+    # ====================== Loss Post Hook (loss + confidence + correct) ======================
     def _loss_post_hook(self, module, args, output):
         if not self.model.training or self._stash is None:
             return
-        fw = getattr(module, "_last_focal_weight", None)
-        if fw is None:
-            return
+
         ids = list(self._stash[0])
-        if len(ids) == fw.shape[0]:
-            self.tracker.update_weight(ids, fw.numpy())
+        targets = self._stash[1]
+
+        # 1. GMMPrototypeLoss 专用路径
+        if hasattr(module, "per_sample_loss") and hasattr(module, "posterior"):
+            per_sample_loss = module.per_sample_loss.detach().cpu().numpy()
+            # confidence / weight
+            if hasattr(module, "confidence") and module.confidence is not None:
+                confidence = module.confidence.detach().cpu().numpy()
+            elif hasattr(module, "_last_focal_weight"):
+                confidence = module._last_focal_weight.detach().cpu().numpy()
+            else:
+                confidence = None
+
+            self.tracker.update_pred(ids, per_sample_loss, targets)
+            if confidence is not None and len(ids) == len(confidence):
+                self.tracker.update_weight(ids, confidence)
+            return
+
+        # 2. 通用 fallback
+        fw = getattr(module, "_last_focal_weight", None)
+        if fw is not None:
+            self.tracker.update_weight(ids, fw.cpu().numpy())
+
+        # 尝试从 output 提取 loss（CrossEntropyLoss 返回 scalar 时可能没有 per-sample）
+        if isinstance(output, torch.Tensor) and output.dim() == 0:
+            # scalar loss，暂时跳过 per-sample
+            pass
 
     def attach_model(self):
         lname, lmod = _find_loss_module(self.model)
         if lmod is None:
-            print("[contrib] 警告：没定位到损失模块，主指标无法采集。")
-        else:
-            self._hooks.append(lmod.register_forward_pre_hook(self._loss_pre_hook))
-            self._hooks.append(lmod.register_forward_hook(self._loss_post_hook))  # 新增
-            print(f"[contrib] 梯度采集已挂到损失模块: {lname}")
-        print("[contrib] 只记录 grad_norm/align/focal_weight。")
+            print("[contrib] 警告：未定位到损失模块")
+            return
+
+        self._hooks.append(lmod.register_forward_pre_hook(self._loss_pre_hook))
+        self._hooks.append(lmod.register_forward_hook(self._loss_post_hook))
+        print(f"[contrib] 梯度+loss+confidence 已挂到损失模块: {lname}")
 
     def attach_real_ids(self, loader):
         dl = _get_dataloader_with_sampler(loader)
         if dl is None:
-            print("[contrib] 未找到 batch_sampler，无法用真实下标 id，回退到特征哈希。\n"
-                  "          （你的 loader 可能不是标准 map-style DataLoader）")
+            print("[contrib] 未找到 batch_sampler，回退到特征哈希")
             return False
+
         wrapped = _RecordingBatchSampler(dl.batch_sampler, self._idx_queue)
         try:
             object.__setattr__(dl, "batch_sampler", wrapped)
@@ -181,9 +189,9 @@ class _Instrumenter:
             dl.__dict__["batch_sampler"] = wrapped
         if "_index_sampler" in dl.__dict__:
             dl.__dict__["_index_sampler"] = wrapped
+
         self.real_ids = True
-        kind = ("整数下标" if self.id_source is None else "id_source 映射")
-        print(f"[contrib] 已启用真实样本 id（{kind}）。")
+        print(f"[contrib] 已启用真实样本 id")
         return True
 
     def finalize(self, out_csv=None):
@@ -194,17 +202,22 @@ class _Instrumenter:
         return SampleContributionTracker.summarize(self.save_dir, out_csv)
 
 
+# ====================== Loader Wrapper ======================
 class _LoaderWrapper:
     def __init__(self, loader, inst, start_epoch):
-        self._loader = loader; self._inst = inst
-        self._epoch = start_epoch; self._started = False
+        self._loader = loader
+        self._inst = inst
+        self._epoch = start_epoch
+        self._started = False
 
     def __iter__(self):
         if self._started:
-            self._inst.tracker.save_epoch(); self._epoch += 1
+            self._inst.tracker.save_epoch()
+            self._epoch += 1
         self._started = True
         self._inst.tracker.set_epoch(self._epoch)
         self._inst._idx_queue.clear()
+
         for batch in self._loader:
             targets, feats = _split_targets(batch)
             if self._inst.real_ids and self._inst._idx_queue:
@@ -224,14 +237,7 @@ class _LoaderWrapper:
 def instrument(model, bunch, num_targets, save_dir,
                loader_attr="train_loader", start_epoch=0,
                real_ids=True, id_source=None, egs_file=None):
-    """
-    在 trainer_process.run() 之前调用；run() 之后调用 .finalize()。
-
-    real_ids  : True 用 batch 采样器的真实数据集下标当 id（推荐）。
-    id_source : 可读名字映射（list/dict/callable），默认用整数下标。
-    egs_file  : egs 清单文件路径（第一列为 utt_id），用于在 npz/CSV 中
-                存入真实 utt_id，方便后续直接对应到具体音频。
-    """
+    """主入口"""
     global _ACTIVE
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
     if "RANK" in os.environ:
@@ -244,25 +250,7 @@ def instrument(model, bunch, num_targets, save_dir,
     loader = getattr(bunch, loader_attr)
     if real_ids:
         inst.attach_real_ids(loader)
+
     setattr(bunch, loader_attr, _LoaderWrapper(loader, inst, start_epoch))
-    print(f"[contrib] 已包装训练 loader: bunch.{loader_attr}; 落盘 -> {save_dir}")
+    print(f"[contrib] 已包装训练 loader -> {save_dir}")
     return inst
-
-
-# ============================================================
-# Res_SE_Launcher.py 只加两处：
-#
-# 【1】 trainer_process = trainer.SimpleTrainer(...) 之后：
-#   from contrib_hook import instrument
-#   contrib = instrument(
-#       model=model, bunch=bunch, num_targets=info["num_targets"],
-#       save_dir=os.path.join(model_dir, "contrib"),
-#       loader_attr="train_loader",
-#       start_epoch=train_stage if train_stage > 0 else 0,
-#       real_ids=True,            # 用真实下标 id
-#       # id_source=my_name_list, # 可选：下标->utt/chunk 名
-#   )
-#
-# 【2】 trainer_process.run() 之后：
-#   contrib.finalize()
-# ============================================================
