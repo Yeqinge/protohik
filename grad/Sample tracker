@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 sample_tracker.py
-逐样本贡献存储 + 聚合（不排序，按原始顺序）
+逐样本贡献存储 + 聚合（修复 focal_weight 缺失问题）
 """
 import os
 import glob
@@ -56,16 +56,15 @@ class SampleContributionTracker:
             e["al_n"] += 1
 
     def update_pred(self, ids, loss, targets):
-        """更新 loss 和 correct"""
         for i, sid in enumerate(ids):
             e = self._ent(str(sid))
             e["loss"] += float(loss[i])
             e["loss_n"] += 1
             if targets is not None:
-                e["correct"] = int(targets[i].item() if torch.is_tensor(targets[i]) else targets[i])
+                tgt = targets[i]
+                e["correct"] = int(tgt.item() if torch.is_tensor(tgt) else tgt)
 
     def update_weight(self, ids, weights):
-        """confidence / focal weight"""
         for i, sid in enumerate(ids):
             e = self._ent(str(sid))
             e["fw"] += float(weights[i])
@@ -101,10 +100,8 @@ class SampleContributionTracker:
         all_ids = list(d0["ids"].astype(str))
         id2idx = {sid: i for i, sid in enumerate(all_ids)}
 
-        # utt_id 处理
         utt_id_map = {}
         if egs_file and os.path.exists(egs_file):
-            # ... (同之前逻辑)
             with open(egs_file) as f:
                 first = f.readline()
                 delim = "\t" if "\t" in first else " "
@@ -114,7 +111,7 @@ class SampleContributionTracker:
                     if parts:
                         utt_id_map[str(i)] = parts[0]
 
-        # 收集所有 id（保持出现顺序）
+        # 收集所有id
         for f in files[1:]:
             d = np.load(f, allow_pickle=True)
             for sid in d["ids"].astype(str):
@@ -123,49 +120,57 @@ class SampleContributionTracker:
                     all_ids.append(sid)
 
         n_samples = len(all_ids)
+        n_epochs = len(files)
         print(f"[contrib] 共 {n_samples} 个样本，开始聚合...")
 
-        n_epochs = len(files)
+        # 初始化矩阵
         gn = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
         al = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
         ls = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
         co = np.full((n_samples, n_epochs), -1, dtype=np.int8)
         fw = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
 
-        for ei, f in enumerate(files):
-            d = np.load(f, allow_pickle=True)
+        for ei, fpath in enumerate(files):
+            d = np.load(fpath, allow_pickle=True)
             ids_str = d["ids"].astype(str)
             idxs = np.array([id2idx[s] for s in ids_str], dtype=np.int64)
+
             gn[idxs, ei] = d["grad_norm"]
             al[idxs, ei] = d["align"]
             ls[idxs, ei] = d["loss"]
             co[idxs, ei] = d["correct"]
+            
+            # 安全读取 focal_weight
             if "focal_weight" in d:
                 fw[idxs, ei] = d["focal_weight"]
+            else:
+                print(f"  epoch {ei}: 无 focal_weight 字段，跳过")
 
-        # 计算统计量
+        # 计算统计量（增加安全检查）
         with np.errstate(all="ignore"):
             mean_gn = np.nanmean(gn, axis=1)
-            early_gn = gn[:, 0] if n_epochs > 0 else np.nan
+            early_gn = gn[:, 0] if n_epochs > 0 else np.full(n_samples, np.nan)
             self_inf = np.nansum(gn ** 2, axis=1)
             mean_al = np.nanmean(al, axis=1)
             mean_ls = np.nanmean(ls, axis=1)
-            last_ls = ls[:, -1] if n_epochs > 0 else np.nan
+            last_ls = ls[:, -1] if n_epochs > 0 else np.full(n_samples, np.nan)
+            
             mean_fw = np.nanmean(fw, axis=1)
-            last_fw = fw[:, -1] if n_epochs > 0 else np.nan
+            last_fw = fw[:, -1] if n_epochs > 0 else np.full(n_samples, np.nan)
+
+            # forget events
+            forget = np.zeros(n_samples, dtype=np.int32)
+            if n_epochs > 1:
+                forget = ((co[:, :-1] == 1) & (co[:, 1:] == 0)).sum(axis=1)
+            final_co = co[:, -1] if n_epochs > 0 else co[:, 0]
 
             valid_al = ~np.isnan(al)
             neg_al = (al < 0) & valid_al
             n_val_al = valid_al.sum(axis=1).astype(np.float32)
             frac_neg = np.where(n_val_al > 0, neg_al.sum(axis=1) / n_val_al, np.nan)
 
-            forget = np.zeros(n_samples, dtype=np.int32)
-            if n_epochs > 1:
-                forget = ((co[:, :-1] == 1) & (co[:, 1:] == 0)).sum(axis=1)
-            final_co = co[:, -1] if n_epochs > 0 else co[:, 0]
-
-        # 写 CSV —— **不排序，按 all_ids 原始顺序**
-        print("[contrib] 写 CSV (按原始样本顺序)...")
+        # 写 CSV（按原始顺序）
+        print("[contrib] 写 CSV ...")
         has_utt = bool(utt_id_map)
         fields = ["id", "utt_id", "n_epochs", "mean_grad_norm", "early_grad_norm",
                   "self_influence", "mean_align", "frac_neg_align",
@@ -175,7 +180,7 @@ class SampleContributionTracker:
         with open(out_csv, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(fields)
-            for i in range(n_samples):          # ← 不排序
+            for i in range(n_samples):
                 sid = all_ids[i]
                 w.writerow([
                     sid,
