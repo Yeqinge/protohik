@@ -597,6 +597,34 @@ def html_template(data_file_name: str) -> str:
       border-top: 1px solid var(--line);
       background: #fff;
     }}
+    .sample-pager {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-top: 1px solid var(--line);
+      background: var(--panel-soft);
+      font-size: 12px;
+      color: var(--muted);
+    }}
+    .sample-pager button {{
+      min-height: 30px;
+      padding: 4px 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      cursor: pointer;
+    }}
+    .sample-pager button:disabled {{
+      opacity: 0.45;
+      cursor: default;
+    }}
+    .sample-page-info {{
+      flex: 1;
+      text-align: center;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }}
     .sample-row {{
       display: grid;
       grid-template-columns: 74px minmax(0, 1fr) 128px;
@@ -806,6 +834,38 @@ def html_template(data_file_name: str) -> str:
       color: var(--muted);
       background: var(--panel-soft);
     }}
+    .status-hist {{
+      display: grid;
+      gap: 8px;
+      margin: 12px 0 14px;
+    }}
+    .hist-row {{
+      display: grid;
+      grid-template-columns: 140px minmax(0, 1fr) 72px;
+      gap: 10px;
+      align-items: center;
+      font-size: 12px;
+    }}
+    .hist-label {{
+      color: #334155;
+      font-weight: 800;
+    }}
+    .hist-track {{
+      height: 12px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      overflow: hidden;
+    }}
+    .hist-bar {{
+      height: 100%;
+      border-radius: inherit;
+      background: var(--accent);
+    }}
+    .hist-value {{
+      color: var(--muted);
+      text-align: right;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }}
     .loader {{
       min-height: 100vh;
       display: flex;
@@ -948,7 +1008,7 @@ def html_template(data_file_name: str) -> str:
         </div>
         <div>
           <label for="exportCsvBtn">导出</label>
-          <button class="export-btn" id="exportCsvBtn" type="button">导出当前 CSV</button>
+          <button class="export-btn" id="exportCsvBtn" type="button">导出汇总 XLSX</button>
         </div>
         <div>
           <label for="beforeInput">前面数量</label>
@@ -960,6 +1020,11 @@ def html_template(data_file_name: str) -> str:
         </div>
       </div>
       <div class="sample-list" id="sampleList"></div>
+      <div class="sample-pager">
+        <button id="listPrevBtn" type="button">上一页</button>
+        <span class="sample-page-info" id="listPageInfo">-</span>
+        <button id="listNextBtn" type="button">下一页</button>
+      </div>
     </section>
 
     <div class="right-panel">
@@ -1037,6 +1102,9 @@ def html_template(data_file_name: str) -> str:
     const byId = new Map();
     const groups = new Map();
     const labelColors = ['#c2410c', '#7c3aed', '#be123c', '#0369a1', '#a16207', '#0f766e', '#b45309', '#4338ca'];
+    const LIST_PAGE_SIZE = 200;
+    let listPageStart = 0;
+    let currentFilteredItems = [];
 
     function buildIndexes() {{
       byId.clear();
@@ -1060,6 +1128,9 @@ def html_template(data_file_name: str) -> str:
       afterInput: document.getElementById('afterInput'),
       filterHint: document.getElementById('filterHint'),
       sampleList: document.getElementById('sampleList'),
+      listPrevBtn: document.getElementById('listPrevBtn'),
+      listNextBtn: document.getElementById('listNextBtn'),
+      listPageInfo: document.getElementById('listPageInfo'),
       statusCard: document.getElementById('statusCard'),
       statusTitle: document.getElementById('statusTitle'),
       statusNote: document.getElementById('statusNote'),
@@ -1299,9 +1370,12 @@ def html_template(data_file_name: str) -> str:
 
     function rebuildSelect(keepId) {{
       const filtered = getFilteredRecords();
+      currentFilteredItems = filtered;
       const currentId = keepId || els.sampleSelect.value || (records[0] && records[0].id);
-      const maxOptions = 1500;
-      const visible = filtered.slice(0, maxOptions);
+      if (listPageStart >= filtered.length) {{
+        listPageStart = Math.max(0, Math.floor((filtered.length - 1) / LIST_PAGE_SIZE) * LIST_PAGE_SIZE);
+      }}
+      const visible = filtered.slice(listPageStart, listPageStart + LIST_PAGE_SIZE);
       els.sampleSelect.innerHTML = visible.map(item => {{
         const rec = item.rec;
         const label = `${{rec.id}} | label=${{valueText(rec.label)}} | segment=${{rec.segment}}`;
@@ -1317,8 +1391,14 @@ def html_template(data_file_name: str) -> str:
         els.sampleSelect.value = '';
       }}
 
-      els.filterHint.textContent = `匹配 ${{filtered.length}} 条；列表最多显示 ${{Math.min(filtered.length, maxOptions)}} 条。`;
+      const page = filtered.length ? Math.floor(listPageStart / LIST_PAGE_SIZE) + 1 : 0;
+      const pages = Math.max(1, Math.ceil(filtered.length / LIST_PAGE_SIZE));
+      els.filterHint.textContent = `匹配 ${{filtered.length}} 条；当前页 ${{visible.length}} 条。`;
+      els.listPageInfo.textContent = `${{page}} / ${{pages}} · ${{filtered.length.toLocaleString()}}`;
+      els.listPrevBtn.disabled = listPageStart <= 0;
+      els.listNextBtn.disabled = listPageStart + LIST_PAGE_SIZE >= filtered.length;
       renderSampleList(visible);
+      renderParseNotes();
     }}
 
     function renderSampleList(visible) {{
@@ -1346,75 +1426,253 @@ def html_template(data_file_name: str) -> str:
       return parts[parts.length - 1] || 'UNKNOWN';
     }}
 
-    function csvCell(value) {{
-      const text = valueText(value).replace(/"/g, '""');
-      return `"${{text}}"`;
+    function xmlEscape(value) {{
+      return valueText(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+    }}
+
+    function columnName(index) {{
+      let name = '';
+      let n = index + 1;
+      while (n > 0) {{
+        const rem = (n - 1) % 26;
+        name = String.fromCharCode(65 + rem) + name;
+        n = Math.floor((n - 1) / 26);
+      }}
+      return name;
+    }}
+
+    function worksheetXml(rows) {{
+      const body = rows.map((row, rIdx) => {{
+        const rowNum = rIdx + 1;
+        const cells = row.map((cell, cIdx) => {{
+          const ref = columnName(cIdx) + rowNum;
+          return '<c r="' + ref + '" t="inlineStr"><is><t>' + xmlEscape(cell) + '</t></is></c>';
+        }}).join('');
+        return '<row r="' + rowNum + '">' + cells + '</row>';
+      }}).join('');
+      return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+        '<sheetData>' + body + '</sheetData></worksheet>';
+    }}
+
+    function makeCrcTable() {{
+      const table = new Uint32Array(256);
+      for (let i = 0; i < 256; i += 1) {{
+        let c = i;
+        for (let k = 0; k < 8; k += 1) {{
+          c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        }}
+        table[i] = c >>> 0;
+      }}
+      return table;
+    }}
+
+    const CRC_TABLE = makeCrcTable();
+
+    function crc32(bytes) {{
+      let c = 0xffffffff;
+      for (let i = 0; i < bytes.length; i += 1) {{
+        c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+      }}
+      return (c ^ 0xffffffff) >>> 0;
+    }}
+
+    function pushU16(arr, value) {{
+      arr.push(value & 255, (value >>> 8) & 255);
+    }}
+
+    function pushU32(arr, value) {{
+      arr.push(value & 255, (value >>> 8) & 255, (value >>> 16) & 255, (value >>> 24) & 255);
+    }}
+
+    function concatUint8(parts) {{
+      const total = parts.reduce((sum, part) => sum + part.length, 0);
+      const out = new Uint8Array(total);
+      let offset = 0;
+      for (const part of parts) {{
+        out.set(part, offset);
+        offset += part.length;
+      }}
+      return out;
+    }}
+
+    function bytesFromString(text) {{
+      return new TextEncoder().encode(text);
+    }}
+
+    function zipStore(files) {{
+      const localParts = [];
+      const centralParts = [];
+      let offset = 0;
+      for (const file of files) {{
+        const nameBytes = bytesFromString(file.name);
+        const data = file.data;
+        const crc = crc32(data);
+
+        const local = [];
+        pushU32(local, 0x04034b50);
+        pushU16(local, 20);
+        pushU16(local, 0);
+        pushU16(local, 0);
+        pushU16(local, 0);
+        pushU16(local, 0);
+        pushU32(local, crc);
+        pushU32(local, data.length);
+        pushU32(local, data.length);
+        pushU16(local, nameBytes.length);
+        pushU16(local, 0);
+        const localBytes = concatUint8([new Uint8Array(local), nameBytes, data]);
+        localParts.push(localBytes);
+
+        const central = [];
+        pushU32(central, 0x02014b50);
+        pushU16(central, 20);
+        pushU16(central, 20);
+        pushU16(central, 0);
+        pushU16(central, 0);
+        pushU16(central, 0);
+        pushU16(central, 0);
+        pushU32(central, crc);
+        pushU32(central, data.length);
+        pushU32(central, data.length);
+        pushU16(central, nameBytes.length);
+        pushU16(central, 0);
+        pushU16(central, 0);
+        pushU16(central, 0);
+        pushU16(central, 0);
+        pushU32(central, 0);
+        pushU32(central, offset);
+        centralParts.push(concatUint8([new Uint8Array(central), nameBytes]));
+
+        offset += localBytes.length;
+      }}
+
+      const centralDir = concatUint8(centralParts);
+      const eocd = [];
+      pushU32(eocd, 0x06054b50);
+      pushU16(eocd, 0);
+      pushU16(eocd, 0);
+      pushU16(eocd, files.length);
+      pushU16(eocd, files.length);
+      pushU32(eocd, centralDir.length);
+      pushU32(eocd, offset);
+      pushU16(eocd, 0);
+      return concatUint8([...localParts, centralDir, new Uint8Array(eocd)]);
+    }}
+
+    function safeSheetName(name, fallback) {{
+      const cleaned = valueText(name).replace(/[\\\\/\\?\\*\\[\\]:]/g, ' ').trim() || fallback;
+      return cleaned.slice(0, 31);
+    }}
+
+    function buildWorkbookBlob(sheets) {{
+      const files = [];
+      const workbookSheets = sheets.map((sheet, idx) =>
+        '<sheet name="' + xmlEscape(safeSheetName(sheet.name, 'Sheet' + (idx + 1))) +
+        '" sheetId="' + (idx + 1) + '" r:id="rId' + (idx + 1) + '"/>'
+      ).join('');
+      const workbookRels = sheets.map((_, idx) =>
+        '<Relationship Id="rId' + (idx + 1) +
+        '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' +
+        (idx + 1) + '.xml"/>'
+      ).join('');
+      const overrides = sheets.map((_, idx) =>
+        '<Override PartName="/xl/worksheets/sheet' + (idx + 1) +
+        '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+      ).join('');
+
+      files.push({{ name: '[Content_Types].xml', data: bytesFromString(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>' +
+        '<Default Extension="xml" ContentType="application/xml"/>' +
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+        overrides + '</Types>'
+      ) }});
+      files.push({{ name: '_rels/.rels', data: bytesFromString(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>' +
+        '</Relationships>'
+      ) }});
+      files.push({{ name: 'xl/workbook.xml', data: bytesFromString(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+        '<sheets>' + workbookSheets + '</sheets></workbook>'
+      ) }});
+      files.push({{ name: 'xl/_rels/workbook.xml.rels', data: bytesFromString(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+        workbookRels + '</Relationships>'
+      ) }});
+      sheets.forEach((sheet, idx) => {{
+        files.push({{ name: 'xl/worksheets/sheet' + (idx + 1) + '.xml', data: bytesFromString(worksheetXml(sheet.rows)) }});
+      }});
+      return new Blob([zipStore(files)], {{ type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }});
     }}
 
     function exportCurrentCsv() {{
       const {{ before, after }} = currentWindowParams();
       const items = getFilteredRecords();
-      const rows = [[
-        'ID',
-        'group_key',
-        'segment',
-        'label',
-        'status',
-        'severity',
-        'weighted_inconsistency',
-        'weighted_mismatch_sum',
-        'observed_weight_sum',
-        'missing_count',
-        'mismatch_count',
-        'missing_weight_ratio',
-        'before',
-        'after',
-        'duration',
-        'sample_rate',
-        'detector_id',
-        'unit_id',
-        'channel_id',
-        'time_point',
-        'project',
-        'file_path',
-      ]];
-
+      const headers = [
+        'ID', 'group_key', 'segment', 'label', 'status', 'severity',
+        'weighted_inconsistency', 'weighted_mismatch_sum', 'observed_weight_sum',
+        'missing_count', 'mismatch_count', 'missing_weight_ratio',
+        'before', 'after', 'duration', 'sample_rate', 'detector_id', 'unit_id',
+        'channel_id', 'time_point', 'project', 'file_path'
+      ];
+      const statusOrder = [
+        ['unparseable', '无法识别编号'],
+        ['mismatch_missing', '不一致且缺失'],
+        ['mismatch', '有不一致'],
+        ['same_missing', '一致但缺失'],
+        ['all_present_same', '全部一致'],
+      ];
+      const grouped = new Map(statusOrder.map(([key, name]) => [key, {{ name, rows: [headers] }}]));
       for (const item of items) {{
         const rec = item.rec;
         const status = item.status;
-        rows.push([
-          rec.id,
-          rec.groupKey,
-          displaySegment(rec),
-          rec.label,
-          status.text,
-          status.severity,
-          status.weightedScore.toFixed(6),
-          status.mismatchWeight.toFixed(6),
-          status.observedWeight.toFixed(6),
-          status.missing,
-          status.mismatch,
-          status.missingWeightRatio.toFixed(6),
-          before,
-          after,
-          rec.duration,
-          rec.sampleRate,
-          rec.detectorId,
-          rec.unitId,
-          rec.channelId,
-          rec.timePoint,
-          rec.project,
-          rec.filePath,
-        ]);
+        const row = [
+          rec.id, rec.groupKey, displaySegment(rec), rec.label, status.text, status.severity,
+          status.weightedScore.toFixed(6), status.mismatchWeight.toFixed(6), status.observedWeight.toFixed(6),
+          status.missing, status.mismatch, status.missingWeightRatio.toFixed(6),
+          before, after, rec.duration, rec.sampleRate, rec.detectorId, rec.unitId,
+          rec.channelId, rec.timePoint, rec.project, rec.filePath
+        ];
+        if (!grouped.has(status.key)) grouped.set(status.key, {{ name: status.text, rows: [headers] }});
+        grouped.get(status.key).rows.push(row);
       }}
 
-      const csv = rows.map(row => row.map(csvCell).join(',')).join('\\n');
-      const blob = new Blob(['\\ufeff' + csv], {{ type: 'text/csv;charset=utf-8' }});
+      const summaryRows = [['status', 'count']];
+      for (const [key, name] of statusOrder) {{
+        const entry = grouped.get(key);
+        summaryRows.push([name, Math.max(0, (entry ? entry.rows.length : 1) - 1)]);
+      }}
+      summaryRows.push(['导出总数', items.length]);
+      summaryRows.push(['before', before]);
+      summaryRows.push(['after', after]);
+      summaryRows.push(['搜索关键词', els.idSearch.value.trim()]);
+      summaryRows.push(['状态筛选', els.statusFilter.value]);
+      summaryRows.push(['排序方式', els.sortMode.value]);
+
+      const sheets = [{{ name: '汇总', rows: summaryRows }}];
+      for (const [key] of statusOrder) {{
+        const entry = grouped.get(key);
+        if (entry && entry.rows.length > 1) sheets.push({{ name: entry.name, rows: entry.rows }});
+      }}
+
+      const blob = buildWorkbookBlob(sheets);
       const url = URL.createObjectURL(blob);
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
       const a = document.createElement('a');
       a.href = url;
-      a.download = `sample_context_${{stamp}}.csv`;
+      a.download = `sample_context_${{stamp}}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -1606,6 +1864,29 @@ def html_template(data_file_name: str) -> str:
     }}
 
     function renderParseNotes() {{
+      const {{ before, after }} = currentWindowParams();
+      const statusDefs = [
+        ['unparseable', '无法识别编号', '#991b1b'],
+        ['mismatch_missing', '不一致且缺失', '#dc2626'],
+        ['mismatch', '有不一致', '#ef4444'],
+        ['same_missing', '一致但缺失', '#d97706'],
+        ['all_present_same', '全部一致', '#15803d'],
+      ];
+      const statusCounts = Object.fromEntries(statusDefs.map(([key]) => [key, 0]));
+      for (const rec of records) {{
+        const st = classifyRecord(rec, before, after);
+        statusCounts[st.key] = (statusCounts[st.key] || 0) + 1;
+      }}
+      const maxCount = Math.max(1, ...Object.values(statusCounts));
+      const histHtml = statusDefs.map(([key, label, color]) => {{
+        const count = statusCounts[key] || 0;
+        const width = Math.max(2, count / maxCount * 100);
+        return `<div class="hist-row">
+          <div class="hist-label">${{escapeHtml(label)}}</div>
+          <div class="hist-track"><div class="hist-bar" style="width:${{width}}%;background:${{color}}"></div></div>
+          <div class="hist-value">${{count.toLocaleString()}}</div>
+        </div>`;
+      }}).join('');
       const largest = (meta.largestGroups || [])
         .map(([key, size]) => `<span class="chip"><span class="mono">${{escapeHtml(key)}}</span>: ${{size}}</span>`)
         .join('');
@@ -1614,6 +1895,8 @@ def html_template(data_file_name: str) -> str:
         .join('');
 
       els.parseNotes.innerHTML = `
+        <h3>状态分类样本数</h3>
+        <div class="status-hist">${{histHtml}}</div>
         <div class="chip-row">
           <span class="chip">全局 label 分布: ${{escapeHtml(formatCounts(meta.labelCounts))}}</span>
           <span class="chip">重复 group+segment: ${{meta.duplicateSegmentCount}}</span>
@@ -1794,6 +2077,7 @@ def html_template(data_file_name: str) -> str:
     }}
 
     els.idSearch.addEventListener('input', () => {{
+      listPageStart = 0;
       const keep = els.sampleSelect.value;
       rebuildSelect(keep);
       renderAll();
@@ -1810,19 +2094,33 @@ def html_template(data_file_name: str) -> str:
       renderAll();
     }});
     els.statusFilter.addEventListener('change', () => {{
+      listPageStart = 0;
       rebuildSelect(els.sampleSelect.value);
       renderAll();
     }});
     els.sortMode.addEventListener('change', () => {{
+      listPageStart = 0;
       rebuildSelect(els.sampleSelect.value);
       renderAll();
     }});
     els.exportCsvBtn.addEventListener('click', exportCurrentCsv);
+    els.listPrevBtn.addEventListener('click', () => {{
+      listPageStart = Math.max(0, listPageStart - LIST_PAGE_SIZE);
+      rebuildSelect('');
+      renderAll();
+    }});
+    els.listNextBtn.addEventListener('click', () => {{
+      listPageStart += LIST_PAGE_SIZE;
+      rebuildSelect('');
+      renderAll();
+    }});
     els.beforeInput.addEventListener('input', () => {{
+      listPageStart = 0;
       rebuildSelect(els.sampleSelect.value);
       renderAll();
     }});
     els.afterInput.addEventListener('input', () => {{
+      listPageStart = 0;
       rebuildSelect(els.sampleSelect.value);
       renderAll();
     }});
