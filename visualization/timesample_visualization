@@ -1,0 +1,1065 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Generate an interactive HTML report for checking labels around every audio
+segment in a labeling JSON file.
+
+The report lets you search/select any sample ID in the browser. Samples are
+grouped into one long sample by treating the ID prefix ending with the final
+underscore as the long-sample ID, so fields after channel/time such as 250M,
+16KHz and 512 must also match.
+
+Input JSON can be either:
+    {"datas": [ ... ]}
+or:
+    [ ... ]
+
+Example:
+    python sample_context_visualizer.py ^
+        --json data.json ^
+        --before 5 ^
+        --after 5 ^
+        --output sample_context_report.html
+
+No third-party Python packages are required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import sys
+import webbrowser
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+Record = Dict[str, Any]
+
+KNOWN_AUDIO_EXTENSIONS_RE = re.compile(r"\.(wav|mp3|flac|m4a|ogg|aac)$", re.IGNORECASE)
+SEGMENT_SUFFIX_RE = re.compile(r"^(?P<long_id>.+_)(?P<segment>\d+)$")
+
+
+def load_records(json_path: Path) -> List[Record]:
+    with json_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if isinstance(payload, dict):
+        records = payload.get("datas")
+        if records is None:
+            raise ValueError("JSON top-level object does not contain a `datas` field.")
+    else:
+        records = payload
+
+    if not isinstance(records, list):
+        raise ValueError("JSON data must be a list or an object with a list field named `datas`.")
+
+    normalized: List[Record] = []
+    for index, item in enumerate(records):
+        if not isinstance(item, dict):
+            raise ValueError(f"Record #{index} is not an object.")
+        normalized.append(item)
+    return normalized
+
+
+def strip_audio_extension(value: str) -> str:
+    return KNOWN_AUDIO_EXTENSIONS_RE.sub("", value)
+
+
+def get_record_id(record: Record) -> str:
+    value = record.get("ID") or record.get("id") or record.get("file_name") or record.get("filename")
+    if value:
+        return str(value)
+
+    file_path = record.get("file_path")
+    if file_path:
+        return os.path.basename(str(file_path))
+
+    raise ValueError(f"Record is missing ID/file_path: {record!r}")
+
+
+def parse_id(record_id: str) -> Tuple[str, int, int]:
+    """
+    Return (long_sample_id, segment_number, segment_width).
+
+    Example:
+        D0003_U0046_C03_..._512_215.wav
+    becomes:
+        ("D0003_U0046_C03_..._512_", 215, 3)
+    """
+    basename = os.path.basename(record_id)
+    stem = strip_audio_extension(basename)
+    match = SEGMENT_SUFFIX_RE.match(stem)
+    if not match:
+        raise ValueError(f"Cannot parse trailing segment number from ID: {record_id}")
+    segment_text = match.group("segment")
+    return match.group("long_id"), int(segment_text), len(segment_text)
+
+
+def parse_segment_id(raw_value: Any, fallback: int) -> int:
+    if raw_value is None or raw_value == "":
+        return fallback
+    try:
+        return int(str(raw_value))
+    except ValueError:
+        return fallback
+
+
+def flatten_dict(value: Any, prefix: str = "") -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {prefix: value}
+
+    result: Dict[str, Any] = {}
+    for key in sorted(value.keys()):
+        child_key = f"{prefix}.{key}" if prefix else str(key)
+        child = value[key]
+        if isinstance(child, dict):
+            result.update(flatten_dict(child, child_key))
+        else:
+            result[child_key] = child
+    return result
+
+
+def safe_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): safe_value(child) for key, child in value.items()}
+    return str(value)
+
+
+def make_browser_record(record: Record, index: int) -> Record:
+    rid = get_record_id(record)
+    group_key, parsed_segment, segment_width = parse_id(rid)
+    segment = parse_segment_id(record.get("segment_id"), parsed_segment)
+
+    flattened = flatten_dict(record)
+    return {
+        "index": index,
+        "id": rid,
+        "idBase": os.path.basename(rid),
+        "groupKey": group_key,
+        "segment": segment,
+        "parsedSegment": parsed_segment,
+        "segmentWidth": segment_width,
+        "label": safe_value(record.get("label", "")),
+        "duration": safe_value(record.get("duration", "")),
+        "sampleRate": safe_value(record.get("sample_rate", "")),
+        "filePath": safe_value(record.get("file_path", "")),
+        "detectorId": safe_value(record.get("detector_id", "")),
+        "unitId": safe_value(record.get("unit_id", "")),
+        "channelId": safe_value(record.get("channel_id", "")),
+        "timePoint": safe_value(record.get("time_point", "")),
+        "project": safe_value(record.get("project", "")),
+        "md5": safe_value(flattened.get("other_information.md5", "")),
+        "usedOrNot": safe_value(flattened.get("other_information.tags.used_or_not", "")),
+        "trainOrTest": safe_value(flattened.get("other_information.tags.train_or_test", "")),
+        "manualOrPseudo": safe_value(flattened.get("other_information.tags.manual_or_pseudo", "")),
+        "flat": safe_value(flattened),
+        "raw": safe_value(record),
+    }
+
+
+def summarize_groups(records: Iterable[Record]) -> Tuple[Dict[str, Counter], int]:
+    seen: Dict[Tuple[str, int], str] = {}
+    duplicate_count = 0
+    group_labels: Dict[str, Counter] = defaultdict(Counter)
+
+    for item in records:
+        group_key = str(item["groupKey"])
+        segment = int(item["segment"])
+        key = (group_key, segment)
+        if key in seen:
+            duplicate_count += 1
+        seen[key] = str(item["id"])
+        group_labels[group_key][str(item.get("label", ""))] += 1
+
+    return group_labels, duplicate_count
+
+
+def build_report_payload(records: List[Record], json_path: Path, before: int, after: int) -> Dict[str, Any]:
+    browser_records: List[Record] = []
+    parse_errors: List[str] = []
+
+    for index, record in enumerate(records):
+        try:
+            browser_records.append(make_browser_record(record, index))
+        except Exception as exc:
+            parse_errors.append(f"#{index}: {exc}")
+
+    if not browser_records:
+        raise ValueError("No parseable records were found.")
+
+    group_labels, duplicate_count = summarize_groups(browser_records)
+    label_counts = Counter(str(item.get("label", "")) for item in browser_records)
+    group_sizes = Counter(str(item["groupKey"]) for item in browser_records)
+
+    return {
+        "meta": {
+            "sourceJson": str(json_path),
+            "generatedAt": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "defaultBefore": before,
+            "defaultAfter": after,
+            "recordCount": len(browser_records),
+            "skippedCount": len(parse_errors),
+            "groupCount": len(group_sizes),
+            "duplicateSegmentCount": duplicate_count,
+            "labelCounts": dict(sorted(label_counts.items())),
+            "largestGroups": group_sizes.most_common(10),
+            "parseErrors": parse_errors[:200],
+        },
+        "records": sorted(browser_records, key=lambda item: (str(item["groupKey"]), int(item["segment"]), str(item["id"]))),
+        "groups": {
+            key: {
+                "labelCounts": dict(sorted(counter.items())),
+                "size": sum(counter.values()),
+            }
+            for key, counter in sorted(group_labels.items())
+        },
+    }
+
+
+def html_template(payload_json: str) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>全量样本前后片段 Label 一致性检查</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --panel-soft: #f8fafc;
+      --text: #111827;
+      --muted: #64748b;
+      --line: #d7dee8;
+      --same: #15803d;
+      --same-soft: #dcfce7;
+      --diff: #dc2626;
+      --diff-soft: #fee2e2;
+      --missing: #6b7280;
+      --missing-soft: #e5e7eb;
+      --accent: #2563eb;
+      --accent-soft: #dbeafe;
+      --warn: #d97706;
+      --warn-soft: #fef3c7;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      line-height: 1.5;
+    }}
+    .page {{
+      max-width: 1500px;
+      margin: 0 auto;
+      padding: 24px;
+    }}
+    header {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 16px;
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 27px;
+      line-height: 1.25;
+      letter-spacing: 0;
+    }}
+    h2 {{
+      margin: 0 0 12px;
+      font-size: 18px;
+      line-height: 1.3;
+      letter-spacing: 0;
+    }}
+    h3 {{
+      margin: 0 0 8px;
+      font-size: 15px;
+      line-height: 1.3;
+      letter-spacing: 0;
+    }}
+    .meta {{
+      color: var(--muted);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }}
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 16px;
+    }}
+    .metric, section {{
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+    }}
+    .metric {{
+      min-height: 84px;
+      padding: 12px 14px;
+    }}
+    .metric-label {{
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 5px;
+    }}
+    .metric-value {{
+      font-size: 21px;
+      font-weight: 750;
+      overflow-wrap: anywhere;
+    }}
+    section {{
+      margin-top: 14px;
+      padding: 16px;
+    }}
+    .controls {{
+      display: grid;
+      grid-template-columns: minmax(260px, 2.2fr) minmax(220px, 1fr) repeat(2, minmax(100px, 0.45fr));
+      gap: 12px;
+      align-items: end;
+    }}
+    label {{
+      display: block;
+      color: #334155;
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }}
+    input, select {{
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid #cbd5e1;
+      border-radius: 7px;
+      background: #fff;
+      color: var(--text);
+      padding: 7px 10px;
+      font: inherit;
+      font-size: 13px;
+    }}
+    input:focus, select:focus {{
+      outline: 3px solid var(--accent-soft);
+      border-color: var(--accent);
+    }}
+    .hint {{
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .status-card {{
+      min-width: 280px;
+      padding: 13px 15px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }}
+    .status-card.ok {{ border-left: 6px solid var(--same); }}
+    .status-card.warn {{ border-left: 6px solid var(--warn); }}
+    .status-card.bad {{ border-left: 6px solid var(--diff); }}
+    .status-title {{
+      font-size: 16px;
+      font-weight: 800;
+    }}
+    .status-note {{
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .two-col {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 14px;
+    }}
+    .kv-table th {{
+      width: 210px;
+      color: #475569;
+      background: var(--panel-soft);
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+    }}
+    th, td {{
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      vertical-align: top;
+      text-align: left;
+      font-size: 13px;
+    }}
+    thead th {{
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: #eef2f7;
+      color: #334155;
+      font-weight: 800;
+      white-space: nowrap;
+    }}
+    tbody tr:hover {{ background: #f8fafc; }}
+    .table-wrap {{
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }}
+    .table-wrap table th,
+    .table-wrap table td {{
+      white-space: nowrap;
+    }}
+    .table-wrap .wide {{
+      white-space: normal;
+      min-width: 260px;
+      overflow-wrap: anywhere;
+    }}
+    .timeline {{
+      display: flex;
+      width: 100%;
+      min-height: 112px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--missing-soft);
+    }}
+    .bar-item {{
+      position: relative;
+      min-width: 60px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      padding: 10px 6px;
+      border-right: 1px solid rgba(255,255,255,0.6);
+      text-align: center;
+    }}
+    .bar-item:last-child {{ border-right: 0; }}
+    .bar-item.target {{
+      outline: 4px solid #111827;
+      outline-offset: -4px;
+      z-index: 1;
+    }}
+    .bar-seg {{
+      font-weight: 850;
+      font-size: 18px;
+    }}
+    .bar-label, .bar-offset {{
+      font-size: 12px;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+    }}
+    .legend, .chip-row {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 12px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .legend-item {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }}
+    .swatch {{
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      border: 1px solid rgba(0,0,0,0.14);
+    }}
+    .pill, .chip {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 750;
+      white-space: nowrap;
+    }}
+    .pill.same {{ background: var(--same-soft); color: #166534; }}
+    .pill.different {{ background: var(--diff-soft); color: #991b1b; }}
+    .pill.missing {{ background: var(--missing-soft); color: #374151; }}
+    .pill.warn {{ background: var(--warn-soft); color: #92400e; }}
+    .chip {{ border: 1px solid var(--line); background: var(--panel-soft); color: #334155; }}
+    .mono {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      overflow-wrap: anywhere;
+    }}
+    .muted {{ color: var(--muted); }}
+    .same-row {{ background: #f0fdf4; }}
+    .different-row {{ background: #fff1f2; }}
+    .missing-row {{ background: #f3f4f6; color: #4b5563; }}
+    details {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 10px;
+      overflow: hidden;
+      background: #fff;
+    }}
+    details.same {{ border-left: 6px solid var(--same); }}
+    details.different {{ border-left: 6px solid var(--diff); }}
+    details summary {{
+      cursor: pointer;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 13px;
+      font-weight: 800;
+      background: var(--panel-soft);
+    }}
+    pre {{
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }}
+    .empty {{
+      padding: 18px;
+      border: 1px dashed #cbd5e1;
+      border-radius: 8px;
+      color: var(--muted);
+      background: var(--panel-soft);
+    }}
+    @media (max-width: 1120px) {{
+      .summary {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+      .controls {{ grid-template-columns: 1fr 1fr; }}
+      .two-col {{ grid-template-columns: 1fr; }}
+      header {{ flex-direction: column; }}
+      .status-card {{ width: 100%; }}
+    }}
+    @media (max-width: 700px) {{
+      .page {{ padding: 16px 12px 32px; }}
+      .summary {{ grid-template-columns: 1fr 1fr; }}
+      .controls {{ grid-template-columns: 1fr; }}
+      .timeline {{ overflow-x: auto; }}
+      .bar-item {{ min-width: 76px; }}
+      h1 {{ font-size: 22px; }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <div>
+        <h1>全量样本前后片段 Label 一致性检查</h1>
+        <div class="meta" id="reportMeta"></div>
+      </div>
+      <div class="status-card" id="statusCard">
+        <div class="status-title" id="statusTitle">等待选择样本</div>
+        <div class="status-note" id="statusNote">从下方列表或搜索框选择任意 ID。</div>
+      </div>
+    </header>
+
+    <div class="summary" id="summary"></div>
+
+    <section>
+      <h2>选择样本</h2>
+      <div class="controls">
+        <div>
+          <label for="idSearch">搜索 ID / label / 大样本前缀</label>
+          <input id="idSearch" type="search" placeholder="输入关键字过滤样本">
+          <div class="hint" id="filterHint"></div>
+        </div>
+        <div>
+          <label for="sampleSelect">样本 ID</label>
+          <select id="sampleSelect"></select>
+          <div class="hint">同一大样本 = 小样本编号前、并保留末尾下划线的大样本 ID 必须相同。</div>
+        </div>
+        <div>
+          <label for="beforeInput">前面数量</label>
+          <input id="beforeInput" type="number" min="0" step="1">
+        </div>
+        <div>
+          <label for="afterInput">后面数量</label>
+          <input id="afterInput" type="number" min="0" step="1">
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>目标样本与大样本信息</h2>
+      <div class="two-col">
+        <div>
+          <h3>目标样本</h3>
+          <table class="kv-table"><tbody id="targetTable"></tbody></table>
+        </div>
+        <div>
+          <h3>大样本分组</h3>
+          <table class="kv-table"><tbody id="groupTable"></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>可视化时间线</h2>
+      <div class="timeline" id="timeline"></div>
+      <div class="legend">
+        <span class="legend-item"><span class="swatch" style="background:#15803d"></span>与目标 label 一致</span>
+        <span class="legend-item"><span class="swatch" style="background:#dc2626"></span>与目标 label 不一致</span>
+        <span class="legend-item"><span class="swatch" style="background:#e5e7eb"></span>JSON 中缺失</span>
+        <span class="legend-item">黑色描边为目标样本</span>
+      </div>
+      <div class="chip-row" id="windowChips"></div>
+    </section>
+
+    <section>
+      <h2>前后样本列表</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>相对位置</th>
+              <th>segment</th>
+              <th>label</th>
+              <th>检查</th>
+              <th>ID</th>
+              <th>duration</th>
+              <th>sample_rate</th>
+              <th>detector_id</th>
+              <th>channel_id</th>
+              <th>time_point</th>
+              <th>file_path</th>
+            </tr>
+          </thead>
+          <tbody id="windowRows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>完整字段详情</h2>
+      <div id="detailList"></div>
+    </section>
+
+    <section>
+      <h2>解析提示</h2>
+      <div id="parseNotes"></div>
+    </section>
+  </main>
+
+  <script id="payload" type="application/json">{payload_json}</script>
+  <script>
+    const payload = JSON.parse(document.getElementById('payload').textContent);
+    const records = payload.records;
+    const meta = payload.meta;
+    const groupMeta = payload.groups;
+
+    const byId = new Map();
+    const groups = new Map();
+    const labelColors = ['#c2410c', '#7c3aed', '#be123c', '#0369a1', '#a16207', '#0f766e', '#b45309', '#4338ca'];
+
+    for (const rec of records) {{
+      byId.set(rec.id, rec);
+      if (!groups.has(rec.groupKey)) groups.set(rec.groupKey, new Map());
+      groups.get(rec.groupKey).set(Number(rec.segment), rec);
+    }}
+
+    const els = {{
+      reportMeta: document.getElementById('reportMeta'),
+      summary: document.getElementById('summary'),
+      idSearch: document.getElementById('idSearch'),
+      sampleSelect: document.getElementById('sampleSelect'),
+      beforeInput: document.getElementById('beforeInput'),
+      afterInput: document.getElementById('afterInput'),
+      filterHint: document.getElementById('filterHint'),
+      statusCard: document.getElementById('statusCard'),
+      statusTitle: document.getElementById('statusTitle'),
+      statusNote: document.getElementById('statusNote'),
+      targetTable: document.getElementById('targetTable'),
+      groupTable: document.getElementById('groupTable'),
+      timeline: document.getElementById('timeline'),
+      windowChips: document.getElementById('windowChips'),
+      windowRows: document.getElementById('windowRows'),
+      detailList: document.getElementById('detailList'),
+      parseNotes: document.getElementById('parseNotes'),
+    }};
+
+    function escapeHtml(value) {{
+      if (value === null || value === undefined) return '';
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }}
+
+    function valueText(value) {{
+      if (value === null || value === undefined) return '';
+      if (typeof value === 'object') return JSON.stringify(value, null, 2);
+      return String(value);
+    }}
+
+    function pill(text, cls) {{
+      return `<span class="pill ${{cls}}">${{escapeHtml(text)}}</span>`;
+    }}
+
+    function metric(label, value) {{
+      return `<div class="metric"><div class="metric-label">${{escapeHtml(label)}}</div><div class="metric-value">${{escapeHtml(value)}}</div></div>`;
+    }}
+
+    function kvRows(items) {{
+      return items.map(([key, value]) => (
+        `<tr><th>${{escapeHtml(key)}}</th><td>${{escapeHtml(valueText(value))}}</td></tr>`
+      )).join('');
+    }}
+
+    function formatCounts(counts) {{
+      const entries = Object.entries(counts || {{}});
+      if (!entries.length) return '无';
+      return entries.map(([key, value]) => `${{escapeHtml(key)}}: ${{value}}`).join('，');
+    }}
+
+    function numberInputValue(input, fallback) {{
+      const value = Number.parseInt(input.value, 10);
+      return Number.isFinite(value) && value >= 0 ? value : fallback;
+    }}
+
+    function getFilteredRecords() {{
+      const query = els.idSearch.value.trim().toLowerCase();
+      if (!query) return records;
+      return records.filter(rec => {{
+        const fields = [
+          rec.id,
+          rec.idBase,
+          rec.groupKey,
+          rec.label,
+          rec.filePath,
+          rec.detectorId,
+          rec.channelId,
+          rec.timePoint,
+          rec.project,
+        ];
+        return fields.some(value => valueText(value).toLowerCase().includes(query));
+      }});
+    }}
+
+    function rebuildSelect(keepId) {{
+      const filtered = getFilteredRecords();
+      const currentId = keepId || els.sampleSelect.value || (records[0] && records[0].id);
+      const maxOptions = 1500;
+      const visible = filtered.slice(0, maxOptions);
+      els.sampleSelect.innerHTML = visible.map(rec => {{
+        const label = `${{rec.id}} | label=${{valueText(rec.label)}} | segment=${{rec.segment}}`;
+        return `<option value="${{escapeHtml(rec.id)}}">${{escapeHtml(label)}}</option>`;
+      }}).join('');
+
+      const selectedExists = visible.some(rec => rec.id === currentId);
+      if (selectedExists) {{
+        els.sampleSelect.value = currentId;
+      }} else if (visible.length) {{
+        els.sampleSelect.value = visible[0].id;
+      }}
+
+      els.filterHint.textContent = `匹配 ${{filtered.length}} 条；下拉最多显示 ${{Math.min(filtered.length, maxOptions)}} 条。`;
+    }}
+
+    function selectedRecord() {{
+      return byId.get(els.sampleSelect.value) || records[0];
+    }}
+
+    function statusClass(label, targetLabel) {{
+      return valueText(label) === valueText(targetLabel) ? 'same' : 'different';
+    }}
+
+    function makeWindow(target, before, after) {{
+      const group = groups.get(target.groupKey) || new Map();
+      const rows = [];
+      for (let segment = Number(target.segment) - before; segment <= Number(target.segment) + after; segment += 1) {{
+        rows.push({{
+          segment,
+          offset: segment - Number(target.segment),
+          record: group.get(segment) || null,
+        }});
+      }}
+      return rows;
+    }}
+
+    function renderSummary() {{
+      els.reportMeta.innerHTML = [
+        `JSON: ${{escapeHtml(meta.sourceJson)}}`,
+        `生成时间: ${{escapeHtml(meta.generatedAt)}}`,
+      ].join('<br>');
+
+      els.summary.innerHTML = [
+        metric('可解析小样本数', meta.recordCount),
+        metric('大样本分组数', meta.groupCount),
+        metric('全局 label 种类', Object.keys(meta.labelCounts || {{}}).length),
+        metric('重复 segment', meta.duplicateSegmentCount),
+        metric('跳过记录', meta.skippedCount),
+        metric('默认窗口', `-${{meta.defaultBefore}} / +${{meta.defaultAfter}}`),
+      ].join('');
+    }}
+
+    function renderStatus(target, rows) {{
+      const existing = rows.filter(item => item.record);
+      const missing = rows.filter(item => !item.record);
+      const mismatch = existing.filter(item => valueText(item.record.label) !== valueText(target.label));
+      const allExistingSame = mismatch.length === 0;
+      const allPresentAndSame = missing.length === 0 && allExistingSame;
+
+      els.statusCard.classList.remove('ok', 'warn', 'bad');
+      if (allPresentAndSame) {{
+        els.statusCard.classList.add('ok');
+        els.statusTitle.textContent = '全部一致';
+      }} else if (allExistingSame) {{
+        els.statusCard.classList.add('warn');
+        els.statusTitle.textContent = '已存在片段一致，但有缺失';
+      }} else {{
+        els.statusCard.classList.add('bad');
+        els.statusTitle.textContent = '发现 label 不一致';
+      }}
+      els.statusNote.innerHTML = `目标 label: ${{pill(target.label, 'same')}}；窗口内已存在 ${{existing.length}} / ${{rows.length}} 条，不一致 ${{mismatch.length}} 条。`;
+    }}
+
+    function renderTarget(target, rows, before, after) {{
+      const group = groups.get(target.groupKey) || new Map();
+      const segments = Array.from(group.keys()).sort((a, b) => a - b);
+      const groupInfo = groupMeta[target.groupKey] || {{}};
+      const windowStart = Number(target.segment) - before;
+      const windowEnd = Number(target.segment) + after;
+      const missingSegments = rows.filter(item => !item.record).map(item => item.segment);
+
+      els.targetTable.innerHTML = kvRows([
+        ['ID', target.id],
+        ['label', target.label],
+        ['segment', target.segment],
+        ['duration', target.duration],
+        ['sample_rate', target.sampleRate],
+        ['detector_id', target.detectorId],
+        ['unit_id', target.unitId],
+        ['channel_id', target.channelId],
+        ['time_point', target.timePoint],
+        ['project', target.project],
+        ['md5', target.md5],
+        ['used_or_not', target.usedOrNot],
+        ['train_or_test', target.trainOrTest],
+        ['manual_or_pseudo', target.manualOrPseudo],
+        ['file_path', target.filePath],
+      ]);
+
+      els.groupTable.innerHTML = kvRows([
+        ['大样本分组键', target.groupKey],
+        ['分组规则', '小样本 ID 去掉最后一段数字编号，保留编号前的末尾下划线作为大样本 ID'],
+        ['大样本 segment 范围', segments.length ? `${{segments[0]}} - ${{segments[segments.length - 1]}}` : '无'],
+        ['大样本片段数', group.size],
+        ['检查窗口', `${{windowStart}} - ${{windowEnd}}`],
+        ['缺失 segment', missingSegments.length ? missingSegments.join(', ') : '无'],
+        ['大样本 label 分布', formatCounts(groupInfo.labelCounts)],
+      ]);
+    }}
+
+    function colorForDifferentLabel(label, paletteMap) {{
+      const key = valueText(label);
+      if (!paletteMap.has(key)) paletteMap.set(key, labelColors[paletteMap.size % labelColors.length]);
+      return paletteMap.get(key);
+    }}
+
+    function renderTimeline(target, rows) {{
+      const width = 100 / Math.max(rows.length, 1);
+      const paletteMap = new Map();
+      els.timeline.innerHTML = rows.map(item => {{
+        const isTarget = item.segment === Number(target.segment);
+        if (!item.record) {{
+          return `<div class="bar-item missing${{isTarget ? ' target' : ''}}" style="width:${{width}}%;background:#e5e7eb;color:#374151" title="segment ${{item.segment}}: 缺失">
+            <div class="bar-seg">${{item.segment}}</div><div class="bar-label">缺失</div><div class="bar-offset">${{item.offset >= 0 ? '+' : ''}}${{item.offset}}</div>
+          </div>`;
+        }}
+        const cls = statusClass(item.record.label, target.label);
+        const bg = cls === 'same' ? '#15803d' : colorForDifferentLabel(item.record.label, paletteMap);
+        const title = `segment ${{item.segment}}: label=${{valueText(item.record.label)}}, ID=${{item.record.id}}`;
+        return `<div class="bar-item ${{cls}}${{isTarget ? ' target' : ''}}" style="width:${{width}}%;background:${{bg}};color:white" title="${{escapeHtml(title)}}">
+          <div class="bar-seg">${{item.segment}}</div>
+          <div class="bar-label">${{escapeHtml(valueText(item.record.label))}}</div>
+          <div class="bar-offset">${{item.offset >= 0 ? '+' : ''}}${{item.offset}}</div>
+        </div>`;
+      }}).join('');
+
+      const labelCounts = {{}};
+      for (const item of rows) {{
+        const key = item.record ? valueText(item.record.label) : '缺失';
+        labelCounts[key] = (labelCounts[key] || 0) + 1;
+      }}
+      els.windowChips.innerHTML = Object.entries(labelCounts)
+        .map(([key, count]) => `<span class="chip"><b>${{escapeHtml(key)}}</b>: ${{count}}</span>`)
+        .join('');
+    }}
+
+    function renderRows(target, rows) {{
+      els.windowRows.innerHTML = rows.map(item => {{
+        const offsetText = `${{item.offset >= 0 ? '+' : ''}}${{item.offset}}`;
+        if (!item.record) {{
+          return `<tr class="missing-row">
+            <td>${{offsetText}}</td>
+            <td>${{item.segment}}</td>
+            <td>${{pill('缺失', 'missing')}}</td>
+            <td colspan="8">该编号的小样本在同一大样本分组中不存在</td>
+          </tr>`;
+        }}
+
+        const cls = statusClass(item.record.label, target.label);
+        const checkText = cls === 'same' ? '一致' : '不一致';
+        return `<tr class="${{cls === 'same' ? 'same-row' : 'different-row'}}">
+          <td>${{offsetText}}</td>
+          <td>${{item.segment}}</td>
+          <td>${{pill(item.record.label, cls)}}</td>
+          <td>${{pill(checkText, cls)}}</td>
+          <td class="wide mono">${{escapeHtml(item.record.id)}}</td>
+          <td>${{escapeHtml(valueText(item.record.duration))}}</td>
+          <td>${{escapeHtml(valueText(item.record.sampleRate))}}</td>
+          <td>${{escapeHtml(valueText(item.record.detectorId))}}</td>
+          <td>${{escapeHtml(valueText(item.record.channelId))}}</td>
+          <td>${{escapeHtml(valueText(item.record.timePoint))}}</td>
+          <td class="wide">${{escapeHtml(valueText(item.record.filePath))}}</td>
+        </tr>`;
+      }}).join('');
+    }}
+
+    function renderDetails(target, rows) {{
+      const parts = rows.filter(item => item.record).map(item => {{
+        const rec = item.record;
+        const cls = statusClass(rec.label, target.label);
+        const offsetText = `${{item.offset >= 0 ? '+' : ''}}${{item.offset}}`;
+        const flatRows = Object.entries(rec.flat || {{}})
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, value]) => `<tr><th>${{escapeHtml(key)}}</th><td><pre>${{escapeHtml(valueText(value))}}</pre></td></tr>`)
+          .join('');
+        return `<details class="${{cls}}" ${{rec.id === target.id ? 'open' : ''}}>
+          <summary>
+            <span class="mono">segment ${{rec.segment}}</span>
+            <span>${{offsetText}}</span>
+            ${{pill(rec.label, cls)}}
+            <span class="muted mono">${{escapeHtml(rec.id)}}</span>
+          </summary>
+          <table class="kv-table"><tbody>${{flatRows}}</tbody></table>
+        </details>`;
+      }});
+      els.detailList.innerHTML = parts.join('') || '<div class="empty">窗口内没有可展示的样本。</div>';
+    }}
+
+    function renderParseNotes() {{
+      const largest = (meta.largestGroups || [])
+        .map(([key, size]) => `<span class="chip"><span class="mono">${{escapeHtml(key)}}</span>: ${{size}}</span>`)
+        .join('');
+      const errors = (meta.parseErrors || [])
+        .map(item => `<li class="mono">${{escapeHtml(item)}}</li>`)
+        .join('');
+
+      els.parseNotes.innerHTML = `
+        <div class="chip-row">
+          <span class="chip">全局 label 分布: ${{escapeHtml(formatCounts(meta.labelCounts))}}</span>
+          <span class="chip">重复 group+segment: ${{meta.duplicateSegmentCount}}</span>
+        </div>
+        <div class="chip-row">${{largest}}</div>
+        ${{errors ? `<h3 style="margin-top:14px">跳过的记录</h3><ul>${{errors}}</ul>` : '<p class="muted">没有解析错误。</p>'}}
+      `;
+    }}
+
+    function renderAll() {{
+      const target = selectedRecord();
+      if (!target) {{
+        els.statusTitle.textContent = '没有可解析样本';
+        return;
+      }}
+      const before = numberInputValue(els.beforeInput, meta.defaultBefore);
+      const after = numberInputValue(els.afterInput, meta.defaultAfter);
+      const rows = makeWindow(target, before, after);
+      renderStatus(target, rows);
+      renderTarget(target, rows, before, after);
+      renderTimeline(target, rows);
+      renderRows(target, rows);
+      renderDetails(target, rows);
+    }}
+
+    els.idSearch.addEventListener('input', () => {{
+      const keep = els.sampleSelect.value;
+      rebuildSelect(keep);
+      renderAll();
+    }});
+    els.sampleSelect.addEventListener('change', renderAll);
+    els.beforeInput.addEventListener('input', renderAll);
+    els.afterInput.addEventListener('input', renderAll);
+
+    renderSummary();
+    els.beforeInput.value = meta.defaultBefore;
+    els.afterInput.value = meta.defaultAfter;
+    rebuildSelect(records[0] && records[0].id);
+    renderParseNotes();
+    renderAll();
+  </script>
+</body>
+</html>
+"""
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate an interactive HTML report for checking labels around every sample ID."
+    )
+    parser.add_argument("--json", required=True, type=Path, help="Path to JSON file. Supports {'datas': [...]} or [...].")
+    parser.add_argument("--before", type=int, default=5, help="Default number of previous segments shown in HTML.")
+    parser.add_argument("--after", type=int, default=5, help="Default number of following segments shown in HTML.")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("sample_context_report.html"),
+        help="Output HTML path. Default: sample_context_report.html.",
+    )
+    parser.add_argument("--open", action="store_true", help="Open the generated HTML with the default browser.")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    if args.before < 0 or args.after < 0:
+        raise ValueError("--before and --after must be >= 0.")
+
+    json_path = args.json.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+
+    records = load_records(json_path)
+    payload = build_report_payload(records, json_path, args.before, args.after)
+    payload_json = (
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+    html_text = html_template(payload_json)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(html_text, encoding="utf-8")
+
+    print(f"Report generated: {output_path}")
+    print(f"Parsed records: {payload['meta']['recordCount']}")
+    print(f"Long-sample groups: {payload['meta']['groupCount']}")
+    print(f"Skipped records: {payload['meta']['skippedCount']}")
+    print(f"Duplicate group+segment entries: {payload['meta']['duplicateSegmentCount']}")
+    print("Open the HTML and use the search/select controls to inspect any ID.")
+
+    if args.open:
+        webbrowser.open(output_path.as_uri())
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        raise SystemExit(2)
