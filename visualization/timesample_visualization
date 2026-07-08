@@ -27,6 +27,7 @@ No third-party Python packages are required.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import gzip
 import json
@@ -258,7 +259,9 @@ def html_template(data_file_name: str) -> str:
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      background: var(--bg);
+      background:
+        linear-gradient(180deg, #eef5ff 0, #f6f8fb 330px),
+        var(--bg);
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
       line-height: 1.5;
@@ -274,6 +277,7 @@ def html_template(data_file_name: str) -> str:
       justify-content: space-between;
       gap: 24px;
       margin-bottom: 16px;
+      padding: 4px 0 6px;
     }}
     h1 {{
       margin: 0 0 8px;
@@ -298,6 +302,24 @@ def html_template(data_file_name: str) -> str:
       font-size: 13px;
       overflow-wrap: anywhere;
     }}
+    .eyebrow {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      color: #1d4ed8;
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: 0;
+    }}
+    .eyebrow::before {{
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #2563eb;
+      box-shadow: 0 0 0 5px #dbeafe;
+    }}
     .summary {{
       display: grid;
       grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -308,6 +330,7 @@ def html_template(data_file_name: str) -> str:
       border: 1px solid var(--line);
       background: var(--panel);
       border-radius: 8px;
+      box-shadow: 0 10px 28px rgba(15, 23, 42, 0.05);
     }}
     .metric {{
       min-height: 84px;
@@ -326,6 +349,9 @@ def html_template(data_file_name: str) -> str:
     section {{
       margin-top: 14px;
       padding: 16px;
+    }}
+    section:first-of-type {{
+      border-top: 4px solid #2563eb;
     }}
     .controls {{
       display: grid;
@@ -546,11 +572,51 @@ def html_template(data_file_name: str) -> str:
       border: 1px solid var(--line);
       background: var(--panel);
       border-radius: 8px;
-      padding: 24px;
+      padding: 30px;
+      box-shadow: 0 24px 80px rgba(15, 23, 42, 0.12);
+    }}
+    .loader-mark {{
+      width: 44px;
+      height: 44px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, #2563eb, #0f766e);
+      margin-bottom: 16px;
+      position: relative;
+    }}
+    .loader-mark::after {{
+      content: "";
+      position: absolute;
+      inset: 11px;
+      border: 3px solid rgba(255,255,255,0.92);
+      border-top-color: transparent;
+      border-radius: 999px;
+      animation: spin 1s linear infinite;
     }}
     .loader-box p {{
       margin: 8px 0 14px;
       color: var(--muted);
+    }}
+    .loader-progress {{
+      height: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e2e8f0;
+      margin: 18px 0 10px;
+    }}
+    .loader-progress span {{
+      display: block;
+      width: 38%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #2563eb, #0f766e);
+      animation: slide 1.25s ease-in-out infinite alternate;
+    }}
+    @keyframes spin {{
+      to {{ transform: rotate(360deg); }}
+    }}
+    @keyframes slide {{
+      from {{ transform: translateX(-20%); }}
+      to {{ transform: translateX(180%); }}
     }}
     @media (max-width: 1120px) {{
       .summary {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
@@ -572,16 +638,18 @@ def html_template(data_file_name: str) -> str:
 <body>
   <section class="page loader" id="loader">
     <div class="loader-box">
-      <h1>加载样本数据</h1>
-      <p id="loadStatus">正在读取同目录数据文件...</p>
-      <input id="dataFileInput" type="file" accept=".bin,.gz,.json,application/octet-stream,application/json">
-      <div class="hint">如果直接双击 HTML 后浏览器禁止自动读取同目录文件，请在这里手动选择生成的 .bin 文件。</div>
+      <div class="loader-mark"></div>
+      <h1>样本一致性工作台</h1>
+      <p id="loadStatus">正在加载默认数据文件...</p>
+      <div class="loader-progress"><span></span></div>
+      <div class="hint">默认数据文件：<span class="mono">{data_file_name}</span></div>
     </div>
   </section>
 
   <main class="page" id="app" style="display:none">
     <header>
       <div>
+        <div class="eyebrow">Audio Segment Label Review</div>
         <h1>全量样本前后片段 Label 一致性检查</h1>
         <div class="meta" id="reportMeta"></div>
       </div>
@@ -678,6 +746,7 @@ def html_template(data_file_name: str) -> str:
     </section>
   </main>
 
+  <script src="{data_file_name}"></script>
   <script>
     const DATA_FILE = {data_file_json};
     let payload = null;
@@ -719,7 +788,6 @@ def html_template(data_file_name: str) -> str:
       parseNotes: document.getElementById('parseNotes'),
       loader: document.getElementById('loader'),
       loadStatus: document.getElementById('loadStatus'),
-      dataFileInput: document.getElementById('dataFileInput'),
       app: document.getElementById('app'),
     }};
 
@@ -1020,24 +1088,39 @@ def html_template(data_file_name: str) -> str:
       renderDetails(target, rows);
     }}
 
-    async function decodePayload(arrayBuffer) {{
-      const bytes = new Uint8Array(arrayBuffer);
-      const isGzip = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
-      let decodedBuffer = arrayBuffer;
+    function base64ToBytes(base64) {{
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {{
+        bytes[i] = binary.charCodeAt(i);
+      }}
+      return bytes;
+    }}
+
+    async function decodePayloadFromPackage(dataPackage) {{
+      if (!dataPackage || !Array.isArray(dataPackage.chunks)) {{
+        throw new Error('默认 bin 数据文件没有提供有效的数据包。');
+      }}
+      els.loadStatus.textContent = `正在解码数据块：${{dataPackage.file || DATA_FILE}}`;
+      const bytes = base64ToBytes(dataPackage.chunks.join(''));
+      const isGzip = dataPackage.encoding === 'gzip+base64' || (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b);
+      let decodedBuffer = bytes.buffer;
       if (isGzip) {{
         if (!('DecompressionStream' in window)) {{
-          throw new Error('当前浏览器不支持 gzip bin 解压，请使用新版 Chrome/Edge/Firefox，或用 --no-compress 重新生成未压缩 bin。');
+          throw new Error('当前浏览器不支持 gzip bin 解压，请使用新版 Chrome/Edge/Firefox，或用 --no-compress 重新生成。');
         }}
-        const stream = new Blob([arrayBuffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+        els.loadStatus.textContent = '正在解压数据...';
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
         decodedBuffer = await new Response(stream).arrayBuffer();
       }}
+      els.loadStatus.textContent = '正在解析 JSON 数据...';
       const text = new TextDecoder('utf-8').decode(decodedBuffer);
       return JSON.parse(text);
     }}
 
-    async function loadPayloadFromBuffer(arrayBuffer, sourceLabel) {{
-      els.loadStatus.textContent = `正在解析数据：${{sourceLabel}}`;
-      const nextPayload = await decodePayload(arrayBuffer);
+    async function loadPayloadFromDefaultPackage() {{
+      const dataPackage = window.__SAMPLE_CONTEXT_DATA__;
+      const nextPayload = await decodePayloadFromPackage(dataPackage);
       payload = nextPayload;
       records = payload.records || [];
       meta = payload.meta || {{}};
@@ -1053,15 +1136,12 @@ def html_template(data_file_name: str) -> str:
       renderAll();
     }}
 
-    async function autoLoadPayload() {{
+    async function boot() {{
       try {{
-        els.loadStatus.textContent = `正在读取同目录数据文件：${{DATA_FILE}}`;
-        const response = await fetch(DATA_FILE);
-        if (!response.ok) throw new Error(`HTTP ${{response.status}} ${{response.statusText}}`);
-        const arrayBuffer = await response.arrayBuffer();
-        await loadPayloadFromBuffer(arrayBuffer, DATA_FILE);
+        els.loadStatus.textContent = `正在加载默认数据文件：${{DATA_FILE}}`;
+        await loadPayloadFromDefaultPackage();
       }} catch (error) {{
-        els.loadStatus.textContent = `自动读取失败：${{error.message}}。请手动选择生成的 .bin 文件，或在输出目录运行 python -m http.server 后通过 http://localhost:8000 打开 HTML。`;
+        els.loadStatus.textContent = `加载失败：${{error.message}}。请确认 ${{DATA_FILE}} 和 HTML 在同一目录，并且是同一次脚本生成的文件。`;
       }}
     }}
 
@@ -1073,18 +1153,8 @@ def html_template(data_file_name: str) -> str:
     els.sampleSelect.addEventListener('change', renderAll);
     els.beforeInput.addEventListener('input', renderAll);
     els.afterInput.addEventListener('input', renderAll);
-    els.dataFileInput.addEventListener('change', async () => {{
-      const file = els.dataFileInput.files && els.dataFileInput.files[0];
-      if (!file) return;
-      try {{
-        const arrayBuffer = await file.arrayBuffer();
-        await loadPayloadFromBuffer(arrayBuffer, file.name);
-      }} catch (error) {{
-        els.loadStatus.textContent = `手动读取失败：${{error.message}}`;
-      }}
-    }});
 
-    autoLoadPayload();
+    boot();
   </script>
 </body>
 </html>
@@ -1113,10 +1183,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-compress",
         action="store_true",
-        help="Write plain UTF-8 JSON bytes to .bin instead of gzip-compressed bytes.",
+        help="Store uncompressed JSON as base64 in the .bin data script instead of gzip-compressed base64.",
     )
     parser.add_argument("--open", action="store_true", help="Open the generated HTML with the default browser.")
     return parser.parse_args(argv)
+
+
+def make_bin_script(payload_bytes: bytes, *, compressed: bool, source_name: str) -> str:
+    encoded = base64.b64encode(payload_bytes).decode("ascii")
+    chunk_size = 76_000
+    chunks = [encoded[i : i + chunk_size] for i in range(0, len(encoded), chunk_size)]
+    data = {
+        "format": "sample-context-data-v2",
+        "encoding": "gzip+base64" if compressed else "base64",
+        "file": source_name,
+        "chunkCount": len(chunks),
+        "chunks": chunks,
+    }
+    data_json = (
+        json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    return f"window.__SAMPLE_CONTEXT_DATA__={data_json};\n"
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1128,26 +1218,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     output_path = args.output.expanduser().resolve()
     bin_output_path = args.bin_output.expanduser().resolve() if args.bin_output else output_path.with_suffix(".bin")
 
+    print(f"[1/6] Reading JSON: {json_path}")
     records = load_records(json_path)
+    print(f"[2/6] Loaded records: {len(records)}")
+    print("[3/6] Building browser data and long-sample index...")
     payload = build_report_payload(records, json_path, args.before, args.after)
-    payload_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if not args.no_compress:
-        payload_bytes = gzip.compress(payload_bytes, compresslevel=6)
+    print(f"      Parsed records: {payload['meta']['recordCount']}")
+    print(f"      Long-sample groups: {payload['meta']['groupCount']}")
+    print(f"      Skipped records: {payload['meta']['skippedCount']}")
+    print(f"      Duplicate group+segment entries: {payload['meta']['duplicateSegmentCount']}")
+
+    print("[4/6] Serializing data payload...")
+    raw_payload_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    compressed = not args.no_compress
+    payload_bytes = gzip.compress(raw_payload_bytes, compresslevel=6) if compressed else raw_payload_bytes
+    bin_script = make_bin_script(payload_bytes, compressed=compressed, source_name=bin_output_path.name)
     html_text = html_template(bin_output_path.name)
 
+    print("[5/6] Writing HTML and default bin data package...")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     bin_output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_text, encoding="utf-8")
-    bin_output_path.write_bytes(payload_bytes)
+    bin_output_path.write_text(bin_script, encoding="utf-8")
 
+    print("[6/6] Done.")
     print(f"Report generated: {output_path}")
     print(f"Data bin generated: {bin_output_path}")
+    print(f"Raw data JSON size: {len(raw_payload_bytes) / 1024 / 1024:.2f} MB")
     print(f"Data bin size: {bin_output_path.stat().st_size / 1024 / 1024:.2f} MB")
-    print(f"Parsed records: {payload['meta']['recordCount']}")
-    print(f"Long-sample groups: {payload['meta']['groupCount']}")
-    print(f"Skipped records: {payload['meta']['skippedCount']}")
-    print(f"Duplicate group+segment entries: {payload['meta']['duplicateSegmentCount']}")
-    print("Open the HTML and use the search/select controls to inspect any ID.")
+    print("Open the HTML directly; it will load the generated .bin file by default.")
 
     if args.open:
         webbrowser.open(output_path.as_uri())
