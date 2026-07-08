@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
 import json
 import os
 import re
@@ -45,7 +46,7 @@ SEGMENT_SUFFIX_RE = re.compile(r"^(?P<long_id>.+_)(?P<segment>\d+)$")
 
 
 def load_records(json_path: Path) -> List[Record]:
-    with json_path.open("r", encoding="utf-8") as f:
+    with json_path.open("r", encoding="utf-8-sig") as f:
         payload = json.load(f)
 
     if isinstance(payload, dict):
@@ -164,7 +165,6 @@ def make_browser_record(record: Record, index: int) -> Record:
         "trainOrTest": safe_value(flattened.get("other_information.tags.train_or_test", "")),
         "manualOrPseudo": safe_value(flattened.get("other_information.tags.manual_or_pseudo", "")),
         "flat": safe_value(flattened),
-        "raw": safe_value(record),
     }
 
 
@@ -227,7 +227,8 @@ def build_report_payload(records: List[Record], json_path: Path, before: int, af
     }
 
 
-def html_template(payload_json: str) -> str:
+def html_template(data_file_name: str) -> str:
+    data_file_json = json.dumps(data_file_name, ensure_ascii=False)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -534,6 +535,23 @@ def html_template(payload_json: str) -> str:
       color: var(--muted);
       background: var(--panel-soft);
     }}
+    .loader {{
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .loader-box {{
+      width: min(720px, 100%);
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 24px;
+    }}
+    .loader-box p {{
+      margin: 8px 0 14px;
+      color: var(--muted);
+    }}
     @media (max-width: 1120px) {{
       .summary {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
       .controls {{ grid-template-columns: 1fr 1fr; }}
@@ -552,7 +570,16 @@ def html_template(payload_json: str) -> str:
   </style>
 </head>
 <body>
-  <main class="page">
+  <section class="page loader" id="loader">
+    <div class="loader-box">
+      <h1>加载样本数据</h1>
+      <p id="loadStatus">正在读取同目录数据文件...</p>
+      <input id="dataFileInput" type="file" accept=".bin,.gz,.json,application/octet-stream,application/json">
+      <div class="hint">如果直接双击 HTML 后浏览器禁止自动读取同目录文件，请在这里手动选择生成的 .bin 文件。</div>
+    </div>
+  </section>
+
+  <main class="page" id="app" style="display:none">
     <header>
       <div>
         <h1>全量样本前后片段 Label 一致性检查</h1>
@@ -651,21 +678,25 @@ def html_template(payload_json: str) -> str:
     </section>
   </main>
 
-  <script id="payload" type="application/json">{payload_json}</script>
   <script>
-    const payload = JSON.parse(document.getElementById('payload').textContent);
-    const records = payload.records;
-    const meta = payload.meta;
-    const groupMeta = payload.groups;
+    const DATA_FILE = {data_file_json};
+    let payload = null;
+    let records = [];
+    let meta = {{}};
+    let groupMeta = {{}};
 
     const byId = new Map();
     const groups = new Map();
     const labelColors = ['#c2410c', '#7c3aed', '#be123c', '#0369a1', '#a16207', '#0f766e', '#b45309', '#4338ca'];
 
-    for (const rec of records) {{
-      byId.set(rec.id, rec);
-      if (!groups.has(rec.groupKey)) groups.set(rec.groupKey, new Map());
-      groups.get(rec.groupKey).set(Number(rec.segment), rec);
+    function buildIndexes() {{
+      byId.clear();
+      groups.clear();
+      for (const rec of records) {{
+        byId.set(rec.id, rec);
+        if (!groups.has(rec.groupKey)) groups.set(rec.groupKey, new Map());
+        groups.get(rec.groupKey).set(Number(rec.segment), rec);
+      }}
     }}
 
     const els = {{
@@ -686,6 +717,10 @@ def html_template(payload_json: str) -> str:
       windowRows: document.getElementById('windowRows'),
       detailList: document.getElementById('detailList'),
       parseNotes: document.getElementById('parseNotes'),
+      loader: document.getElementById('loader'),
+      loadStatus: document.getElementById('loadStatus'),
+      dataFileInput: document.getElementById('dataFileInput'),
+      app: document.getElementById('app'),
     }};
 
     function escapeHtml(value) {{
@@ -985,6 +1020,51 @@ def html_template(payload_json: str) -> str:
       renderDetails(target, rows);
     }}
 
+    async function decodePayload(arrayBuffer) {{
+      const bytes = new Uint8Array(arrayBuffer);
+      const isGzip = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+      let decodedBuffer = arrayBuffer;
+      if (isGzip) {{
+        if (!('DecompressionStream' in window)) {{
+          throw new Error('当前浏览器不支持 gzip bin 解压，请使用新版 Chrome/Edge/Firefox，或用 --no-compress 重新生成未压缩 bin。');
+        }}
+        const stream = new Blob([arrayBuffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+        decodedBuffer = await new Response(stream).arrayBuffer();
+      }}
+      const text = new TextDecoder('utf-8').decode(decodedBuffer);
+      return JSON.parse(text);
+    }}
+
+    async function loadPayloadFromBuffer(arrayBuffer, sourceLabel) {{
+      els.loadStatus.textContent = `正在解析数据：${{sourceLabel}}`;
+      const nextPayload = await decodePayload(arrayBuffer);
+      payload = nextPayload;
+      records = payload.records || [];
+      meta = payload.meta || {{}};
+      groupMeta = payload.groups || {{}};
+      buildIndexes();
+      els.loader.style.display = 'none';
+      els.app.style.display = '';
+      renderSummary();
+      els.beforeInput.value = meta.defaultBefore || 5;
+      els.afterInput.value = meta.defaultAfter || 5;
+      rebuildSelect(records[0] && records[0].id);
+      renderParseNotes();
+      renderAll();
+    }}
+
+    async function autoLoadPayload() {{
+      try {{
+        els.loadStatus.textContent = `正在读取同目录数据文件：${{DATA_FILE}}`;
+        const response = await fetch(DATA_FILE);
+        if (!response.ok) throw new Error(`HTTP ${{response.status}} ${{response.statusText}}`);
+        const arrayBuffer = await response.arrayBuffer();
+        await loadPayloadFromBuffer(arrayBuffer, DATA_FILE);
+      }} catch (error) {{
+        els.loadStatus.textContent = `自动读取失败：${{error.message}}。请手动选择生成的 .bin 文件，或在输出目录运行 python -m http.server 后通过 http://localhost:8000 打开 HTML。`;
+      }}
+    }}
+
     els.idSearch.addEventListener('input', () => {{
       const keep = els.sampleSelect.value;
       rebuildSelect(keep);
@@ -993,13 +1073,18 @@ def html_template(payload_json: str) -> str:
     els.sampleSelect.addEventListener('change', renderAll);
     els.beforeInput.addEventListener('input', renderAll);
     els.afterInput.addEventListener('input', renderAll);
+    els.dataFileInput.addEventListener('change', async () => {{
+      const file = els.dataFileInput.files && els.dataFileInput.files[0];
+      if (!file) return;
+      try {{
+        const arrayBuffer = await file.arrayBuffer();
+        await loadPayloadFromBuffer(arrayBuffer, file.name);
+      }} catch (error) {{
+        els.loadStatus.textContent = `手动读取失败：${{error.message}}`;
+      }}
+    }});
 
-    renderSummary();
-    els.beforeInput.value = meta.defaultBefore;
-    els.afterInput.value = meta.defaultAfter;
-    rebuildSelect(records[0] && records[0].id);
-    renderParseNotes();
-    renderAll();
+    autoLoadPayload();
   </script>
 </body>
 </html>
@@ -1019,6 +1104,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=Path("sample_context_report.html"),
         help="Output HTML path. Default: sample_context_report.html.",
     )
+    parser.add_argument(
+        "--bin-output",
+        type=Path,
+        default=None,
+        help="Output data bin path. Default: same as HTML with .bin extension.",
+    )
+    parser.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="Write plain UTF-8 JSON bytes to .bin instead of gzip-compressed bytes.",
+    )
     parser.add_argument("--open", action="store_true", help="Open the generated HTML with the default browser.")
     return parser.parse_args(argv)
 
@@ -1030,21 +1126,23 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     json_path = args.json.expanduser().resolve()
     output_path = args.output.expanduser().resolve()
+    bin_output_path = args.bin_output.expanduser().resolve() if args.bin_output else output_path.with_suffix(".bin")
 
     records = load_records(json_path)
     payload = build_report_payload(records, json_path, args.before, args.after)
-    payload_json = (
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        .replace("&", "\\u0026")
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-    )
-    html_text = html_template(payload_json)
+    payload_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if not args.no_compress:
+        payload_bytes = gzip.compress(payload_bytes, compresslevel=6)
+    html_text = html_template(bin_output_path.name)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    bin_output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_text, encoding="utf-8")
+    bin_output_path.write_bytes(payload_bytes)
 
     print(f"Report generated: {output_path}")
+    print(f"Data bin generated: {bin_output_path}")
+    print(f"Data bin size: {bin_output_path.stat().st_size / 1024 / 1024:.2f} MB")
     print(f"Parsed records: {payload['meta']['recordCount']}")
     print(f"Long-sample groups: {payload['meta']['groupCount']}")
     print(f"Skipped records: {payload['meta']['skippedCount']}")
