@@ -127,6 +127,15 @@ def parse_id(record_id: str) -> Tuple[str, int, int]:
     return match.group("long_id"), int(segment_text), len(segment_text)
 
 
+def parse_non_numeric_suffix(record_id: str) -> Tuple[str, str]:
+    basename = os.path.basename(record_id)
+    stem = strip_audio_extension(basename)
+    if "_" not in stem:
+        return stem + "_", stem
+    prefix, suffix = stem.rsplit("_", 1)
+    return prefix + "_", suffix
+
+
 def parse_segment_id(raw_value: Any, fallback: int) -> int:
     if raw_value is None or raw_value == "":
         return fallback
@@ -165,8 +174,18 @@ def safe_value(value: Any) -> Any:
 
 def make_browser_record(record: Record, index: int) -> Record:
     rid = get_record_id(record)
-    group_key, parsed_segment, segment_width = parse_id(rid)
-    segment = parse_segment_id(record.get("segment_id"), parsed_segment)
+    segment_token = ""
+    parseable_segment = True
+    try:
+        group_key, parsed_segment, segment_width = parse_id(rid)
+        segment = parse_segment_id(record.get("segment_id"), parsed_segment)
+        segment_token = str(record.get("segment_id") or str(parsed_segment).zfill(segment_width))
+    except ValueError:
+        group_key, segment_token = parse_non_numeric_suffix(rid)
+        parsed_segment = -1
+        segment = -1
+        segment_width = 0
+        parseable_segment = False
 
     flattened = flatten_dict(record)
     return {
@@ -177,6 +196,8 @@ def make_browser_record(record: Record, index: int) -> Record:
         "segment": segment,
         "parsedSegment": parsed_segment,
         "segmentWidth": segment_width,
+        "segmentToken": segment_token,
+        "parseableSegment": parseable_segment,
         "label": safe_value(record.get("label", "")),
         "duration": safe_value(record.get("duration", "")),
         "sampleRate": safe_value(record.get("sample_rate", "")),
@@ -541,6 +562,21 @@ def html_template(data_file_name: str) -> str:
       outline: 3px solid var(--accent-soft);
       border-color: var(--accent);
     }}
+    .export-btn {{
+      width: 100%;
+      min-height: 38px;
+      border: 1px solid var(--accent);
+      border-radius: 7px;
+      background: var(--accent);
+      color: #fff;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    .export-btn:hover {{
+      background: #1d4ed8;
+    }}
     .hint {{
       margin-top: 7px;
       color: var(--muted);
@@ -548,6 +584,9 @@ def html_template(data_file_name: str) -> str:
     }}
     .search-control {{
       grid-column: 1 / -1;
+    }}
+    .sample-select-control {{
+      display: none;
     }}
     #sampleSelect {{
       display: none;
@@ -560,7 +599,7 @@ def html_template(data_file_name: str) -> str:
     }}
     .sample-row {{
       display: grid;
-      grid-template-columns: 74px minmax(0, 1fr) 86px;
+      grid-template-columns: 74px minmax(0, 1fr) 128px;
       gap: 8px;
       align-items: center;
       min-height: 42px;
@@ -588,6 +627,9 @@ def html_template(data_file_name: str) -> str:
       white-space: nowrap;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
       font-size: 11px;
+    }}
+    .sample-status {{
+      justify-self: end;
     }}
     .status-card {{
       min-width: 280px;
@@ -841,7 +883,7 @@ def html_template(data_file_name: str) -> str:
   </style>
 </head>
 <body>
-  <section class="page loader" id="loader">
+  <section class="page loader" id="loader" style="display:none">
     <div class="loader-box">
       <div class="loader-mark"></div>
       <h1>样本一致性工作台</h1>
@@ -852,7 +894,7 @@ def html_template(data_file_name: str) -> str:
     </div>
   </section>
 
-  <main class="page" id="app" style="display:none">
+  <main class="page" id="app">
     <header>
       <div>
         <div class="eyebrow">Audio Segment Label Review</div>
@@ -860,8 +902,8 @@ def html_template(data_file_name: str) -> str:
         <div class="meta" id="reportMeta"></div>
       </div>
       <div class="status-card" id="statusCard">
-        <div class="status-title" id="statusTitle">等待选择样本</div>
-        <div class="status-note" id="statusNote">从下方列表或搜索框选择任意 ID。</div>
+        <div class="status-title" id="statusTitle">正在加载数据</div>
+        <div class="status-note" id="statusNote">正在读取默认 bin 文件...</div>
       </div>
     </header>
 
@@ -875,10 +917,38 @@ def html_template(data_file_name: str) -> str:
           <input id="idSearch" type="search" placeholder="输入关键字过滤样本">
           <div class="hint" id="filterHint"></div>
         </div>
-        <div>
+        <div class="sample-select-control">
           <label for="sampleSelect">样本 ID</label>
           <select id="sampleSelect"></select>
           <div class="hint">同一大样本 = 小样本编号前、并保留末尾下划线的大样本 ID 必须相同。</div>
+        </div>
+        <div>
+          <label for="statusFilter">状态分类</label>
+          <select id="statusFilter">
+            <option value="all">全部状态</option>
+            <option value="unparseable">无法识别编号 / ALARM</option>
+            <option value="mismatch_missing">不一致且有缺失</option>
+            <option value="mismatch">有 label 不一致</option>
+            <option value="same_missing">都一致但有缺失</option>
+            <option value="all_present_same">都存在都一致</option>
+            <option value="any_missing">有缺失</option>
+            <option value="all_present">都存在</option>
+          </select>
+        </div>
+        <div>
+          <label for="sortMode">排序方式</label>
+          <select id="sortMode">
+            <option value="severity_desc">严重程度从高到低</option>
+            <option value="weighted_desc">加权不一致从高到低</option>
+            <option value="weighted_asc">加权不一致从低到高</option>
+            <option value="severity_asc">严重程度从低到高</option>
+            <option value="segment_asc">segment 从小到大</option>
+            <option value="id_asc">ID 字典序</option>
+          </select>
+        </div>
+        <div>
+          <label for="exportCsvBtn">导出</label>
+          <button class="export-btn" id="exportCsvBtn" type="button">导出当前 CSV</button>
         </div>
         <div>
           <label for="beforeInput">前面数量</label>
@@ -983,6 +1053,9 @@ def html_template(data_file_name: str) -> str:
       summary: document.getElementById('summary'),
       idSearch: document.getElementById('idSearch'),
       sampleSelect: document.getElementById('sampleSelect'),
+      statusFilter: document.getElementById('statusFilter'),
+      sortMode: document.getElementById('sortMode'),
+      exportCsvBtn: document.getElementById('exportCsvBtn'),
       beforeInput: document.getElementById('beforeInput'),
       afterInput: document.getElementById('afterInput'),
       filterHint: document.getElementById('filterHint'),
@@ -1043,10 +1116,125 @@ def html_template(data_file_name: str) -> str:
       return Number.isFinite(value) && value >= 0 ? value : fallback;
     }}
 
+    function currentWindowParams() {{
+      return {{
+        before: numberInputValue(els.beforeInput, meta.defaultBefore || 5),
+        after: numberInputValue(els.afterInput, meta.defaultAfter || 5),
+      }};
+    }}
+
+    function classifyRecord(rec, before, after) {{
+      if (Number(rec.segment) < 0 || Number(rec.segmentWidth) === 0) {{
+        return {{
+          key: 'unparseable',
+          text: '无法识别编号',
+          pillClass: 'different',
+          severity: 5,
+          missing: 0,
+          mismatch: 0,
+          existing: 0,
+          total: 0,
+          observedWeight: 0,
+          mismatchWeight: 0,
+          missingWeight: 0,
+          totalNeighborWeight: 0,
+          weightedScore: 1,
+          missingWeightRatio: 0,
+        }};
+      }}
+      const group = groups.get(rec.groupKey) || new Map();
+      const targetLabel = valueText(rec.label);
+      let missing = 0;
+      let mismatch = 0;
+      let existing = 0;
+      const total = before + after + 1;
+      let observedWeight = 0;
+      let mismatchWeight = 0;
+      let missingWeight = 0;
+      let totalNeighborWeight = 0;
+
+      for (let segment = Number(rec.segment) - before; segment <= Number(rec.segment) + after; segment += 1) {{
+        const distance = Math.abs(segment - Number(rec.segment));
+        if (distance === 0) {{
+          continue;
+        }}
+        const weight = 1 / (distance + 1);
+        totalNeighborWeight += weight;
+        const neighbor = group.get(segment);
+        if (!neighbor) {{
+          missing += 1;
+          missingWeight += weight;
+          continue;
+        }}
+        existing += 1;
+        observedWeight += weight;
+        if (valueText(neighbor.label) !== targetLabel) {{
+          mismatch += 1;
+          mismatchWeight += weight;
+        }}
+      }}
+
+      let key;
+      let text;
+      let pillClass;
+      let severity;
+      if (mismatch > 0 && missing > 0) {{
+        key = 'mismatch_missing';
+        text = '不一致且缺失';
+        pillClass = 'different';
+        severity = 4;
+      }} else if (mismatch > 0) {{
+        key = 'mismatch';
+        text = '有不一致';
+        pillClass = 'different';
+        severity = 3;
+      }} else if (missing > 0) {{
+        key = 'same_missing';
+        text = '一致但缺失';
+        pillClass = 'warn';
+        severity = 2;
+      }} else {{
+        key = 'all_present_same';
+        text = '全部一致';
+        pillClass = 'same';
+        severity = 0;
+      }}
+
+      return {{
+        key,
+        text,
+        pillClass,
+        severity,
+        missing,
+        mismatch,
+        existing,
+        total,
+        observedWeight,
+        mismatchWeight,
+        missingWeight,
+        totalNeighborWeight,
+        weightedScore: observedWeight > 0 ? mismatchWeight / observedWeight : 0,
+        missingWeightRatio: totalNeighborWeight > 0 ? missingWeight / totalNeighborWeight : 0,
+      }};
+    }}
+
+    function statusMatchesFilter(status, filterValue) {{
+      if (filterValue === 'all') return true;
+      if (status.key === 'unparseable') return filterValue === 'unparseable';
+      if (filterValue === 'any_missing') return status.missing > 0;
+      if (filterValue === 'all_present') return status.missing === 0;
+      if (filterValue === 'mismatch') return status.mismatch > 0;
+      return status.key === filterValue;
+    }}
+
     function getFilteredRecords() {{
       const query = els.idSearch.value.trim().toLowerCase();
-      if (!query) return records;
-      return records.filter(rec => {{
+      const statusFilter = els.statusFilter.value;
+      const sortMode = els.sortMode.value;
+      const {{ before, after }} = currentWindowParams();
+      const items = [];
+
+      for (const rec of records) {{
         const fields = [
           rec.id,
           rec.idBase,
@@ -1058,8 +1246,55 @@ def html_template(data_file_name: str) -> str:
           rec.timePoint,
           rec.project,
         ];
-        return fields.some(value => valueText(value).toLowerCase().includes(query));
+        if (query && !fields.some(value => valueText(value).toLowerCase().includes(query))) {{
+          continue;
+        }}
+        const status = classifyRecord(rec, before, after);
+        if (!statusMatchesFilter(status, statusFilter)) {{
+          continue;
+        }}
+        items.push({{ rec, status }});
+      }}
+
+      items.sort((a, b) => {{
+        if (sortMode === 'weighted_desc') {{
+          return b.status.weightedScore - a.status.weightedScore ||
+            b.status.severity - a.status.severity ||
+            b.status.mismatchWeight - a.status.mismatchWeight ||
+            b.status.missingWeightRatio - a.status.missingWeightRatio ||
+            a.rec.groupKey.localeCompare(b.rec.groupKey) ||
+            Number(a.rec.segment) - Number(b.rec.segment);
+        }}
+        if (sortMode === 'weighted_asc') {{
+          return a.status.weightedScore - b.status.weightedScore ||
+            a.status.severity - b.status.severity ||
+            a.status.missingWeightRatio - b.status.missingWeightRatio ||
+            a.rec.groupKey.localeCompare(b.rec.groupKey) ||
+            Number(a.rec.segment) - Number(b.rec.segment);
+        }}
+        if (sortMode === 'severity_asc') {{
+          return a.status.severity - b.status.severity ||
+            b.status.mismatch - a.status.mismatch ||
+            b.status.missing - a.status.missing ||
+            a.rec.groupKey.localeCompare(b.rec.groupKey) ||
+            Number(a.rec.segment) - Number(b.rec.segment);
+        }}
+        if (sortMode === 'segment_asc') {{
+          return a.rec.groupKey.localeCompare(b.rec.groupKey) ||
+            Number(a.rec.segment) - Number(b.rec.segment) ||
+            a.status.severity - b.status.severity;
+        }}
+        if (sortMode === 'id_asc') {{
+          return a.rec.id.localeCompare(b.rec.id);
+        }}
+        return b.status.severity - a.status.severity ||
+          b.status.mismatch - a.status.mismatch ||
+          b.status.missing - a.status.missing ||
+          a.rec.groupKey.localeCompare(b.rec.groupKey) ||
+          Number(a.rec.segment) - Number(b.rec.segment);
       }});
+
+      return items;
     }}
 
     function rebuildSelect(keepId) {{
@@ -1067,16 +1302,19 @@ def html_template(data_file_name: str) -> str:
       const currentId = keepId || els.sampleSelect.value || (records[0] && records[0].id);
       const maxOptions = 1500;
       const visible = filtered.slice(0, maxOptions);
-      els.sampleSelect.innerHTML = visible.map(rec => {{
+      els.sampleSelect.innerHTML = visible.map(item => {{
+        const rec = item.rec;
         const label = `${{rec.id}} | label=${{valueText(rec.label)}} | segment=${{rec.segment}}`;
         return `<option value="${{escapeHtml(rec.id)}}">${{escapeHtml(label)}}</option>`;
       }}).join('');
 
-      const selectedExists = visible.some(rec => rec.id === currentId);
+      const selectedExists = visible.some(item => item.rec.id === currentId);
       if (selectedExists) {{
         els.sampleSelect.value = currentId;
       }} else if (visible.length) {{
-        els.sampleSelect.value = visible[0].id;
+        els.sampleSelect.value = visible[0].rec.id;
+      }} else {{
+        els.sampleSelect.value = '';
       }}
 
       els.filterHint.textContent = `匹配 ${{filtered.length}} 条；列表最多显示 ${{Math.min(filtered.length, maxOptions)}} 条。`;
@@ -1085,19 +1323,107 @@ def html_template(data_file_name: str) -> str:
 
     function renderSampleList(visible) {{
       const selectedId = els.sampleSelect.value;
-      els.sampleList.innerHTML = visible.map(rec => {{
+      if (!visible.length) {{
+        els.sampleList.innerHTML = '<div class="empty">当前筛选条件下没有样本。</div>';
+        return;
+      }}
+      els.sampleList.innerHTML = visible.map(item => {{
+        const rec = item.rec;
+        const status = item.status;
         const active = rec.id === selectedId ? ' active' : '';
-        const labelCls = statusClass(rec.label, selectedRecord().label);
         return `<div class="sample-row${{active}}" data-id="${{escapeHtml(rec.id)}}" title="${{escapeHtml(rec.id)}}">
-          <div class="sample-seg">#${{escapeHtml(rec.segment)}}</div>
+          <div class="sample-seg">#${{escapeHtml(displaySegment(rec))}}</div>
           <div class="sample-id">${{escapeHtml(rec.id)}}</div>
-          <div>${{pill(rec.label, labelCls)}}</div>
+          <div class="sample-status" title="加权不一致 ${{status.weightedScore.toFixed(4)}}；缺失 ${{status.missing}}；不一致 ${{status.mismatch}}">${{pill(`${{status.text}} · ${{status.weightedScore.toFixed(2)}}`, status.pillClass)}}</div>
         </div>`;
       }}).join('');
     }}
 
+    function displaySegment(rec) {{
+      if (!rec || Number(rec.segment) >= 0) return rec ? rec.segment : '';
+      const stem = valueText(rec.idBase || rec.id).replace(/\.[^.]+$/, '');
+      const parts = stem.split('_');
+      return parts[parts.length - 1] || 'UNKNOWN';
+    }}
+
+    function csvCell(value) {{
+      const text = valueText(value).replace(/"/g, '""');
+      return `"${{text}}"`;
+    }}
+
+    function exportCurrentCsv() {{
+      const {{ before, after }} = currentWindowParams();
+      const items = getFilteredRecords();
+      const rows = [[
+        'ID',
+        'group_key',
+        'segment',
+        'label',
+        'status',
+        'severity',
+        'weighted_inconsistency',
+        'weighted_mismatch_sum',
+        'observed_weight_sum',
+        'missing_count',
+        'mismatch_count',
+        'missing_weight_ratio',
+        'before',
+        'after',
+        'duration',
+        'sample_rate',
+        'detector_id',
+        'unit_id',
+        'channel_id',
+        'time_point',
+        'project',
+        'file_path',
+      ]];
+
+      for (const item of items) {{
+        const rec = item.rec;
+        const status = item.status;
+        rows.push([
+          rec.id,
+          rec.groupKey,
+          displaySegment(rec),
+          rec.label,
+          status.text,
+          status.severity,
+          status.weightedScore.toFixed(6),
+          status.mismatchWeight.toFixed(6),
+          status.observedWeight.toFixed(6),
+          status.missing,
+          status.mismatch,
+          status.missingWeightRatio.toFixed(6),
+          before,
+          after,
+          rec.duration,
+          rec.sampleRate,
+          rec.detectorId,
+          rec.unitId,
+          rec.channelId,
+          rec.timePoint,
+          rec.project,
+          rec.filePath,
+        ]);
+      }}
+
+      const csv = rows.map(row => row.map(csvCell).join(',')).join('\\n');
+      const blob = new Blob(['\\ufeff' + csv], {{ type: 'text/csv;charset=utf-8' }});
+      const url = URL.createObjectURL(blob);
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `sample_context_${{stamp}}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }}
+
     function selectedRecord() {{
-      return byId.get(els.sampleSelect.value) || records[0];
+      if (!els.sampleSelect.value) return null;
+      return byId.get(els.sampleSelect.value) || null;
     }}
 
     function statusClass(label, targetLabel) {{
@@ -1165,7 +1491,7 @@ def html_template(data_file_name: str) -> str:
       els.targetTable.innerHTML = kvRows([
         ['ID', target.id],
         ['label', target.label],
-        ['segment', target.segment],
+        ['segment', displaySegment(target)],
         ['duration', target.duration],
         ['sample_rate', target.sampleRate],
         ['detector_id', target.detectorId],
@@ -1300,11 +1626,33 @@ def html_template(data_file_name: str) -> str:
     function renderAll() {{
       const target = selectedRecord();
       if (!target) {{
+        els.statusCard.classList.remove('ok', 'warn', 'bad');
         els.statusTitle.textContent = '没有可解析样本';
+        els.statusNote.textContent = '当前筛选条件没有匹配项。';
+        els.targetTable.innerHTML = '';
+        els.groupTable.innerHTML = '';
+        els.timeline.innerHTML = '';
+        els.windowChips.innerHTML = '';
+        els.windowRows.innerHTML = '';
+        els.detailList.innerHTML = '<div class="empty">没有可展示的样本。</div>';
         return;
       }}
       const before = numberInputValue(els.beforeInput, meta.defaultBefore);
       const after = numberInputValue(els.afterInput, meta.defaultAfter);
+      const targetStatus = classifyRecord(target, before, after);
+      if (targetStatus.key === 'unparseable') {{
+        const rows = [{{ segment: displaySegment(target), offset: 0, record: target }}];
+        els.statusCard.classList.remove('ok', 'warn');
+        els.statusCard.classList.add('bad');
+        els.statusTitle.textContent = '无法识别小样本编号';
+        els.statusNote.textContent = '该样本末尾不是数字编号，已单独归类，不参与前后窗口一致性计算。';
+        renderTarget(target, rows, before, after);
+        els.timeline.innerHTML = '<div class="empty">该样本没有可计算的前后编号窗口。</div>';
+        els.windowChips.innerHTML = `${{pill('无法识别编号', 'different')}}`;
+        els.windowRows.innerHTML = `<tr class="different-row"><td>0</td><td>${{escapeHtml(displaySegment(target))}}</td><td>${{pill(target.label, 'different')}}</td><td>${{pill('不参与窗口计算', 'different')}}</td><td class="wide mono">${{escapeHtml(target.id)}}</td><td colspan="6">末尾后缀不是数字编号</td></tr>`;
+        renderDetails(target, rows);
+        return;
+      }}
       const rows = makeWindow(target, before, after);
       renderStatus(target, rows);
       renderTarget(target, rows, before, after);
@@ -1408,6 +1756,9 @@ def html_template(data_file_name: str) -> str:
 
     async function loadPayloadFromDefaultBin() {{
       els.loadStatus.textContent = `正在读取默认数据文件：${{DATA_FILE}}`;
+      els.statusCard.classList.remove('ok', 'warn', 'bad');
+      els.statusTitle.textContent = '正在加载数据';
+      els.statusNote.textContent = `正在读取默认数据文件：${{DATA_FILE}}`;
       const response = await fetch(DATA_FILE);
       if (!response.ok) {{
         throw new Error(`Cannot read ${{DATA_FILE}}: HTTP ${{response.status}}. 请在输出目录运行 python -m http.server 后通过 http://localhost:8000 打开 HTML。`);
@@ -1435,6 +1786,10 @@ def html_template(data_file_name: str) -> str:
         await loadPayloadFromDefaultBin();
       }} catch (error) {{
         els.loadStatus.textContent = `加载失败：${{error.message}}`;
+        els.statusCard.classList.remove('ok', 'warn');
+        els.statusCard.classList.add('bad');
+        els.statusTitle.textContent = '加载失败';
+        els.statusNote.textContent = error.message;
       }}
     }}
 
@@ -1454,8 +1809,23 @@ def html_template(data_file_name: str) -> str:
       rebuildSelect(row.dataset.id);
       renderAll();
     }});
-    els.beforeInput.addEventListener('input', renderAll);
-    els.afterInput.addEventListener('input', renderAll);
+    els.statusFilter.addEventListener('change', () => {{
+      rebuildSelect(els.sampleSelect.value);
+      renderAll();
+    }});
+    els.sortMode.addEventListener('change', () => {{
+      rebuildSelect(els.sampleSelect.value);
+      renderAll();
+    }});
+    els.exportCsvBtn.addEventListener('click', exportCurrentCsv);
+    els.beforeInput.addEventListener('input', () => {{
+      rebuildSelect(els.sampleSelect.value);
+      renderAll();
+    }});
+    els.afterInput.addEventListener('input', () => {{
+      rebuildSelect(els.sampleSelect.value);
+      renderAll();
+    }});
 
     boot();
   </script>
