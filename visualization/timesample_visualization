@@ -27,11 +27,12 @@ No third-party Python packages are required.
 from __future__ import annotations
 
 import argparse
+from array import array
 import datetime as dt
-import gzip
 import json
 import os
 import re
+import struct
 import sys
 import webbrowser
 from collections import Counter, defaultdict
@@ -43,6 +44,31 @@ Record = Dict[str, Any]
 
 KNOWN_AUDIO_EXTENSIONS_RE = re.compile(r"\.(wav|mp3|flac|m4a|ogg|aac)$", re.IGNORECASE)
 SEGMENT_SUFFIX_RE = re.compile(r"^(?P<long_id>.+_)(?P<segment>\d+)$")
+BIN_MAGIC = b"SCVBIN2\0"
+BIN_VERSION = 2
+BIN_INT_FIELDS = [
+    "index",
+    "segment",
+    "parsedSegment",
+    "segmentWidth",
+    "id",
+    "idBase",
+    "groupKey",
+    "label",
+    "duration",
+    "sampleRate",
+    "filePath",
+    "detectorId",
+    "unitId",
+    "channelId",
+    "timePoint",
+    "project",
+    "md5",
+    "usedOrNot",
+    "trainOrTest",
+    "manualOrPseudo",
+    "flat",
+]
 
 
 def load_records(json_path: Path) -> List[Record]:
@@ -225,6 +251,122 @@ def build_report_payload(records: List[Record], json_path: Path, before: int, af
             for key, counter in sorted(group_labels.items())
         },
     }
+
+
+def _align4(value: int) -> int:
+    return (value + 3) & ~3
+
+
+def build_binary_report(payload: Dict[str, Any]) -> Tuple[bytes, Dict[str, int]]:
+    """
+    Build a true binary data file:
+
+    header:
+        8s magic, uint32 version, uint32 record_count, uint32 int_field_count,
+        uint32 string_count, uint32 meta_json_len, uint32 string_blob_len
+    body:
+        meta JSON bytes, 4-byte padding,
+        uint32 string offsets, UTF-8 string blob, 4-byte padding,
+        int32 record table
+    """
+    strings: List[bytes] = []
+    string_index: Dict[str, int] = {}
+
+    def intern(value: Any) -> int:
+        if value is None:
+            text = ""
+        elif isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            text = str(value)
+        existing = string_index.get(text)
+        if existing is not None:
+            return existing
+        encoded = text.encode("utf-8")
+        idx = len(strings)
+        strings.append(encoded)
+        string_index[text] = idx
+        return idx
+
+    intern("")
+
+    rows: List[int] = []
+    for rec in payload["records"]:
+        rows.extend(
+            [
+                int(rec.get("index", 0)),
+                int(rec.get("segment", 0)),
+                int(rec.get("parsedSegment", 0)),
+                int(rec.get("segmentWidth", 0)),
+                intern(rec.get("id", "")),
+                intern(rec.get("idBase", "")),
+                intern(rec.get("groupKey", "")),
+                intern(rec.get("label", "")),
+                intern(rec.get("duration", "")),
+                intern(rec.get("sampleRate", "")),
+                intern(rec.get("filePath", "")),
+                intern(rec.get("detectorId", "")),
+                intern(rec.get("unitId", "")),
+                intern(rec.get("channelId", "")),
+                intern(rec.get("timePoint", "")),
+                intern(rec.get("project", "")),
+                intern(rec.get("md5", "")),
+                intern(rec.get("usedOrNot", "")),
+                intern(rec.get("trainOrTest", "")),
+                intern(rec.get("manualOrPseudo", "")),
+                intern(rec.get("flat", {})),
+            ]
+        )
+
+    offsets = [0]
+    blob_parts: List[bytes] = []
+    total = 0
+    for encoded in strings:
+        blob_parts.append(encoded)
+        total += len(encoded)
+        offsets.append(total)
+
+    string_blob = b"".join(blob_parts)
+    meta_bytes = json.dumps(
+        {"meta": payload["meta"], "groups": payload["groups"]},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    header = struct.pack(
+        "<8sIIIIII",
+        BIN_MAGIC,
+        BIN_VERSION,
+        len(payload["records"]),
+        len(BIN_INT_FIELDS),
+        len(strings),
+        len(meta_bytes),
+        len(string_blob),
+    )
+    meta_pad = b"\0" * (_align4(len(header) + len(meta_bytes)) - (len(header) + len(meta_bytes)))
+    offset_array = array("I", offsets)
+    if offset_array.itemsize != 4:
+        raise RuntimeError("This platform does not use 4-byte unsigned integers for array('I').")
+    if sys.byteorder != "little":
+        offset_array.byteswap()
+    offsets_bytes = offset_array.tobytes()
+    strings_pad = b"\0" * (_align4(len(header) + len(meta_bytes) + len(meta_pad) + len(offsets_bytes) + len(string_blob)) - (len(header) + len(meta_bytes) + len(meta_pad) + len(offsets_bytes) + len(string_blob)))
+    row_array = array("i", rows)
+    if row_array.itemsize != 4:
+        raise RuntimeError("This platform does not use 4-byte signed integers for array('i').")
+    if sys.byteorder != "little":
+        row_array.byteswap()
+    rows_bytes = row_array.tobytes()
+
+    binary = header + meta_bytes + meta_pad + offsets_bytes + string_blob + strings_pad + rows_bytes
+    stats = {
+        "record_count": len(payload["records"]),
+        "string_count": len(strings),
+        "string_blob_bytes": len(string_blob),
+        "meta_bytes": len(meta_bytes),
+        "record_table_bytes": len(rows_bytes),
+    }
+    return binary, stats
 
 
 def html_template(data_file_name: str) -> str:
@@ -1172,20 +1314,96 @@ def html_template(data_file_name: str) -> str:
     }}
 
     async function decodePayloadFromBuffer(arrayBuffer) {{
-      const bytes = new Uint8Array(arrayBuffer);
-      const isGzip = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
-      let decodedBuffer = arrayBuffer;
-      if (isGzip) {{
-        if (!('DecompressionStream' in window)) {{
-          throw new Error('当前浏览器不支持 gzip bin 解压，请使用新版 Chrome/Edge/Firefox，或用 --no-compress 重新生成未压缩 bin。');
-        }}
-        els.loadStatus.textContent = '正在解压数据...';
-        const stream = new Blob([arrayBuffer]).stream().pipeThrough(new DecompressionStream('gzip'));
-        decodedBuffer = await new Response(stream).arrayBuffer();
+      const view = new DataView(arrayBuffer);
+      const magic = new TextDecoder('ascii').decode(new Uint8Array(arrayBuffer, 0, 7));
+      if (magic !== 'SCVBIN2') {{
+        throw new Error('bin 文件格式不匹配，请确认 HTML 和 bin 是由新版脚本同一次生成的。');
       }}
-      els.loadStatus.textContent = '正在解析 JSON 数据...';
-      const text = new TextDecoder('utf-8').decode(decodedBuffer);
-      return JSON.parse(text);
+
+      const version = view.getUint32(8, true);
+      const recordCount = view.getUint32(12, true);
+      const intFieldCount = view.getUint32(16, true);
+      const stringCount = view.getUint32(20, true);
+      const metaLen = view.getUint32(24, true);
+      const stringBlobLen = view.getUint32(28, true);
+      if (version !== 2) {{
+        throw new Error(`不支持的 bin 版本：${{version}}`);
+      }}
+      if (intFieldCount !== 21) {{
+        throw new Error(`bin 字段数不匹配：${{intFieldCount}}`);
+      }}
+
+      const align4 = (n) => (n + 3) & ~3;
+      const utf8 = new TextDecoder('utf-8');
+      let offset = 32;
+      els.loadStatus.textContent = '正在解析 bin 元信息...';
+      const metaText = utf8.decode(new Uint8Array(arrayBuffer, offset, metaLen));
+      const container = JSON.parse(metaText);
+      offset = align4(offset + metaLen);
+
+      const stringOffsets = new Uint32Array(arrayBuffer, offset, stringCount + 1);
+      offset += (stringCount + 1) * 4;
+      const stringBytes = new Uint8Array(arrayBuffer, offset, stringBlobLen);
+      offset = align4(offset + stringBlobLen);
+      const table = new Int32Array(arrayBuffer, offset, recordCount * intFieldCount);
+
+      const stringCache = new Map();
+      function readString(idx) {{
+        if (idx < 0 || idx >= stringCount) return '';
+        if (stringCache.has(idx)) return stringCache.get(idx);
+        const start = stringOffsets[idx];
+        const end = stringOffsets[idx + 1];
+        const value = utf8.decode(stringBytes.subarray(start, end));
+        stringCache.set(idx, value);
+        return value;
+      }}
+
+      els.loadStatus.textContent = `正在还原 ${{recordCount.toLocaleString()}} 条样本索引...`;
+      const recordsOut = new Array(recordCount);
+      for (let i = 0; i < recordCount; i += 1) {{
+        const b = i * intFieldCount;
+        const flatIdx = table[b + 20];
+        let flatCache = null;
+        const rec = {{
+          index: table[b + 0],
+          segment: table[b + 1],
+          parsedSegment: table[b + 2],
+          segmentWidth: table[b + 3],
+          id: readString(table[b + 4]),
+          idBase: readString(table[b + 5]),
+          groupKey: readString(table[b + 6]),
+          label: readString(table[b + 7]),
+          duration: readString(table[b + 8]),
+          sampleRate: readString(table[b + 9]),
+          filePath: readString(table[b + 10]),
+          detectorId: readString(table[b + 11]),
+          unitId: readString(table[b + 12]),
+          channelId: readString(table[b + 13]),
+          timePoint: readString(table[b + 14]),
+          project: readString(table[b + 15]),
+          md5: readString(table[b + 16]),
+          usedOrNot: readString(table[b + 17]),
+          trainOrTest: readString(table[b + 18]),
+          manualOrPseudo: readString(table[b + 19]),
+        }};
+        Object.defineProperty(rec, 'flat', {{
+          enumerable: true,
+          get() {{
+            if (flatCache === null) {{
+              const raw = readString(flatIdx);
+              flatCache = raw ? JSON.parse(raw) : {{}};
+            }}
+            return flatCache;
+          }}
+        }});
+        recordsOut[i] = rec;
+      }}
+
+      return {{
+        meta: container.meta || {{}},
+        groups: container.groups || {{}},
+        records: recordsOut,
+      }};
     }}
 
     async function loadPayloadFromDefaultBin() {{
@@ -1268,7 +1486,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-compress",
         action="store_true",
-        help="Write plain UTF-8 JSON bytes to .bin instead of gzip-compressed bytes.",
+        help="Deprecated; kept for compatibility. The new .bin format is an uncompressed typed binary table.",
     )
     parser.add_argument("--open", action="store_true", help="Open the generated HTML with the default browser.")
     return parser.parse_args(argv)
@@ -1293,11 +1511,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"      Skipped records: {payload['meta']['skippedCount']}")
     print(f"      Duplicate group+segment entries: {payload['meta']['duplicateSegmentCount']}")
 
-    print("[4/6] Serializing data payload...")
-    raw_payload_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    compressed = not args.no_compress
-    payload_bytes = gzip.compress(raw_payload_bytes, compresslevel=6) if compressed else raw_payload_bytes
-    html_text = html_template(bin_output_path.name)
+    print("[4/6] Building typed binary data package...")
+    payload_bytes, bin_stats = build_binary_report(payload)
+    print(f"      String table entries: {bin_stats['string_count']}")
+    print(f"      String blob size: {bin_stats['string_blob_bytes'] / 1024 / 1024:.2f} MB")
+    print(f"      Record table size: {bin_stats['record_table_bytes'] / 1024 / 1024:.2f} MB")
+    try:
+        data_file_ref = os.path.relpath(bin_output_path, output_path.parent).replace(os.sep, "/")
+    except ValueError:
+        data_file_ref = bin_output_path.name
+    html_text = html_template(data_file_ref)
 
     print("[5/6] Writing HTML and default bin data package...")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1308,7 +1531,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("[6/6] Done.")
     print(f"Report generated: {output_path}")
     print(f"Data bin generated: {bin_output_path}")
-    print(f"Raw data JSON size: {len(raw_payload_bytes) / 1024 / 1024:.2f} MB")
     print(f"Data bin size: {bin_output_path.stat().st_size / 1024 / 1024:.2f} MB")
     print("The HTML loads the generated .bin by default.")
     print("If the browser blocks local file reads, run: python -m http.server 8000")
