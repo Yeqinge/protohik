@@ -1,0 +1,189 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from sklearn.mixture import GaussianMixture
+
+
+class MulGMMPrototypeLoss(TopVirtualLoss):
+    def __init__(
+        self,
+        input_dim,
+        num_targets,
+        temperature=0.1,
+        n_components=3,          # 3: easy/medium/hard；4: 更细
+        hard_alpha=1.0,
+        lambda_hard_max=1.0,
+        warmup_epochs=0,
+        total_epochs=10,
+        weight_min=0.5,
+        weight_max=2.5,
+    ):
+        super().__init__()
+
+        self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+
+        self.temperature = temperature
+        self.loss_function = nn.CrossEntropyLoss(reduction='none')
+
+        self.n_components = n_components
+        self.hard_alpha = hard_alpha
+        self.lambda_hard_max = lambda_hard_max
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+
+        self.weight_min = weight_min
+        self.weight_max = weight_max
+
+        self.gmm = None
+        self.current_epoch = 0
+        self._last_printed_epoch = -1
+
+        self.epoch_losses = []
+
+        # hook用
+        self.per_sample_loss = None
+        self.weight = None
+        self.hard_prob = None
+        self.posterior = None
+
+    def _get_lambda_hard(self):
+        if self.current_epoch < self.warmup_epochs:
+            return 0.0
+
+        progress = (self.current_epoch - self.warmup_epochs) / \
+                   max(self.total_epochs - self.warmup_epochs, 1)
+
+        return self.lambda_hard_max * min(progress, 1.0)
+
+    def forward(self, inputs, targets):
+        assert len(inputs.shape) == 3
+        assert inputs.shape[2] == 1
+
+        features = torch.squeeze(inputs, dim=2)
+
+        features_norm = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+
+        logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
+        self.posterior = logits.unsqueeze(2).detach()
+
+        per_sample_loss = self.loss_function(logits, targets)
+        self.per_sample_loss = per_sample_loss.detach()
+
+        # 当前epoch继续收集loss，用于epoch结束后拟合下一轮GMM
+        self.epoch_losses.append(per_sample_loss.detach().cpu())
+
+        lambda_hard = self._get_lambda_hard()
+
+        # =====================================================
+        # 没有GMM时：退化为普通Prototype Loss
+        # =====================================================
+        if self.gmm is None or lambda_hard == 0.0:
+            self.weight = None
+            self.hard_prob = None
+            final_loss = per_sample_loss.mean()
+            self._maybe_print(final_loss, lambda_hard, None, None)
+            return final_loss
+
+        # =====================================================
+        # GMM Hard Mining
+        # =====================================================
+        with torch.no_grad():
+            loss_np = per_sample_loss.detach().cpu().numpy().reshape(-1, 1)
+
+            probs = self.gmm.predict_proba(loss_np)
+
+            means = self.gmm.means_.flatten()
+
+            # 按loss均值从小到大排序
+            sorted_idx = np.argsort(means)
+
+            # 最大均值对应hard峰
+            hard_idx = sorted_idx[-1]
+
+            hard_prob = torch.tensor(
+                probs[:, hard_idx],
+                dtype=torch.float32,
+                device=per_sample_loss.device
+            )
+
+            # 和focal一致：越hard，权重越大
+            weight = 1.0 + lambda_hard * (hard_prob ** self.hard_alpha)
+
+            # 防止权重过激
+            weight = torch.clamp(weight, self.weight_min, self.weight_max)
+
+            # 保持平均梯度尺度稳定
+            weight = weight / (weight.mean() + 1e-8)
+
+        self.weight = weight.detach()
+        self.hard_prob = hard_prob.detach()
+
+        final_loss = (weight * per_sample_loss).mean()
+
+        self._maybe_print(final_loss, lambda_hard, weight, hard_prob)
+
+        return final_loss
+
+    def step(self, *args, **kwargs):
+        if 'epoch' in kwargs:
+            self.current_epoch = kwargs['epoch']
+        else:
+            self.current_epoch += 1
+
+        if len(self.epoch_losses) == 0:
+            return
+
+        all_losses = torch.cat(self.epoch_losses, dim=0)
+        losses_np = all_losses.numpy().reshape(-1, 1)
+
+        try:
+            gmm = GaussianMixture(
+                n_components=self.n_components,
+                covariance_type='full',
+                random_state=42,
+                max_iter=200,
+                reg_covar=1e-6
+            )
+
+            gmm.fit(losses_np)
+
+            means = gmm.means_.flatten()
+            sorted_idx = np.argsort(means)
+
+            self.gmm = gmm
+
+            print(
+                f"\n[GMM Hard Update] Epoch={self.current_epoch}\n"
+                f"Means(sorted) = {means[sorted_idx]}\n"
+                f"Easy Mean = {means[sorted_idx[0]]:.4f}\n"
+                f"Hard Mean = {means[sorted_idx[-1]]:.4f}\n"
+            )
+
+        except Exception as e:
+            print(f"[GMM Hard Update Failed] {e}")
+
+        self.epoch_losses = []
+
+    def _maybe_print(self, final_loss, lambda_hard, weight=None, hard_prob=None):
+        if self.current_epoch == self._last_printed_epoch:
+            return
+
+        self._last_printed_epoch = self.current_epoch
+
+        msg = (
+            f"[GMMFocalProtoLoss] epoch={self.current_epoch} | "
+            f"loss={final_loss.item():.4f} | "
+            f"lambda_hard={lambda_hard:.4f}"
+        )
+
+        if weight is not None:
+            msg += (
+                f" | weight_mean={weight.mean().item():.4f}"
+                f" | weight_max={weight.max().item():.4f}"
+                f" | hard_prob_mean={hard_prob.mean().item():.4f}"
+            )
+
+        print(msg)
