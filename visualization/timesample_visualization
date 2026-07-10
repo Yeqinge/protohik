@@ -996,6 +996,14 @@ def html_template(data_file_name: str) -> str:
           </select>
         </div>
         <div>
+          <label for="targetLabelFilter">目标 label</label>
+          <select id="targetLabelFilter">
+            <option value="all">全部 label</option>
+            <option value="normal">normal</option>
+            <option value="abnormal">abnormal</option>
+          </select>
+        </div>
+        <div>
           <label for="sortMode">排序方式</label>
           <select id="sortMode">
             <option value="severity_desc">严重程度从高到低</option>
@@ -1122,6 +1130,7 @@ def html_template(data_file_name: str) -> str:
       idSearch: document.getElementById('idSearch'),
       sampleSelect: document.getElementById('sampleSelect'),
       statusFilter: document.getElementById('statusFilter'),
+      targetLabelFilter: document.getElementById('targetLabelFilter'),
       sortMode: document.getElementById('sortMode'),
       exportCsvBtn: document.getElementById('exportCsvBtn'),
       beforeInput: document.getElementById('beforeInput'),
@@ -1194,6 +1203,15 @@ def html_template(data_file_name: str) -> str:
       }};
     }}
 
+    function isNormalLabel(label) {{
+      return valueText(label).trim().toLowerCase() === 'normal';
+    }}
+
+    function isAbnormalLikeLabel(label) {{
+      const text = valueText(label).trim().toLowerCase();
+      return text === 'abnormal' || text === 'anomaly' || text === 'alarm' || text.includes('abnormal');
+    }}
+
     function classifyRecord(rec, before, after) {{
       if (Number(rec.segment) < 0 || Number(rec.segmentWidth) === 0) {{
         return {{
@@ -1211,6 +1229,8 @@ def html_template(data_file_name: str) -> str:
           totalNeighborWeight: 0,
           weightedScore: 1,
           missingWeightRatio: 0,
+          normalToAbnormal: 0,
+          normalToAbnormalWeight: 0,
         }};
       }}
       const group = groups.get(rec.groupKey) || new Map();
@@ -1223,6 +1243,8 @@ def html_template(data_file_name: str) -> str:
       let mismatchWeight = 0;
       let missingWeight = 0;
       let totalNeighborWeight = 0;
+      let normalToAbnormal = 0;
+      let normalToAbnormalWeight = 0;
 
       for (let segment = Number(rec.segment) - before; segment <= Number(rec.segment) + after; segment += 1) {{
         const distance = Math.abs(segment - Number(rec.segment));
@@ -1242,6 +1264,10 @@ def html_template(data_file_name: str) -> str:
         if (valueText(neighbor.label) !== targetLabel) {{
           mismatch += 1;
           mismatchWeight += weight;
+          if (isNormalLabel(targetLabel) && isAbnormalLikeLabel(neighbor.label)) {{
+            normalToAbnormal += 1;
+            normalToAbnormalWeight += weight;
+          }}
         }}
       }}
 
@@ -1271,6 +1297,11 @@ def html_template(data_file_name: str) -> str:
         severity = 0;
       }}
 
+      if (normalToAbnormal > 0) {{
+        text += ' · normal→abnormal';
+        severity += 0.75;
+      }}
+
       return {{
         key,
         text,
@@ -1286,6 +1317,8 @@ def html_template(data_file_name: str) -> str:
         totalNeighborWeight,
         weightedScore: observedWeight > 0 ? mismatchWeight / observedWeight : 0,
         missingWeightRatio: totalNeighborWeight > 0 ? missingWeight / totalNeighborWeight : 0,
+        normalToAbnormal,
+        normalToAbnormalWeight,
       }};
     }}
 
@@ -1298,9 +1331,17 @@ def html_template(data_file_name: str) -> str:
       return status.key === filterValue;
     }}
 
+    function targetLabelMatchesFilter(rec, filterValue) {{
+      if (filterValue === 'all') return true;
+      if (filterValue === 'normal') return isNormalLabel(rec.label);
+      if (filterValue === 'abnormal') return isAbnormalLikeLabel(rec.label);
+      return true;
+    }}
+
     function getFilteredRecords() {{
       const query = els.idSearch.value.trim().toLowerCase();
       const statusFilter = els.statusFilter.value;
+      const targetLabelFilter = els.targetLabelFilter.value;
       const sortMode = els.sortMode.value;
       const {{ before, after }} = currentWindowParams();
       const items = [];
@@ -1318,6 +1359,9 @@ def html_template(data_file_name: str) -> str:
           rec.project,
         ];
         if (query && !fields.some(value => valueText(value).toLowerCase().includes(query))) {{
+          continue;
+        }}
+        if (!targetLabelMatchesFilter(rec, targetLabelFilter)) {{
           continue;
         }}
         const status = classifyRecord(rec, before, after);
@@ -1414,7 +1458,7 @@ def html_template(data_file_name: str) -> str:
         return `<div class="sample-row${{active}}" data-id="${{escapeHtml(rec.id)}}" title="${{escapeHtml(rec.id)}}">
           <div class="sample-seg">#${{escapeHtml(displaySegment(rec))}}</div>
           <div class="sample-id">${{escapeHtml(rec.id)}}</div>
-          <div class="sample-status" title="加权不一致 ${{status.weightedScore.toFixed(4)}}；缺失 ${{status.missing}}；不一致 ${{status.mismatch}}">${{pill(`${{status.text}} · ${{status.weightedScore.toFixed(2)}}`, status.pillClass)}}</div>
+          <div class="sample-status" title="加权不一致 ${{status.weightedScore.toFixed(4)}}；normal→abnormal ${{status.normalToAbnormal}}；缺失 ${{status.missing}}；不一致 ${{status.mismatch}}">${{pill(`${{status.text}} · ${{status.weightedScore.toFixed(2)}}`, status.pillClass)}}</div>
         </div>`;
       }}).join('');
     }}
@@ -1623,6 +1667,7 @@ def html_template(data_file_name: str) -> str:
       const headers = [
         'ID', 'group_key', 'segment', 'label', 'status', 'severity',
         'weighted_inconsistency', 'weighted_mismatch_sum', 'observed_weight_sum',
+        'normal_to_abnormal_count', 'normal_to_abnormal_weight',
         'missing_count', 'mismatch_count', 'missing_weight_ratio',
         'before', 'after', 'duration', 'sample_rate', 'detector_id', 'unit_id',
         'channel_id', 'time_point', 'project', 'file_path'
@@ -1641,6 +1686,7 @@ def html_template(data_file_name: str) -> str:
         const row = [
           rec.id, rec.groupKey, displaySegment(rec), rec.label, status.text, status.severity,
           status.weightedScore.toFixed(6), status.mismatchWeight.toFixed(6), status.observedWeight.toFixed(6),
+          status.normalToAbnormal, status.normalToAbnormalWeight.toFixed(6),
           status.missing, status.mismatch, status.missingWeightRatio.toFixed(6),
           before, after, rec.duration, rec.sampleRate, rec.detectorId, rec.unitId,
           rec.channelId, rec.timePoint, rec.project, rec.filePath
@@ -1659,6 +1705,7 @@ def html_template(data_file_name: str) -> str:
       summaryRows.push(['after', after]);
       summaryRows.push(['搜索关键词', els.idSearch.value.trim()]);
       summaryRows.push(['状态筛选', els.statusFilter.value]);
+      summaryRows.push(['目标 label 筛选', els.targetLabelFilter.value]);
       summaryRows.push(['排序方式', els.sortMode.value]);
 
       const sheets = [{{ name: '汇总', rows: summaryRows }}];
@@ -1874,6 +1921,9 @@ def html_template(data_file_name: str) -> str:
       ];
       const statusCounts = Object.fromEntries(statusDefs.map(([key]) => [key, 0]));
       for (const rec of records) {{
+        if (!targetLabelMatchesFilter(rec, els.targetLabelFilter.value)) {{
+          continue;
+        }}
         const st = classifyRecord(rec, before, after);
         statusCounts[st.key] = (statusCounts[st.key] || 0) + 1;
       }}
@@ -2094,6 +2144,11 @@ def html_template(data_file_name: str) -> str:
       renderAll();
     }});
     els.statusFilter.addEventListener('change', () => {{
+      listPageStart = 0;
+      rebuildSelect(els.sampleSelect.value);
+      renderAll();
+    }});
+    els.targetLabelFilter.addEventListener('change', () => {{
       listPageStart = 0;
       rebuildSelect(els.sampleSelect.value);
       renderAll();
