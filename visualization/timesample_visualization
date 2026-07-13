@@ -585,6 +585,49 @@ def html_template(data_file_name: str) -> str:
     .search-control {{
       grid-column: 1 / -1;
     }}
+    .wide-control {{
+      grid-column: 1 / -1;
+    }}
+    .inline-control {{
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+      align-items: end;
+    }}
+    .export-control {{
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 132px;
+      gap: 12px;
+      align-items: end;
+    }}
+    .export-progress {{
+      grid-column: 1 / -1;
+      display: none;
+      gap: 6px;
+    }}
+    .export-progress.show {{
+      display: grid;
+    }}
+    .export-progress-track {{
+      height: 8px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e2e8f0;
+    }}
+    .export-progress-bar {{
+      display: block;
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #2563eb, #0f766e);
+      transition: width 0.18s ease;
+    }}
+    .export-progress-text {{
+      color: var(--muted);
+      font-size: 12px;
+    }}
     .sample-select-control {{
       display: none;
     }}
@@ -1004,7 +1047,7 @@ def html_template(data_file_name: str) -> str:
             <option value="abnormal">abnormal</option>
           </select>
         </div>
-        <div>
+        <div class="wide-control">
           <label for="sortMode">排序方式</label>
           <select id="sortMode">
             <option value="severity_desc">严重程度从高到低</option>
@@ -1015,27 +1058,35 @@ def html_template(data_file_name: str) -> str:
             <option value="id_asc">ID 字典序</option>
           </select>
         </div>
-        <div>
-          <label for="exportType">导出</label>
-          <select id="exportType">
-            <option value="xlsx">导出 XLSX</option>
-            <option value="json">导出 JSON</option>
-            <option value="html">导出汇总 HTML</option>
-            <option value="sources">导出源文件</option>
-            <option value="all">导出全部信息</option>
-          </select>
+        <div class="inline-control">
+          <div>
+            <label for="beforeInput">前面数量</label>
+            <input id="beforeInput" type="number" min="0" step="1">
+          </div>
+          <div>
+            <label for="afterInput">后面数量</label>
+            <input id="afterInput" type="number" min="0" step="1">
+          </div>
         </div>
-        <div>
-          <label for="exportCsvBtn">&nbsp;</label>
-          <button class="export-btn" id="exportCsvBtn" type="button">执行导出</button>
+        <div class="export-control">
+          <div>
+            <label for="exportType">导出</label>
+            <select id="exportType">
+              <option value="xlsx">导出 XLSX</option>
+              <option value="json">导出 JSON</option>
+              <option value="html">导出汇总 HTML</option>
+              <option value="sources">导出源文件</option>
+              <option value="all">导出全部信息</option>
+            </select>
+          </div>
+          <div>
+            <label for="exportCsvBtn">&nbsp;</label>
+            <button class="export-btn" id="exportCsvBtn" type="button">执行导出</button>
+          </div>
         </div>
-        <div>
-          <label for="beforeInput">前面数量</label>
-          <input id="beforeInput" type="number" min="0" step="1">
-        </div>
-        <div>
-          <label for="afterInput">后面数量</label>
-          <input id="afterInput" type="number" min="0" step="1">
+        <div class="export-progress" id="exportProgress">
+          <div class="export-progress-track"><span class="export-progress-bar" id="exportProgressBar"></span></div>
+          <div class="export-progress-text" id="exportProgressText">等待导出</div>
         </div>
       </div>
       <div class="sample-list" id="sampleList"></div>
@@ -1153,6 +1204,9 @@ def html_template(data_file_name: str) -> str:
       sortMode: document.getElementById('sortMode'),
       exportType: document.getElementById('exportType'),
       exportCsvBtn: document.getElementById('exportCsvBtn'),
+      exportProgress: document.getElementById('exportProgress'),
+      exportProgressBar: document.getElementById('exportProgressBar'),
+      exportProgressText: document.getElementById('exportProgressText'),
       beforeInput: document.getElementById('beforeInput'),
       afterInput: document.getElementById('afterInput'),
       filterHint: document.getElementById('filterHint'),
@@ -1373,9 +1427,9 @@ def html_template(data_file_name: str) -> str:
       return true;
     }}
 
-    function getFilteredRecords() {{
+    function getFilteredRecords(options = {{}}) {{
       const query = els.idSearch.value.trim().toLowerCase();
-      const statusFilter = els.statusFilter.value;
+      const statusFilter = options.ignoreStatusFilter ? 'all' : els.statusFilter.value;
       const targetLabelFilter = els.targetLabelFilter.value;
       const sortMode = els.sortMode.value;
       const {{ before, after }} = currentWindowParams();
@@ -1708,7 +1762,23 @@ def html_template(data_file_name: str) -> str:
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(url);
+      window.setTimeout(() => URL.revokeObjectURL(url), 30000);
+    }}
+
+    function nextFrame() {{
+      return new Promise(resolve => requestAnimationFrame(() => resolve()));
+    }}
+
+    function setExportProgress(percent, text, visible = true) {{
+      if (!els.exportProgress) return;
+      els.exportProgress.classList.toggle('show', visible);
+      els.exportProgressBar.style.width = `${{Math.max(0, Math.min(100, percent))}}%`;
+      els.exportProgressText.textContent = text || '';
+    }}
+
+    function finishExportProgress(text) {{
+      setExportProgress(100, text || '导出完成', true);
+      window.setTimeout(() => setExportProgress(0, '等待导出', false), 1800);
     }}
 
     function exportStatusOrder() {{
@@ -1770,9 +1840,11 @@ def html_template(data_file_name: str) -> str:
       return out;
     }}
 
-    function exportCurrentCsv() {{
+    async function exportCurrentCsv() {{
+      setExportProgress(8, '正在整理 XLSX 数据...');
+      await nextFrame();
       const {{ before, after }} = currentWindowParams();
-      const items = getFilteredRecords();
+      const items = getFilteredRecords({{ ignoreStatusFilter: true }});
       const headers = [
         'ID', 'group_key', 'segment', 'label', 'status', 'severity',
         'weighted_inconsistency', 'weighted_mismatch_sum', 'observed_weight_sum',
@@ -1817,11 +1889,16 @@ def html_template(data_file_name: str) -> str:
         if (entry && entry.rows.length > 1) sheets.push({{ name: entry.name, rows: entry.rows }});
       }}
 
+      setExportProgress(72, '正在生成 XLSX 文件...');
+      await nextFrame();
       const blob = buildWorkbookBlob(sheets);
       downloadBlob(blob, `sample_context_${{exportStamp()}}.xlsx`);
+      setExportProgress(100, `XLSX 已开始下载：${{items.length.toLocaleString()}} 条`);
     }}
 
-    function exportTaggedJson() {{
+    async function exportTaggedJson() {{
+      setExportProgress(8, '正在给全量样本写入状态标签...');
+      await nextFrame();
       const {{ before, after }} = currentWindowParams();
       const datas = records.map(rec => {{
         const status = classifyRecord(rec, before, after);
@@ -1842,8 +1919,11 @@ def html_template(data_file_name: str) -> str:
         }},
         datas,
       }};
+      setExportProgress(78, '正在生成 JSON 文件...');
+      await nextFrame();
       const blob = new Blob([JSON.stringify(out, null, 2)], {{ type: 'application/json;charset=utf-8' }});
       downloadBlob(blob, `sample_context_tagged_${{exportStamp()}}.json`);
+      setExportProgress(100, `JSON 已开始下载：${{datas.length.toLocaleString()}} 条`);
     }}
 
     function buildSummaryScatter(items) {{
@@ -1889,7 +1969,9 @@ def html_template(data_file_name: str) -> str:
       }}).join('');
     }}
 
-    function exportSummaryHtml() {{
+    async function exportSummaryHtml() {{
+      setExportProgress(8, '正在统计当前窗口并绘制汇总 HTML...');
+      await nextFrame();
       const {{ before, after }} = currentWindowParams();
       const items = getFilteredRecords();
       const counts = statusSummary(items);
@@ -1937,11 +2019,16 @@ def html_template(data_file_name: str) -> str:
         '<section class="panel"><h2>状态分类统计</h2><div class="status-hist">' + buildSummaryBars(items) + '</div></section></div>' +
         '<section class="panel" style="margin-top:14px"><h2>样本明细预览</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>group</th><th>segment</th><th>label</th><th>状态</th><th>缺失</th><th>不一致</th><th>加权不一致</th></tr></thead><tbody>' + sampleRows + '</tbody></table></div></section>' +
         '</main></body></html>';
+      setExportProgress(82, '正在生成 HTML 文件...');
+      await nextFrame();
       const blob = new Blob([html], {{ type: 'text/html;charset=utf-8' }});
       downloadBlob(blob, `sample_context_summary_${{exportStamp()}}.html`);
+      setExportProgress(100, `HTML 已开始下载：${{items.length.toLocaleString()}} 条`);
     }}
 
-    function exportSourceCopyScript() {{
+    async function exportSourceCopyScript() {{
+      setExportProgress(10, '正在汇总源文件路径...');
+      await nextFrame();
       const items = getFilteredRecords();
       const seen = new Set();
       const lines = [
@@ -1965,17 +2052,37 @@ def html_template(data_file_name: str) -> str:
       lines.push('pause');
       const blob = new Blob([lines.join('\\r\\n')], {{ type: 'text/plain;charset=utf-8' }});
       downloadBlob(blob, `copy_sample_sources_${{exportStamp()}}.bat`);
+      setExportProgress(100, `源文件复制脚本已开始下载：${{seen.size.toLocaleString()}} 个路径`);
     }}
 
-    function handleExport() {{
+    async function handleExport() {{
       const type = els.exportType.value;
-      if (type === 'xlsx') return exportCurrentCsv();
-      if (type === 'json') return exportTaggedJson();
-      if (type === 'html') return exportSummaryHtml();
-      if (type === 'sources') return exportSourceCopyScript();
-      if (type === 'all') {{
-        const jobs = [exportCurrentCsv, exportTaggedJson, exportSummaryHtml, exportSourceCopyScript];
-        jobs.forEach((fn, idx) => window.setTimeout(fn, idx * 180));
+      els.exportCsvBtn.disabled = true;
+      setExportProgress(2, '准备导出...');
+      try {{
+        if (type === 'xlsx') await exportCurrentCsv();
+        else if (type === 'json') await exportTaggedJson();
+        else if (type === 'html') await exportSummaryHtml();
+        else if (type === 'sources') await exportSourceCopyScript();
+        else if (type === 'all') {{
+          const jobs = [
+            ['XLSX', exportCurrentCsv],
+            ['JSON', exportTaggedJson],
+            ['汇总 HTML', exportSummaryHtml],
+            ['源文件脚本', exportSourceCopyScript],
+          ];
+          for (let i = 0; i < jobs.length; i += 1) {{
+            setExportProgress(i / jobs.length * 100, `正在导出 ${{jobs[i][0]}}...`);
+            await nextFrame();
+            await jobs[i][1]();
+          }}
+          setExportProgress(100, '全部导出已开始下载');
+        }}
+        finishExportProgress();
+      }} catch (error) {{
+        setExportProgress(100, `导出失败：${{error.message || error}}`);
+      }} finally {{
+        els.exportCsvBtn.disabled = false;
       }}
     }}
 
@@ -2172,8 +2279,9 @@ def html_template(data_file_name: str) -> str:
     }}
 
     function renderParseNotes() {{
+      const {{ before, after }} = currentWindowParams();
       const statusCounts = Object.fromEntries(STATUS_DEFS.map(([key]) => [key, 0]));
-      const items = currentFilteredItems || [];
+      const items = records.map(rec => ({{ rec, status: classifyRecord(rec, before, after) }}));
       for (const item of items) {{
         statusCounts[item.status.key] = (statusCounts[item.status.key] || 0) + 1;
       }}
@@ -2195,7 +2303,7 @@ def html_template(data_file_name: str) -> str:
         .join('');
 
       els.parseNotes.innerHTML = `
-        <h3>当前筛选结果状态分类样本数</h3>
+        <h3>当前窗口大小下的全量状态分类样本数</h3>
         <div class="status-hist">${{histHtml}}</div>
         <div class="chip-row">
           <span class="chip">当前统计样本数: ${{items.length.toLocaleString()}}</span>
