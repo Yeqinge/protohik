@@ -1,0 +1,87 @@
+class DictancePrototypeLoss(TopVirtualLoss):
+    def init(self, input_dim, num_targets, temperature=0.1,
+                 weight_start_epoch=2, gap_tau=0.2, min_weight=0.2):
+
+        assert num_targets == 2, "当前 PrototypeLoss 版本只适用于两个类别"
+
+        self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+
+        self.temperature = temperature
+        self.weight_start_epoch = weight_start_epoch
+        self.gap_tau = gap_tau
+        self.min_weight = min_weight
+
+        self.current_epoch = 0
+        self._last_printed_epoch = -1
+        self.loss_function = nn.CrossEntropyLoss(reduction='none')
+
+    def _use_weight(self):
+        return self.current_epoch >= self.weight_start_epoch
+
+    def _maybe_print(self, per_sample_loss, dist_gap=None, sample_weight=None):
+        if self.current_epoch == self._last_printed_epoch:
+            return
+        self._last_printed_epoch = self.current_epoch
+
+        print(f"[PrototypeLoss] epoch={self.current_epoch} | "
+              f"use_weight={self._use_weight()} | "
+              f"loss_mean={per_sample_loss.mean().item():.4f} | "
+              f"loss_max={per_sample_loss.max().item():.4f}")
+
+        if dist_gap is not None:
+            print(f"[PrototypeLoss]   dist_gap_mean={dist_gap.mean().item():.4f} | "
+                  f"dist_gap_min={dist_gap.min().item():.4f} | "
+                  f"dist_gap_max={dist_gap.max().item():.4f}")
+
+        if sample_weight is not None:
+            print(f"[PrototypeLoss]   weight_mean={sample_weight.mean().item():.4f} | "
+                  f"weight_min={sample_weight.min().item():.4f} | "
+                  f"weight_max={sample_weight.max().item():.4f}")
+
+    def forward(self, inputs, targets):
+        assert len(inputs.shape) == 3
+        assert inputs.shape[2] == 1
+
+        features = torch.squeeze(inputs, dim=2)
+
+        features_norm = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+
+        cos_sim = torch.mm(features_norm, prototypes_norm.t())
+        logits = cos_sim / self.temperature
+
+        self.posterior = logits.unsqueeze(2).detach()
+
+        per_sample_loss = self.loss_function(logits, targets)
+
+        if not self._use_weight():
+            self._maybe_print(per_sample_loss)
+            return per_sample_loss.mean()
+
+        with torch.no_grad():
+            # cosine distance: 距离越小，说明样本越接近该原型
+            distances = 1.0 - cos_sim
+
+            target_dist = distances.gather(1, targets.view(-1, 1)).squeeze(1)
+
+            # 当前场景只有两个类别，另一个类别就是 1 - target
+            other_targets = 1 - targets
+            other_dist = distances.gather(1, other_targets.view(-1, 1)).squeeze(1)
+
+            # dist_gap > 0: 更接近标签对应原型，标签较可信
+            # dist_gap < 0: 更接近另一个原型，疑似错标，应该降权
+            dist_gap = other_dist - target_dist
+
+            # 用距离差估计标签可信度
+            # dist_gap 越大，weight 越接近 1
+            # dist_gap 越小或为负，weight 越接近 min_weight
+            sample_weight = self.min_weight + \
+                (1.0 - self.min_weight) * torch.sigmoid(dist_gap / self.gap_tau)
+
+            # 归一化，避免整体 loss 尺度漂移太大
+            sample_weight = sample_weight / (sample_weight.mean() + 1e-8)
+
+        self._maybe_print(per_sample_loss, dist_gap, sample_weight)
+
+        return (sample_weight * per_sample_loss).mean()
