@@ -2,6 +2,8 @@ class DictancePrototypeLoss(TopVirtualLoss):
     def init(self, input_dim, num_targets, temperature=0.1,
                  weight_start_epoch=2, gap_tau=0.2, min_weight=0.2):
 
+        assert num_targets == 2, "DictancePrototypeLoss only supports binary classification."
+
         self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
         nn.init.xavier_uniform_(self.prototypes)
 
