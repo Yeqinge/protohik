@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 contrib_hook.py
-逐样本贡献追踪（适配 GMMPrototypeLoss + 修复 NoneType 错误）
+Per-sample contribution tracing for loss modules such as GMMPrototypeLoss.
 """
+import inspect
 import os
 import hashlib
 from collections import deque
+
 import torch
 import torch.nn.functional as F
+
 from sample_tracker import SampleContributionTracker
 
 _ACTIVE = None
@@ -23,8 +26,10 @@ def _to_2d(t):
 
 def _hash_ids(feats):
     feats = feats.detach().to("cpu").contiguous()
-    return [hashlib.blake2b(feats[i].numpy().tobytes(), digest_size=8).hexdigest()
-            for i in range(feats.shape[0])]
+    return [
+        hashlib.blake2b(feats[i].numpy().tobytes(), digest_size=8).hexdigest()
+        for i in range(feats.shape[0])
+    ]
 
 
 def _split_targets(batch):
@@ -40,34 +45,35 @@ def _split_targets(batch):
 
 
 def _find_loss_module(model):
-    """优先查找 GMMPrototypeLoss"""
     for name, mod in model.named_modules():
         if "GMMPrototypeLoss" in type(mod).__name__:
             return name, mod
-    # 兜底查找
+
     keys = ("loss", "softmax", "margin", "proto", "aam", "arc", "gmm")
     for name, mod in model.named_modules():
-        if any(k in type(mod).__name__.lower() for k in keys):
+        mod_name = type(mod).__name__.lower()
+        if any(k in mod_name for k in keys):
             return name, mod
     return None, None
 
 
 def _get_dataloader_with_sampler(loader, max_depth=10):
-    """增强版：支持多层嵌套 DataLoader"""
     current = loader
     visited = set()
     depth = 0
-    
+
     while depth < max_depth:
         if id(current) in visited:
             break
         visited.add(id(current))
-        
+
         if getattr(current, "batch_sampler", None) is not None:
             return current
-        
-        for attr in ["loader", "_loader", "dataloader", "_dataloader", "dl", "_dl",
-                     "train_loader", "train_dataloader", "data_loader", "inner_loader"]:
+
+        for attr in (
+            "loader", "_loader", "dataloader", "_dataloader", "dl", "_dl",
+            "train_loader", "train_dataloader", "data_loader", "inner_loader",
+        ):
             inner = getattr(current, attr, None)
             if inner is not None and inner is not current:
                 current = inner
@@ -75,10 +81,153 @@ def _get_dataloader_with_sampler(loader, max_depth=10):
         else:
             break
         depth += 1
-    
+
     if getattr(current, "batch_sampler", None) is not None:
         return current
     return None
+
+
+def _iter_tensors(obj):
+    if torch.is_tensor(obj):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_tensors(v)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _iter_tensors(v)
+
+
+def _as_1d_long(targets):
+    if targets is None:
+        return None
+    if not torch.is_tensor(targets):
+        try:
+            targets = torch.as_tensor(targets)
+        except Exception:
+            return None
+    return targets.detach().view(-1).long()
+
+
+def _detach_numpy(t):
+    if t is None:
+        return None
+    if torch.is_tensor(t):
+        return t.detach().cpu().numpy()
+    return t
+
+
+def _is_batch_vector(t, batch_size):
+    return (
+        torch.is_tensor(t)
+        and t.dim() >= 1
+        and t.shape[0] == batch_size
+        and t.numel() >= batch_size
+    )
+
+
+def _find_vector(source, batch_size, names=()):
+    for name in names:
+        candidate = getattr(source, name, None)
+        if _is_batch_vector(candidate, batch_size):
+            return candidate.reshape(batch_size, -1).mean(dim=1)
+    return None
+
+
+def _find_logits(module, args, output, batch_size, num_targets):
+    attr_names = (
+        "logits", "score", "scores", "output", "outputs", "pred", "preds",
+        "prediction", "predictions", "_last_logits", "last_logits",
+        "_last_scores", "last_scores", "posterior", "_last_posterior",
+        "cosine", "cos_theta",
+    )
+    for name in attr_names:
+        candidate = getattr(module, name, None)
+        if torch.is_tensor(candidate) and candidate.dim() >= 2 and candidate.shape[0] == batch_size:
+            candidate_2d = _to_2d(candidate)
+            if num_targets is None or candidate_2d.shape[1] == num_targets:
+                return candidate_2d
+
+    for t in list(_iter_tensors(output)) + list(_iter_tensors(args)):
+        if t.dim() >= 2 and t.shape[0] == batch_size:
+            t2 = _to_2d(t)
+            if num_targets is None or t2.shape[1] == num_targets:
+                return t2
+
+    get_posterior = getattr(module, "get_posterior", None)
+    if callable(get_posterior):
+        try:
+            posterior = get_posterior()
+            if torch.is_tensor(posterior) and posterior.dim() >= 2 and posterior.shape[0] == batch_size:
+                posterior = _to_2d(posterior)
+                if num_targets is None or posterior.shape[1] == num_targets:
+                    return posterior
+        except Exception:
+            pass
+    return None
+
+
+def _find_per_sample_loss(module, args, output, batch_size, targets, logits):
+    loss = _find_vector(
+        module,
+        batch_size,
+        names=(
+            "weighted_per_sample_loss", "_weighted_per_sample_loss",
+            "per_sample_loss", "_per_sample_loss", "sample_loss", "sample_losses",
+            "loss_per_sample",
+            "losses", "_last_loss", "_last_losses",
+            "ce_loss", "ce_losses", "_last_ce_loss", "nll", "nll_loss",
+        ),
+    )
+    if loss is not None:
+        return loss
+
+    for t in _iter_tensors(output):
+        if _is_batch_vector(t, batch_size):
+            return t.reshape(batch_size, -1).mean(dim=1)
+
+    target_vec = _as_1d_long(targets)
+    if logits is not None and target_vec is not None and target_vec.numel() == batch_size:
+        try:
+            logits_f = logits.float()
+            if logits_f.min().item() >= 0 and torch.allclose(
+                logits_f.sum(dim=1),
+                torch.ones(batch_size, device=logits_f.device),
+                rtol=1e-3,
+                atol=1e-4,
+            ):
+                idx = target_vec.to(logits_f.device).view(-1, 1)
+                return -torch.log(torch.gather(logits_f.clamp_min(1e-12), 1, idx).squeeze(1))
+            return F.cross_entropy(logits_f, target_vec.to(logits.device), reduction="none")
+        except Exception:
+            return None
+    return None
+
+
+def _safe_call(obj, method_names, *args):
+    for name in method_names:
+        method = getattr(obj, name, None)
+        if method is None:
+            continue
+        try:
+            method(*args)
+            return True
+        except TypeError:
+            # Some trackers accept fewer arguments; trim from the right.
+            try:
+                sig = inspect.signature(method)
+                max_args = len([
+                    p for p in sig.parameters.values()
+                    if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    and p.default is p.empty
+                ])
+                method(*args[:max_args])
+                return True
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return False
 
 
 class _RecordingBatchSampler:
@@ -109,6 +258,14 @@ class _Instrumenter:
         self._idx_queue = deque()
         self._hooks = []
         self.real_ids = False
+        self._warned_missing_loss = False
+        self._warned_missing_pred = False
+        self._batches_seen = 0
+        self._loss_batches = 0
+        self._pred_batches = 0
+        self._weight_batches = 0
+        self._grad_batches = 0
+        self._heartbeat_interval = int(os.environ.get("CONTRIB_PRINT_EVERY", "200"))
 
     def resolve_ids(self, idxs):
         src = self.id_source
@@ -121,7 +278,6 @@ class _Instrumenter:
     def stash(self, ids, targets):
         self._stash = (ids, targets)
 
-    # ====================== Loss Pre Hook ======================
     def _loss_pre_hook(self, module, args):
         if not self.model.training or self._stash is None:
             return
@@ -143,66 +299,109 @@ class _Instrumenter:
                 al = F.cosine_similarity(g, g.sum(0, keepdim=True).expand_as(g), dim=1)
                 if len(ids) == gn.shape[0]:
                     self.tracker.update_grad(ids, gn.cpu().numpy(), al.cpu().numpy())
+                    self._grad_batches += 1
             finally:
                 if "h" in holder:
                     holder["h"].remove()
 
         holder["h"] = X.register_hook(_grad_cb)
 
-    # ====================== Loss Post Hook（已修复 NoneType） ======================
     def _loss_post_hook(self, module, args, output):
         if not self.model.training or self._stash is None:
             return
 
-        ids = list(self._stash[0])
+        ids = list(self._stash[0] or [])
         targets = self._stash[1]
-
-        # 优先适配 GMMPrototypeLoss
-        if hasattr(module, "per_sample_loss"):
-            per_sample_loss = getattr(module, "per_sample_loss", None)
-            if per_sample_loss is not None:
-                try:
-                    self.tracker.update_pred(ids, per_sample_loss.detach().cpu().numpy(), targets)
-                except Exception:
-                    pass
-
-            # 获取 weight / confidence（安全处理 None）
-            weight = None
-            for attr in ["_last_focal_weight", "weight", "confidence"]:
-                candidate = getattr(module, attr, None)
-                if candidate is not None:
-                    weight = candidate
-                    break
-
-            if weight is not None:
-                try:
-                    self.tracker.update_weight(ids, weight.detach().cpu().numpy())
-                except Exception:
-                    pass
+        if not ids:
             return
+        batch_size = len(ids)
 
-        # 通用 fallback
-        fw = getattr(module, "_last_focal_weight", None)
-        if fw is not None:
-            try:
-                self.tracker.update_weight(ids, fw.detach().cpu().numpy())
-            except Exception:
-                pass
+        logits = _find_logits(module, args, output, batch_size, self.num_targets)
+        per_sample_loss = _find_per_sample_loss(module, args, output, batch_size, targets, logits)
+        self._batches_seen += 1
+
+        if per_sample_loss is not None:
+            loss_np = _detach_numpy(per_sample_loss)
+            updated = _safe_call(
+                self.tracker,
+                ("update_loss", "update_losses", "update_sample_loss"),
+                ids,
+                loss_np,
+                targets,
+            )
+            if not updated and not self._warned_missing_loss:
+                print("[contrib] warning: tracker has no loss update method")
+                self._warned_missing_loss = True
+            elif updated:
+                self._loss_batches += 1
+        elif not self._warned_missing_loss:
+            print("[contrib] warning: cannot find per-sample loss; loss will stay NaN")
+            self._warned_missing_loss = True
+
+        if logits is not None:
+            pred_payload = _detach_numpy(logits)
+            updated = _safe_call(
+                self.tracker,
+                ("update_logits", "update_pred", "update_preds", "update_prediction", "update_predictions"),
+                ids,
+                pred_payload,
+                targets,
+            )
+            if not updated and not self._warned_missing_pred:
+                print("[contrib] warning: tracker has no prediction update method")
+                self._warned_missing_pred = True
+            elif updated:
+                self._pred_batches += 1
+        elif not self._warned_missing_pred:
+            print("[contrib] warning: cannot find logits/predictions; forget/final will not update")
+            self._warned_missing_pred = True
+
+        weight = _find_vector(
+            module,
+            batch_size,
+            names=(
+                "_last_focal_weight", "focal_weight", "sample_weight",
+                "sample_weights", "weight", "weights", "confidence",
+                "conf", "_last_confidence",
+            ),
+        )
+        if weight is not None:
+            _safe_call(
+                self.tracker,
+                ("update_weight", "update_weights", "update_confidence"),
+                ids,
+                _detach_numpy(weight),
+            )
+            self._weight_batches += 1
+
+        if self._should_print_progress():
+            print(
+                "[contrib] collecting: "
+                f"batches={self._batches_seen}, "
+                f"loss={self._loss_batches}, pred={self._pred_batches}, "
+                f"grad={self._grad_batches}, weight={self._weight_batches}, "
+                f"batch_size={batch_size}"
+            )
+
+    def _should_print_progress(self):
+        if self._batches_seen == 1:
+            return True
+        return self._heartbeat_interval > 0 and self._batches_seen % self._heartbeat_interval == 0
 
     def attach_model(self):
         lname, lmod = _find_loss_module(self.model)
         if lmod is None:
-            print("[contrib] 警告：未找到损失模块")
+            print("[contrib] warning: loss module not found")
             return
 
         self._hooks.append(lmod.register_forward_pre_hook(self._loss_pre_hook))
         self._hooks.append(lmod.register_forward_hook(self._loss_post_hook))
-        print(f"[contrib] 成功挂载到损失模块: {lname}")
+        print(f"[contrib] attached loss module: {lname} ({type(lmod).__name__})")
 
     def attach_real_ids(self, loader):
         dl = _get_dataloader_with_sampler(loader)
         if dl is None:
-            print("[contrib] 未能找到有效的 DataLoader，回退到特征哈希")
+            print("[contrib] warning: valid DataLoader not found; fallback to feature hashes")
             return False
 
         wrapped = _RecordingBatchSampler(dl.batch_sampler, self._idx_queue)
@@ -215,7 +414,7 @@ class _Instrumenter:
             dl.__dict__["_index_sampler"] = wrapped
 
         self.real_ids = True
-        print(f"[contrib] ✅ 已启用真实样本ID")
+        print("[contrib] real sample ids enabled")
         return True
 
     def finalize(self, out_csv=None):
@@ -226,7 +425,6 @@ class _Instrumenter:
         return SampleContributionTracker.summarize(self.save_dir, out_csv)
 
 
-# ====================== Loader Wrapper ======================
 class _LoaderWrapper:
     def __init__(self, loader, inst, start_epoch):
         self._loader = loader
@@ -258,9 +456,17 @@ class _LoaderWrapper:
         return getattr(self._loader, item)
 
 
-def instrument(model, bunch, num_targets, save_dir,
-               loader_attr="train_loader", start_epoch=0,
-               real_ids=True, id_source=None, egs_file=None):
+def instrument(
+    model,
+    bunch,
+    num_targets,
+    save_dir,
+    loader_attr="train_loader",
+    start_epoch=0,
+    real_ids=True,
+    id_source=None,
+    egs_file=None,
+):
     global _ACTIVE
     rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
     if "RANK" in os.environ:
@@ -270,19 +476,20 @@ def instrument(model, bunch, num_targets, save_dir,
     _ACTIVE = inst
     inst.attach_model()
 
-    # 支持多层嵌套查找 loader
     loader = None
-    for attr in [loader_attr, "train_loader", "train_dataloader", "loader", "dataloader"]:
+    real_loader_attr = loader_attr
+    for attr in (loader_attr, "train_loader", "train_dataloader", "loader", "dataloader"):
         loader = getattr(bunch, attr, None)
         if loader is not None:
+            real_loader_attr = attr
             break
 
     if loader is not None:
         if real_ids:
             inst.attach_real_ids(loader)
-        setattr(bunch, loader_attr, _LoaderWrapper(loader, inst, start_epoch))
-        print(f"[contrib] 已包装 loader: {loader_attr} -> {save_dir}")
+        setattr(bunch, real_loader_attr, _LoaderWrapper(loader, inst, start_epoch))
+        print(f"[contrib] wrapped loader: {real_loader_attr} -> {save_dir}")
     else:
-        print("[contrib] 警告：未能找到 loader，仅记录梯度信息")
+        print("[contrib] warning: loader not found; only gradient information may be recorded")
 
     return inst
