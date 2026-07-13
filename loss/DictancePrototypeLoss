@@ -1,6 +1,7 @@
 class DictancePrototypeLoss(TopVirtualLoss):
-    def init(self, input_dim, num_targets, temperature=0.1,
+    def __init__(self, input_dim, num_targets, temperature=0.1,
                  weight_start_epoch=2, gap_tau=0.2, min_weight=0.2):
+        super().__init__()
 
         assert num_targets == 2, "DictancePrototypeLoss only supports binary classification."
 
@@ -22,6 +23,12 @@ class DictancePrototypeLoss(TopVirtualLoss):
         self._last_losses = None
         self._weighted_per_sample_loss = None
         self.sample_weight = None
+
+    def step(self, epoch=None):
+        if epoch is None:
+            self.current_epoch += 1
+        else:
+            self.current_epoch = epoch
 
     def _use_weight(self):
         return self.current_epoch >= self.weight_start_epoch
@@ -75,9 +82,12 @@ class DictancePrototypeLoss(TopVirtualLoss):
 
             target_dist = distances.gather(1, targets.view(-1, 1)).squeeze(1)
 
+            # 二分类场景：另一个类别就是 1 - target
             other_targets = 1 - targets
             other_dist = distances.gather(1, other_targets.view(-1, 1)).squeeze(1)
 
+            # dist_gap > 0：更接近标签原型，标签更可信，权重大
+            # dist_gap < 0：更接近另一个原型，疑似错标，权重小
             dist_gap = other_dist - target_dist
 
             sample_weight = self.min_weight + \
