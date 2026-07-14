@@ -24,8 +24,6 @@ Example:
 No third-party Python packages are required.
 """
 
-from __future__ import annotations
-
 import argparse
 from array import array
 import datetime as dt
@@ -1666,6 +1664,7 @@ def html_template(data_file_name: str) -> str:
 
     const byId = new Map();
     const groups = new Map();
+    const groupRanges = new Map();
     const labelColors = ['#c2410c', '#7c3aed', '#be123c', '#0369a1', '#a16207', '#0f766e', '#b45309', '#4338ca'];
     const STATUS_DEFS = [
       ['unparseable', '无法识别编号', '#991b1b'],
@@ -1682,10 +1681,21 @@ def html_template(data_file_name: str) -> str:
     function buildIndexes() {{
       byId.clear();
       groups.clear();
+      groupRanges.clear();
       for (const rec of records) {{
         byId.set(rec.id, rec);
         if (!groups.has(rec.groupKey)) groups.set(rec.groupKey, new Map());
-        groups.get(rec.groupKey).set(Number(rec.segment), rec);
+        const segment = Number(rec.segment);
+        groups.get(rec.groupKey).set(segment, rec);
+        if (Number.isFinite(segment) && segment >= 0) {{
+          const range = groupRanges.get(rec.groupKey);
+          if (range) {{
+            if (segment < range.min) range.min = segment;
+            if (segment > range.max) range.max = segment;
+          }} else {{
+            groupRanges.set(rec.groupKey, {{ min: segment, max: segment }});
+          }}
+        }}
       }}
     }}
 
@@ -1697,11 +1707,6 @@ def html_template(data_file_name: str) -> str:
       statusFilter: document.getElementById('statusFilter'),
       targetLabelFilter: document.getElementById('targetLabelFilter'),
       sortMode: document.getElementById('sortMode'),
-      exportType: document.getElementById('exportType'),
-      exportCsvBtn: document.getElementById('exportCsvBtn'),
-      exportProgress: document.getElementById('exportProgress'),
-      exportProgressBar: document.getElementById('exportProgressBar'),
-      exportProgressText: document.getElementById('exportProgressText'),
       beforeInput: document.getElementById('beforeInput'),
       afterInput: document.getElementById('afterInput'),
       filterHint: document.getElementById('filterHint'),
@@ -1807,9 +1812,9 @@ def html_template(data_file_name: str) -> str:
         }};
       }}
       const group = groups.get(rec.groupKey) || new Map();
-      const segments = Array.from(group.keys()).filter(value => Number.isFinite(value)).sort((a, b) => a - b);
-      const groupMin = segments.length ? segments[0] : Number(rec.segment);
-      const groupMax = segments.length ? segments[segments.length - 1] : Number(rec.segment);
+      const range = groupRanges.get(rec.groupKey);
+      const groupMin = range ? range.min : Number(rec.segment);
+      const groupMax = range ? range.max : Number(rec.segment);
       const requestedStart = Number(rec.segment) - before;
       const requestedEnd = Number(rec.segment) + after;
       const checkStart = Math.max(requestedStart, groupMin);
@@ -2665,9 +2670,9 @@ def html_template(data_file_name: str) -> str:
 
     function makeWindow(target, before, after) {{
       const group = groups.get(target.groupKey) || new Map();
-      const segments = Array.from(group.keys()).filter(value => Number.isFinite(value)).sort((a, b) => a - b);
-      const groupMin = segments.length ? segments[0] : Number(target.segment);
-      const groupMax = segments.length ? segments[segments.length - 1] : Number(target.segment);
+      const range = groupRanges.get(target.groupKey);
+      const groupMin = range ? range.min : Number(target.segment);
+      const groupMax = range ? range.max : Number(target.segment);
       const start = Math.max(Number(target.segment) - before, groupMin);
       const end = Math.min(Number(target.segment) + after, groupMax);
       const rows = [];
