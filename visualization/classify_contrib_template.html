@@ -11,7 +11,7 @@
 .left{display:flex;min-width:0;flex-direction:column;overflow:hidden;background:var(--surf);border-right:1px solid var(--bdr)}.controls{padding:10px 12px;border-bottom:1px solid var(--bdr);display:grid;gap:7px;background:var(--surf2)}.search-row,.filter-row{display:flex;gap:6px}.search{flex:1;padding:7px 9px;border:1px solid var(--bdr2);border-radius:var(--radius);font:11px var(--mono);outline:none}.search:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(37,99,235,.12)}select{min-width:120px;padding:6px 8px;border:1px solid var(--bdr2);border-radius:var(--radius);background:var(--surf);font:11px var(--mono);outline:none}.export{margin-left:auto;padding:6px 12px;border:0;border-radius:var(--radius);background:var(--ac);color:#fff;font:500 10px var(--mono);cursor:pointer}.export:hover{background:var(--ac2)}
 .list-head,.row{display:grid;grid-template-columns:38px minmax(170px,1fr) 132px 64px 64px 58px;gap:5px;align-items:center;padding:0 10px}.list-head{height:29px;border-bottom:2px solid var(--bdr);background:var(--surf3);color:var(--mt);font:9px var(--mono);text-transform:uppercase}.list{flex:1;overflow:auto;position:relative}.inner{position:relative}.row{position:absolute;width:100%;height:36px;border-bottom:1px solid var(--bdr);cursor:pointer}.row:hover{background:var(--surf2)}.row.sel{background:var(--acbg);border-left:3px solid var(--ac);padding-left:7px}.rank,.num{font:10px var(--mono);color:var(--mt);text-align:right}.uid{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:10px var(--mono)}.badge{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;border:1px solid;border-radius:4px;padding:2px 6px;white-space:nowrap;font:9px var(--mono)}.suspicious_noisy{color:var(--red);border-color:#fca5a5;background:#fef2f2}.boundary_ambiguous{color:var(--orange);border-color:#fdba74;background:#fff7ed}.hard_learnable{color:var(--ac);border-color:#93c5fd;background:#eff6ff}.clean_easy{color:var(--green);border-color:#86efac;background:#f0fdf4}.influential{color:var(--purple);border-color:#c4b5fd;background:#f5f3ff}.unknown{color:var(--mt);border-color:var(--bdr2);background:var(--surf2)}.pagination{display:flex;align-items:center;gap:8px;padding:6px 12px;border-top:1px solid var(--bdr);background:var(--surf2);font:10px var(--mono);color:var(--mt)}.pagination span{flex:1;text-align:center}.pagination button{padding:3px 10px;border:1px solid var(--bdr2);border-radius:4px;background:var(--surf);cursor:pointer}.pagination button:disabled{opacity:.35}
 .right{display:flex;min-width:0;flex-direction:column;overflow:hidden}.detail-head{padding:10px 20px;border-bottom:1px solid var(--bdr);background:var(--surf);box-shadow:var(--shadow)}.sample-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:600 12px var(--mono)}.reason{margin-top:5px;color:var(--mt);font-size:11px}.model-stats{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.stat{min-width:138px;padding:6px 9px;border:1px solid var(--bdr);border-radius:var(--radius);background:var(--surf)}.stat-name{font:600 9px var(--mono);text-transform:uppercase}.stat-values{display:flex;gap:10px;margin-top:4px}.stat-item label{display:block;color:var(--mt);font:8px var(--mono)}.stat-item b{font:600 12px var(--mono)}.meta{display:none;gap:5px 16px;flex-wrap:wrap;padding:7px 20px;border-bottom:1px solid var(--bdr);background:var(--surf2);font:10px var(--mono)}.meta.show{display:flex}.meta b{color:var(--mt2);font-weight:400;text-transform:uppercase}.path{flex-basis:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--mt)}
-.tabs{display:flex;padding:0 16px;border-bottom:1px solid var(--bdr);background:var(--surf2)}.tab{padding:8px 14px;border-bottom:2px solid transparent;color:var(--mt);font:11px var(--mono);cursor:pointer}.tab.active{border-bottom-color:var(--ac);color:var(--ac);font-weight:600}.chart-area{position:relative;flex:1;min-height:0;padding:14px 18px 10px}.placeholder,.error{height:100%;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--mt2);font:11px var(--mono)}.error{padding:20px;color:var(--red);white-space:pre-wrap}.chart-panel{display:none;height:100%;flex-direction:column}.chart-panel.active{display:flex}.chart-title{padding-bottom:7px;color:var(--mt);font:9px var(--mono);text-transform:uppercase}.legend{display:flex;gap:14px;flex-wrap:wrap;padding-bottom:8px;font:10px var(--mono)}.legend span{display:inline-flex;align-items:center;gap:5px}.line-key{width:16px;height:3px;border-radius:2px}.dash-key{width:16px;border-top:2px dashed}.canvas-wrap{position:relative;flex:1;min-height:220px;background:var(--surf)}canvas{position:absolute;inset:0;width:100%;height:100%}
+.tabs{display:flex;gap:4px;padding:7px 16px;border-bottom:1px solid var(--bdr);background:var(--surf2)}.tab{appearance:none;padding:6px 13px;border:1px solid transparent;border-radius:5px;background:transparent;color:var(--mt);font:11px var(--mono);cursor:pointer;transition:color .15s,border-color .15s,background .15s,box-shadow .15s}.tab:hover{border-color:var(--bdr2);background:rgba(255,255,255,.65);color:var(--tx)}.tab.active{border-color:var(--bdr2);background:var(--surf);color:var(--ac);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.06)}.tab:focus-visible{outline:2px solid rgba(37,99,235,.3);outline-offset:1px}.chart-area{position:relative;flex:1;min-height:0;padding:14px 18px 10px}.placeholder,.error{height:100%;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--mt2);font:11px var(--mono)}.error{padding:20px;color:var(--red);white-space:pre-wrap}.chart-panel{display:none;height:100%;flex-direction:column}.chart-panel.active{display:flex}.chart-title{padding-bottom:7px;color:var(--mt);font:9px var(--mono);text-transform:uppercase}.legend{display:flex;gap:14px;flex-wrap:wrap;padding-bottom:8px;font:10px var(--mono)}.legend span{display:inline-flex;align-items:center;gap:5px}.line-key{width:16px;height:3px;border-radius:2px}.canvas-wrap{position:relative;flex:1;min-height:220px;background:var(--surf)}canvas{position:absolute;inset:0;width:100%;height:100%}
 @media(max-width:1050px){.layout{grid-template-columns:480px 1fr}.list-head,.row{grid-template-columns:32px minmax(120px,1fr) 110px 52px 52px 45px}}@media(max-width:760px){html,body{overflow:auto}.layout{display:block;height:auto}.header{height:auto;min-height:52px}.left{height:58vh;border-right:0}.right{height:70vh}.list-head,.row{grid-template-columns:30px minmax(110px,1fr) 106px 48px}.hide-sm{display:none}}
 </style>
 </head>
@@ -20,7 +20,7 @@
   <header class="header"><span class="htitle">CONTRIB SAMPLE CLASSIFIER</span><span class="hmeta" id="hmeta">正在加载...</span><div class="hbadges" id="hbadges"><span class="status" id="status">LOADING</span></div></header>
   <section class="left">
     <div class="controls">
-      <div class="search-row"><input id="search" class="search" placeholder="搜索样本名、标签或路径" autocomplete="off"><button class="export" onclick="exportVisibleCSV()">CSV</button></div>
+      <div class="search-row"><input id="search" class="search" placeholder="搜索样本名或分类" autocomplete="off"><button class="export" onclick="exportVisibleCSV()">CSV</button></div>
       <div class="filter-row"><select id="category"><option value="all">全部分类</option></select><select id="sort"><option value="score">按可疑分排序</option><option value="wrong">按错误率排序</option><option value="loss">按高 loss 比例排序</option><option value="name">按样本名排序</option></select></div>
     </div>
     <div class="list-head"><span>#</span><span>sample</span><span>category</span><span style="text-align:right">score</span><span style="text-align:right">wrong</span><span class="hide-sm" style="text-align:right">models</span></div>
@@ -30,9 +30,15 @@
   <section class="right">
     <div class="detail-head"><div class="sample-title" id="sample-title">- 点击左侧选择一个样本 -</div><div class="reason" id="reason"></div><div class="model-stats" id="model-stats"></div></div>
     <div class="meta" id="meta"></div>
-    <div class="tabs"><button class="tab active" data-tab="lw">loss + weight</button><button class="tab" data-tab="grad">grad_norm</button><button class="tab" data-tab="align">align</button></div>
+    <div class="tabs" role="tablist" aria-label="训练指标">
+      <button class="tab active" data-tab="loss" role="tab" aria-selected="true">loss</button>
+      <button class="tab" data-tab="weight" role="tab" aria-selected="false">weight</button>
+      <button class="tab" data-tab="grad" role="tab" aria-selected="false">grad_norm</button>
+      <button class="tab" data-tab="align" role="tab" aria-selected="false">align</button>
+    </div>
     <div class="chart-area" id="chart-area"><div class="placeholder" id="placeholder">选择样本后显示各模型的 epoch 曲线</div>
-      <div class="chart-panel" id="panel-lw"><div class="chart-title">loss 与 weight 同坐标系（实线 loss，虚线 weight）</div><div class="legend" id="legend-lw"></div><div class="canvas-wrap"><canvas id="chart-lw"></canvas></div></div>
+      <div class="chart-panel" id="panel-loss"><div class="chart-title">loss 轨迹（各模型叠加）</div><div class="legend" id="legend-loss"></div><div class="canvas-wrap"><canvas id="chart-loss"></canvas></div></div>
+      <div class="chart-panel" id="panel-weight"><div class="chart-title">weight 轨迹（仅显示采集到 weight 的模型）</div><div class="legend" id="legend-weight"></div><div class="canvas-wrap"><canvas id="chart-weight"></canvas></div></div>
       <div class="chart-panel" id="panel-grad"><div class="chart-title">grad_norm 轨迹</div><div class="legend" id="legend-grad"></div><div class="canvas-wrap"><canvas id="chart-grad"></canvas></div></div>
       <div class="chart-panel" id="panel-align"><div class="chart-title">align 轨迹</div><div class="legend" id="legend-align"></div><div class="canvas-wrap"><canvas id="chart-align"></canvas></div></div>
     </div>
@@ -41,7 +47,7 @@
 <script>
 const SUMMARY_URL=__SUMMARY_URL__;
 const PAGE=100,ROW_H=36;
-let DATA={rows:[],models:[],categories:{}},filtered=[],pageStart=0,selected='',activeTab='lw',currentDetails=null;
+let DATA={rows:[],models:[],categories:{}},filtered=[],pageStart=0,selected='',activeTab='loss',currentDetails=null;
 const shardCache=new Map();
 const $=id=>document.getElementById(id);
 const finite=x=>typeof x==='number'&&Number.isFinite(x);
@@ -66,18 +72,19 @@ async function loadDetails(row){
   const id=row.shard;if(shardCache.has(id))return shardCache.get(id)[row.sample_name]||{};
   const base=SUMMARY_URL.replace(/[^/]+$/,'');const url=base+`detail_shard_${String(id).padStart(4,'0')}.json`;
   const res=await fetch(url,{cache:'no-store'});if(!res.ok)throw new Error(`${url}\nHTTP ${res.status}`);
-  const shard=await res.json();shardCache.set(id,shard);return shard[row.sample_name]||{};
+  const shard=await res.json();shardCache.set(id,shard);return shard[row.sample_name]||{summary:{},models:{}};
 }
 async function selectSample(row){
   selected=row.sample_name;renderPage();$('sample-title').textContent=row.sample_name;$('reason').textContent='正在加载 epoch 明细...';$('model-stats').innerHTML='';$('meta').classList.remove('show');
-  try{currentDetails=await loadDetails(row);}catch(e){$('reason').textContent='明细加载失败';$('chart-area').innerHTML=`<div class="error">${esc(e.message)}\n请确认 HTML 和数据目录一起复制，并通过 http.server 打开。</div>`;return}
+  let entry;
+  try{entry=await loadDetails(row);row={...row,...(entry.summary||{})};currentDetails=entry.models||{};}catch(e){$('reason').textContent='明细加载失败';$('chart-area').innerHTML=`<div class="error">${esc(e.message)}\n请确认 HTML 和数据目录一起复制，并通过 http.server 打开。</div>`;return}
   $('reason').innerHTML=`<span class="badge ${row.category}">${esc(row.category_label)}</span> &nbsp;${esc(row.reason)}`;
   $('model-stats').innerHTML=DATA.models.map(m=>{const s=currentDetails[m.name];return `<div class="stat" style="border-color:${m.color}66"><div class="stat-name" style="color:${m.color}">${esc(m.name)}</div>${s?`<div class="stat-values"><span class="stat-item"><label>loss</label><b>${fmt(s.mean_loss)}</b></span><span class="stat-item"><label>weight</label><b>${fmt(s.mean_weight)}</b></span><span class="stat-item"><label>correct</label><b>${s.final_correct}</b></span><span class="stat-item"><label>egs</label><b>${s.n_egs}</b></span></div>`:'<div class="reason">未覆盖</div>'}</div>`}).join('');
   const meta=[['label',row.json_label],['path',row.file_path]].filter(x=>x[1]);if(meta.length){$('meta').innerHTML=meta.map(([k,v])=>`<span class="${k==='path'?'path':''}"><b>${k}</b> ${esc(v)}</span>`).join('');$('meta').classList.add('show')}
   $('placeholder').style.display='none';document.querySelectorAll('.chart-panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+activeTab));drawActive();
 }
 function seriesFor(tab){
-  const out=[];DATA.models.forEach(m=>{const s=currentDetails&&currentDetails[m.name];if(!s)return;if(tab==='lw'){out.push({label:m.name+' loss',data:s.loss_traj,color:m.color,dash:false});if((s.weight_traj||[]).some(finite))out.push({label:m.name+' weight',data:s.weight_traj,color:m.color,dash:true})}else{const a=tab==='grad'?s.grad_traj:s.align_traj;if((a||[]).some(finite))out.push({label:m.name,data:a,color:m.color,dash:false})}});return out;
+  const out=[];DATA.models.forEach(m=>{const s=currentDetails&&currentDetails[m.name];if(!s)return;let a;if(tab==='loss')a=s.loss_traj;else if(tab==='weight')a=s.weight_traj;else if(tab==='grad')a=s.grad_traj;else a=s.align_traj;if((a||[]).some(finite))out.push({label:m.name,data:a,color:m.color,dash:false})});return out;
 }
 function drawActive(){if(!currentDetails)return;drawChart($('chart-'+activeTab),seriesFor(activeTab),$('legend-'+activeTab),activeTab)}
 function drawChart(canvas,series,legend,tab){
@@ -91,14 +98,28 @@ function drawChart(canvas,series,legend,tab){
   series.forEach(s=>{c.strokeStyle=s.color;c.lineWidth=s.dash?1.7:2.2;c.setLineDash(s.dash?[6,4]:[]);c.beginPath();let open=false;(s.data||[]).forEach((v,i)=>{if(!finite(v)){open=false;return}const x=xp(i),y=yp(v);if(!open){c.moveTo(x,y);open=true}else c.lineTo(x,y)});c.stroke()});c.setLineDash([]);
 }
 function exportVisibleCSV(){const fields=['sample_name','category','reason','mean_suspicious_score','wrong_rate','high_loss_rate','conflict_rate','models_present'];const lines=[fields.join(',')].concat(filtered.map(r=>fields.map(k=>'"'+String(r[k]??'').replace(/"/g,'""')+'"').join(',')));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}));a.download='contrib_visible.csv';a.click();URL.revokeObjectURL(a.href)}
+function parseIndex(buf){
+  const dv=new DataView(buf),magic=new TextDecoder().decode(new Uint8Array(buf,0,8));if(magic!=='CCLSBIN1')throw new Error('索引文件格式错误: '+magic);
+  const version=dv.getUint32(8,true),n=dv.getUint32(12,true),namesBytes=dv.getUint32(16,true);if(version!==1)throw new Error('不支持的索引版本: '+version);
+  let o=24;const align=()=>{o=(o+3)&~3};
+  const categories=new Uint8Array(buf,o,n);o+=n;align();
+  const present=new Uint16Array(buf,o,n);o+=n*2;align();
+  const shards=new Uint32Array(buf,o,n);o+=n*4;align();
+  const takeF32=()=>{const a=new Float32Array(buf,o,n);o+=n*4;align();return a};
+  const scores=takeF32(),wrong=takeF32(),loss=takeF32(),conflict=takeF32(),coverage=takeF32();
+  const names=new TextDecoder('utf-8').decode(new Uint8Array(buf,o,namesBytes)).split('\n');
+  if(names.length!==n)throw new Error(`索引样本名数量不匹配: ${names.length}/${n}`);
+  return Array.from({length:n},(_,i)=>({sample_name:names[i],category:DATA.category_order[categories[i]]||'unknown',category_label:DATA.categories[DATA.category_order[categories[i]]]||'采集不足',models_present:present[i],shard:shards[i],mean_suspicious_score:scores[i],wrong_rate:wrong[i],high_loss_rate:loss[i],conflict_rate:conflict[i],model_coverage:coverage[i]}));
+}
 async function boot(){
   try{const res=await fetch(SUMMARY_URL,{cache:'no-store'});if(!res.ok)throw new Error(`${SUMMARY_URL}\nHTTP ${res.status}`);DATA=await res.json();
+    $('hmeta').textContent='正在加载二进制样本索引...';const base=SUMMARY_URL.replace(/[^/]+$/,'');const indexUrl=base+DATA.index_file;const ir=await fetch(indexUrl,{cache:'no-store'});if(!ir.ok)throw new Error(`${indexUrl}\nHTTP ${ir.status}`);DATA.rows=parseIndex(await ir.arrayBuffer());
     $('hmeta').textContent=`${DATA.rows.length.toLocaleString()} samples · ${DATA.models.length} 模型`;$('hbadges').innerHTML=DATA.models.map(m=>`<span class="model-pill"><i class="dot" style="background:${m.color}"></i>${esc(m.name)}</span>`).join('');
     $('category').innerHTML='<option value="all">全部分类</option>'+Object.entries(DATA.categories).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join('');rebuild();
     if(filtered.length)await selectSample(filtered[0]);
   }catch(e){$('status').textContent='LOAD FAILED';$('hmeta').textContent='数据加载失败';$('chart-area').innerHTML=`<div class="error">${esc(e.message)}\n\n请在输出目录执行：python -m http.server 8000\n然后访问 http://localhost:8000/你的文件.html</div>`;console.error(e)}
 }
-$('search').addEventListener('input',()=>{clearTimeout(window._st);window._st=setTimeout(rebuild,160)});$('category').onchange=rebuild;$('sort').onchange=rebuild;$('prev').onclick=()=>{pageStart=Math.max(0,pageStart-PAGE);renderPage()};$('next').onclick=()=>{pageStart+=PAGE;renderPage()};document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{activeTab=t.dataset.tab;document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===t));document.querySelectorAll('.chart-panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+activeTab));requestAnimationFrame(drawActive)});window.addEventListener('resize',()=>requestAnimationFrame(drawActive));
+$('search').addEventListener('input',()=>{clearTimeout(window._st);window._st=setTimeout(rebuild,160)});$('category').onchange=rebuild;$('sort').onchange=rebuild;$('prev').onclick=()=>{pageStart=Math.max(0,pageStart-PAGE);renderPage()};$('next').onclick=()=>{pageStart+=PAGE;renderPage()};document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{activeTab=t.dataset.tab;document.querySelectorAll('.tab').forEach(x=>{const on=x===t;x.classList.toggle('active',on);x.setAttribute('aria-selected',String(on))});document.querySelectorAll('.chart-panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+activeTab));requestAnimationFrame(drawActive)});window.addEventListener('resize',()=>requestAnimationFrame(drawActive));
 boot();
 </script>
 </body>
