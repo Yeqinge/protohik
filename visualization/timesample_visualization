@@ -606,92 +606,149 @@ def export_status_json(items: List[Dict[str, Any]], out_path: Path, source_json:
 
 
 def export_summary_html(items: List[Dict[str, Any]], out_path: Path, source_json: Path, before: int, after: int) -> None:
-    counts = status_counts(items)
-    max_count = max([1] + list(counts.values()))
-    max_missing = max([1] + [int(item["status"]["missing_count"]) for item in items])
-    max_mismatch = max([1] + [int(item["status"]["mismatch_count"]) for item in items])
-    colors = {
-        "unparseable": "#991b1b",
-        "missing_mismatch": "#dc2626",
-        "present_mismatch": "#ef4444",
-        "missing_consistent": "#d97706",
-        "present_consistent": "#15803d",
-    }
-
-    bars = []
-    for key, label in STATUS_DEFS:
-        count = counts.get(key, 0)
-        width = max(2.0, count / max_count * 100)
-        bars.append(
-            f'<div class="hist-row"><div class="hist-label">{html.escape(label)}</div>'
-            f'<div class="hist-track"><div class="hist-bar" style="width:{width:.2f}%;background:{colors[key]}"></div></div>'
-            f'<div class="hist-value">{count:,}</div></div>'
-        )
-
-    points = []
-    for item in items[:5000]:
-        status = item["status"]
-        x = 54 + int(status["missing_count"]) / max_missing * (760 - 54 * 1.4)
-        y = 430 - 54 - int(status["mismatch_count"]) / max_mismatch * (430 - 54 * 1.35)
-        title = f'{item["browser"].get("id", "")} | {status["label"]} | missing={status["missing_count"]} mismatch={status["mismatch_count"]}'
-        points.append(
-            f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.2" fill="{colors.get(status["key"], "#64748b")}" fill-opacity="0.42">'
-            f'<title>{html.escape(title)}</title></circle>'
-        )
-
-    rows = []
-    for item in items[:800]:
+    rows_data = []
+    datasets = set()
+    for item in items:
         rec = item["browser"]
         status = item["status"]
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(value_text(rec.get('id', '')))}</td>"
-            f"<td>{html.escape(value_text(rec.get('groupKey', '')))}</td>"
-            f"<td>{html.escape(value_text(rec.get('segment', '')))}</td>"
-            f"<td>{html.escape(value_text(rec.get('label', '')))}</td>"
-            f"<td>{html.escape(value_text(status['label']))}</td>"
-            f"<td>{status['missing_count']}</td>"
-            f"<td>{status['mismatch_count']}</td>"
-            f"<td>{status['weighted_inconsistency']:.6f}</td>"
-            "</tr>"
+        dataset = value_text(rec.get("trainOrTest", "")).strip() or "未标注"
+        datasets.add(dataset)
+        rows_data.append(
+            {
+                "id": value_text(rec.get("id", "")),
+                "group": value_text(rec.get("groupKey", "")),
+                "segment": rec.get("segment", ""),
+                "label": value_text(rec.get("label", "")),
+                "dataset": dataset,
+                "statusKey": status["key"],
+                "statusLabel": status["label"],
+                "missing": int(status["missing_count"]),
+                "mismatch": int(status["mismatch_count"]),
+                "weighted": float(status["weighted_inconsistency"]),
+                "filePath": value_text(rec.get("filePath", "")),
+            }
         )
-
-    svg = f"""
-      <svg viewBox="0 0 760 430" role="img" aria-label="missing mismatch scatter">
-        <rect width="760" height="430" fill="#fff"/>
-        <line x1="54" y1="376" x2="738" y2="376" stroke="#94a3b8"/>
-        <line x1="54" y1="24" x2="54" y2="376" stroke="#94a3b8"/>
-        {''.join(points)}
-        <text x="380" y="416" text-anchor="middle" fill="#475569" font-size="13">missing count</text>
-        <text x="18" y="215" text-anchor="middle" transform="rotate(-90 18 215)" fill="#475569" font-size="13">mismatch count</text>
-      </svg>
-    """
+    data_json = json.dumps(rows_data, ensure_ascii=False, separators=(",", ":"))
+    status_json = json.dumps(
+        [{"key": key, "label": label} for key, label in STATUS_DEFS],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    dataset_options = "".join(
+        f'<option value="{html.escape(name, quote=True)}">{html.escape(name)}</option>'
+        for name in sorted(datasets)
+    )
     doc = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>样本时间维度状态汇总</title>
 <style>
-body{{margin:0;background:#f6f8fb;color:#111827;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;line-height:1.5}}
-.page{{max-width:1320px;margin:0 auto;padding:24px}} h1{{font-size:26px;margin:0 0 8px}} h2{{font-size:18px;margin:0 0 12px}}
-.meta{{color:#64748b;font-size:13px;overflow-wrap:anywhere}} .summary{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:16px 0}}
-.metric,.panel{{background:#fff;border:1px solid #d7dee8;border-radius:8px;box-shadow:0 10px 28px rgba(15,23,42,.05)}} .metric{{padding:12px 14px;min-height:82px}}
-.metric-label{{color:#64748b;font-size:12px;margin-bottom:5px}} .metric-value{{font-size:21px;font-weight:750}}
+body{{margin:0;background:linear-gradient(180deg,#eef5ff 0,#f6f8fb 330px);color:#111827;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;line-height:1.5}}
+.page{{max-width:1380px;margin:0 auto;padding:24px}} header{{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:16px}}
+h1{{font-size:26px;margin:0 0 8px;letter-spacing:0}} h2{{font-size:18px;margin:0 0 12px;letter-spacing:0}} .meta{{color:#64748b;font-size:13px;overflow-wrap:anywhere}}
+.toolbar{{display:grid;grid-template-columns:minmax(180px,260px) minmax(220px,320px) 1fr;gap:12px;align-items:end;margin:14px 0 16px;padding:14px;background:#fff;border:1px solid #d7dee8;border-radius:8px;box-shadow:0 10px 28px rgba(15,23,42,.05)}}
+label{{display:block;color:#334155;font-size:13px;font-weight:700;margin-bottom:6px}} select{{width:100%;min-height:38px;border:1px solid #cbd5e1;border-radius:7px;background:#fff;color:#111827;padding:7px 10px;font:inherit;font-size:13px}}
+.summary{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:16px 0}} .metric,.panel{{background:#fff;border:1px solid #d7dee8;border-radius:8px;box-shadow:0 10px 28px rgba(15,23,42,.05)}} .metric{{padding:12px 14px;min-height:82px}}
+.metric-label{{color:#64748b;font-size:12px;margin-bottom:5px}} .metric-value{{font-size:21px;font-weight:750;overflow-wrap:anywhere}}
 .grid{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(360px,.65fr);gap:14px}} .panel{{padding:16px}} .status-hist{{display:grid;gap:8px}}
-.hist-row{{display:grid;grid-template-columns:150px minmax(0,1fr) 80px;gap:10px;align-items:center;font-size:12px}} .hist-label{{font-weight:800;color:#334155}}
+.hist-row{{display:grid;grid-template-columns:170px minmax(0,1fr) 80px;gap:10px;align-items:center;font-size:12px}} .hist-label{{font-weight:800;color:#334155}}
 .hist-track{{height:12px;border-radius:999px;background:#e5e7eb;overflow:hidden}} .hist-bar{{height:100%;border-radius:inherit}} .hist-value{{text-align:right;color:#64748b;font-family:ui-monospace,Consolas,monospace}}
-table{{width:100%;border-collapse:collapse;background:#fff}} th,td{{border-bottom:1px solid #d7dee8;padding:8px 10px;text-align:left;font-size:13px;white-space:nowrap}} th{{background:#eef2f7;color:#334155}}
-.table-wrap{{max-height:520px;overflow:auto;border:1px solid #d7dee8;border-radius:8px}} @media(max-width:980px){{.summary,.grid{{grid-template-columns:1fr}}}}
+.matrix{{display:grid;grid-template-columns:120px repeat(2,minmax(0,1fr));gap:10px;align-items:stretch}} .matrix-head{{display:flex;align-items:center;justify-content:center;color:#475569;font-size:12px;font-weight:800;background:#f8fafc;border:1px solid #d7dee8;border-radius:8px;min-height:44px;text-align:center}}
+.matrix-axis{{writing-mode:vertical-rl;transform:rotate(180deg);letter-spacing:0;color:#475569}} .matrix-cell{{border:1px solid #d7dee8;border-left:6px solid #64748b;border-radius:8px;background:#fff;padding:13px;min-height:112px;display:grid;align-content:space-between}}
+.matrix-cell strong{{display:block;font-size:24px;line-height:1.1}} .matrix-cell span{{color:#64748b;font-size:12px}} .matrix-cell small{{display:block;margin-top:8px;color:#334155;font-weight:800}} .matrix-extra{{margin-top:10px;border:1px solid #d7dee8;border-left:6px solid #991b1b;border-radius:8px;background:#fff;padding:12px 13px;display:flex;justify-content:space-between;gap:12px;align-items:center}}
+table{{width:100%;border-collapse:collapse;background:#fff}} th,td{{border-bottom:1px solid #d7dee8;padding:8px 10px;text-align:left;font-size:13px;white-space:nowrap}} th{{position:sticky;top:0;background:#eef2f7;color:#334155;z-index:1}}
+.table-wrap{{max-height:520px;overflow:auto;border:1px solid #d7dee8;border-radius:8px}} .muted{{color:#64748b;font-size:12px}} @media(max-width:980px){{header{{display:block}}.toolbar,.summary,.grid{{grid-template-columns:1fr}}}}
 </style></head><body><main class="page">
 <header><h1>样本时间维度状态汇总</h1><div class="meta">源 JSON: {html.escape(str(source_json))}<br>生成时间: {dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}<br>窗口: -{before} / +{after}</div></header>
-<div class="summary">
-<div class="metric"><div class="metric-label">样本数</div><div class="metric-value">{len(items):,}</div></div>
-<div class="metric"><div class="metric-label">有缺失</div><div class="metric-value">{counts.get("missing_mismatch",0)+counts.get("missing_consistent",0):,}</div></div>
-<div class="metric"><div class="metric-label">有不一致</div><div class="metric-value">{counts.get("missing_mismatch",0)+counts.get("present_mismatch",0):,}</div></div>
-<div class="metric"><div class="metric-label">无缺失无不一致</div><div class="metric-value">{counts.get("present_consistent",0):,}</div></div>
-<div class="metric"><div class="metric-label">无法识别</div><div class="metric-value">{counts.get("unparseable",0):,}</div></div>
+<div class="toolbar">
+  <div><label for="datasetFilter">数据集</label><select id="datasetFilter"><option value="all">全部数据集</option>{dataset_options}</select></div>
+  <div><label for="statusFilter">状态</label><select id="statusFilter"><option value="all">全部状态</option><option value="has_missing">有缺失</option><option value="has_mismatch">有不一致</option><option value="all_present">无缺失</option></select></div>
+  <div class="muted" id="filterNote"></div>
 </div>
-<div class="grid"><section class="panel"><h2>缺失/不一致散点分布</h2>{svg}</section><section class="panel"><h2>状态分类统计</h2><div class="status-hist">{''.join(bars)}</div></section></div>
-<section class="panel" style="margin-top:14px"><h2>样本明细预览</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>group</th><th>segment</th><th>label</th><th>状态</th><th>缺失</th><th>不一致</th><th>加权不一致</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>
+<div class="summary" id="summary"></div>
+<div class="grid"><section class="panel"><h2>缺失/不一致状态矩阵</h2><div id="matrix"></div></section><section class="panel"><h2>状态分类统计</h2><div class="status-hist" id="bars"></div></section></div>
+<section class="panel" style="margin-top:14px"><h2>样本明细预览</h2><div class="muted" id="tableNote"></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>数据集</th><th>group</th><th>segment</th><th>label</th><th>状态</th><th>缺失</th><th>不一致</th><th>加权不一致</th></tr></thead><tbody id="rows"></tbody></table></div></section>
 </main></body></html>"""
+    script = f"""
+<script>
+const DATA = {data_json};
+const STATUS_DEFS = {status_json};
+const COLORS = {{unparseable:'#991b1b',missing_mismatch:'#dc2626',present_mismatch:'#ef4444',missing_consistent:'#d97706',present_consistent:'#15803d'}};
+const statusSelect = document.getElementById('statusFilter');
+for (const st of STATUS_DEFS) {{
+  const opt = document.createElement('option');
+  opt.value = st.key;
+  opt.textContent = st.label;
+  statusSelect.appendChild(opt);
+}}
+function esc(v) {{
+  return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}}
+function matchesStatus(row, key) {{
+  if (key === 'all') return true;
+  if (key === 'has_missing') return row.missing > 0;
+  if (key === 'has_mismatch') return row.mismatch > 0;
+  if (key === 'all_present') return row.statusKey !== 'unparseable' && row.missing === 0;
+  return row.statusKey === key;
+}}
+function filtered() {{
+  const ds = document.getElementById('datasetFilter').value;
+  const st = document.getElementById('statusFilter').value;
+  return DATA.filter(row => (ds === 'all' || row.dataset === ds) && matchesStatus(row, st));
+}}
+function counts(items) {{
+  const out = Object.fromEntries(STATUS_DEFS.map(st => [st.key, 0]));
+  for (const row of items) out[row.statusKey] = (out[row.statusKey] || 0) + 1;
+  return out;
+}}
+function metric(label, value) {{
+  return `<div class="metric"><div class="metric-label">${{esc(label)}}</div><div class="metric-value">${{esc(value)}}</div></div>`;
+}}
+function render() {{
+  const items = filtered();
+  const c = counts(items);
+  const miss = (c.missing_mismatch || 0) + (c.missing_consistent || 0);
+  const mismatch = (c.missing_mismatch || 0) + (c.present_mismatch || 0);
+  document.getElementById('summary').innerHTML = [
+    metric('样本数', items.length.toLocaleString()),
+    metric('有缺失', miss.toLocaleString()),
+    metric('有不一致', mismatch.toLocaleString()),
+    metric('无缺失无不一致', (c.present_consistent || 0).toLocaleString()),
+    metric('无法识别', (c.unparseable || 0).toLocaleString()),
+  ].join('');
+  document.getElementById('filterNote').textContent = `当前筛选：${{items.length.toLocaleString()}} / ${{DATA.length.toLocaleString()}} 条`;
+  const maxCount = Math.max(1, ...Object.values(c));
+  document.getElementById('bars').innerHTML = STATUS_DEFS.map(st => {{
+    const count = c[st.key] || 0;
+    const width = Math.max(2, count / maxCount * 100);
+    return `<div class="hist-row"><div class="hist-label">${{esc(st.label)}}</div><div class="hist-track"><div class="hist-bar" style="width:${{width}}%;background:${{COLORS[st.key]}}"></div></div><div class="hist-value">${{count.toLocaleString()}}</div></div>`;
+  }}).join('');
+  function cell(key, title, note) {{
+    const count = c[key] || 0;
+    const pct = items.length ? (count / items.length * 100).toFixed(1) + '%' : '0.0%';
+    return `<div class="matrix-cell" style="border-left-color:${{COLORS[key]}}"><div><span>${{esc(title)}}</span><strong>${{count.toLocaleString()}}</strong><span>${{pct}}</span></div><small>${{esc(note)}}</small></div>`;
+  }}
+  document.getElementById('matrix').innerHTML = `
+    <div class="matrix">
+      <div></div>
+      <div class="matrix-head">无缺失</div>
+      <div class="matrix-head">有缺失</div>
+      <div class="matrix-head matrix-axis">有不一致</div>
+      ${{cell('present_mismatch', '无缺失 + 有不一致', '连续片段都存在，但窗口内 label 有冲突')}}
+      ${{cell('missing_mismatch', '有缺失 + 有不一致', '同时存在断片和 label 冲突，优先检查')}}
+      <div class="matrix-head matrix-axis">无不一致</div>
+      ${{cell('present_consistent', '无缺失 + 无不一致', '窗口完整且 label 一致')}}
+      ${{cell('missing_consistent', '有缺失 + 无不一致', '已有片段一致，但窗口内部缺 segment')}}
+    </div>
+    <div class="matrix-extra"><div><strong>无法识别编号</strong><div class="muted">ID 末尾不是可解析数字编号，不参与窗口计算</div></div><strong>${{(c.unparseable || 0).toLocaleString()}}</strong></div>
+  `;
+  document.getElementById('rows').innerHTML = items.slice(0, 800).map(row => `<tr><td>${{esc(row.id)}}</td><td>${{esc(row.dataset)}}</td><td>${{esc(row.group)}}</td><td>${{esc(row.segment)}}</td><td>${{esc(row.label)}}</td><td>${{esc(row.statusLabel)}}</td><td>${{row.missing}}</td><td>${{row.mismatch}}</td><td>${{Number(row.weighted).toFixed(6)}}</td></tr>`).join('');
+  document.getElementById('tableNote').textContent = `显示前 ${{Math.min(800, items.length).toLocaleString()}} 条明细`;
+}}
+document.getElementById('datasetFilter').addEventListener('change', render);
+document.getElementById('statusFilter').addEventListener('change', render);
+render();
+</script>"""
+    doc = doc.replace("</main></body></html>", f"</main>{script}</body></html>")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(doc, encoding="utf-8")
 
