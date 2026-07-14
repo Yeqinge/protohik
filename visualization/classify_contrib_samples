@@ -28,6 +28,7 @@ import math
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -152,31 +153,30 @@ def normalize_sample_name(raw, json_names=None):
     name = re.sub(r"\.(wav|flac|mp3|ogg|ark|npy|npz)$", "", name, flags=re.IGNORECASE)
     name = LABEL_PREFIXES.sub("", name)
 
-    # If JSON contains the real sample names, prefer an exact prefix match.
-    # Longest first prevents "abc" from stealing "abc_def_001".
-    if json_names:
-        for candidate in json_names:
-            if name == candidate:
-                return candidate
-            if name.startswith(candidate + "_") or name.startswith(candidate + "-"):
-                suffix = name[len(candidate) + 1:]
-                if re.fullmatch(r"\d{1,6}|chunk\d+|seg\d+", suffix, flags=re.IGNORECASE):
-                    return candidate
+    json_name_set = json_names if isinstance(json_names, set) else set(json_names or [])
+    if json_name_set and name in json_name_set:
+        return name
 
     # Common egs/chunk suffixes: sample_001, sample-001, sample_chunk001.
-    name = re.sub(r"([_-])(?:chunk|seg)?\d{1,6}$", "", name, flags=re.IGNORECASE)
-    return name
+    chunk_stripped = re.sub(r"([_-])(?:chunk|seg)?\d{1,6}$", "", name, flags=re.IGNORECASE)
+    if json_name_set and chunk_stripped in json_name_set:
+        return chunk_stripped
+    return chunk_stripped
 
 
 def load_json_name_map(path):
     if not path:
-        return {}, []
+        return {}, set()
     if not os.path.exists(path):
         print(f"[warn] JSON file not found, ignored: {path}")
-        return {}, []
+        return {}, set()
 
+    t0 = time.time()
+    print(f"[json] reading {path} ...", flush=True)
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
+    print(f"[json] parsed JSON in {time.time() - t0:.1f}s", flush=True)
+
     items = data if isinstance(data, list) else data.get("datas", data.get("data", data.get("items", [])))
     meta = {}
     names = set()
@@ -201,9 +201,8 @@ def load_json_name_map(path):
             "duration": item.get("duration", ""),
             "time_point": item.get("time_point", ""),
         }
-    ordered = sorted(names, key=len, reverse=True)
-    print(f"[json] loaded {len(items)} records, {len(ordered)} normalized names")
-    return meta, ordered
+    print(f"[json] loaded {len(items)} records, {len(names)} normalized names ({time.time() - t0:.1f}s)", flush=True)
+    return meta, names
 
 
 def load_egs_map(path, json_names=None):
@@ -213,32 +212,44 @@ def load_egs_map(path, json_names=None):
         print(f"[warn] egs file not found, ignored: {path}")
         return {}
 
+    t0 = time.time()
+    print(f"[egs] reading {path} ...", flush=True)
     with open(path, encoding="utf-8") as f:
-        lines = f.readlines()
-    first = lines[0] if lines else ""
+        first = f.readline()
     delim = sniff_delimiter(first)
     first_parts = split_egs_line(first, delim)
     has_header = looks_like_header(first_parts)
 
     mapping = {}
     data_idx = 0
-    for file_idx, line in enumerate(lines):
+    file_idx = 0
+
+    def add_line(idx, line):
+        nonlocal data_idx
         parts = split_egs_line(line, delim)
         if not parts:
-            continue
-        if file_idx == 0 and has_header:
-            continue
+            return
         raw_name = parts[0]
         sample = normalize_sample_name(raw_name, json_names=json_names)
         if not sample:
-            continue
-
+            return
         # contrib ids may be file line numbers, or data row numbers after header.
-        mapping[str(file_idx)] = sample
+        mapping[str(idx)] = sample
         mapping[str(data_idx)] = sample
         data_idx += 1
+        if data_idx % 500000 == 0:
+            print(f"[egs] processed {data_idx} rows ({time.time() - t0:.1f}s)", flush=True)
 
-    print(f"[egs] loaded {data_idx} data rows from {path} (header={has_header})")
+    if first and not has_header:
+        add_line(file_idx, first)
+
+    with open(path, encoding="utf-8") as f:
+        if first:
+            f.readline()
+        for file_idx, line in enumerate(f, start=1):
+            add_line(file_idx, line)
+
+    print(f"[egs] loaded {data_idx} data rows from {path} (header={has_header}, {time.time() - t0:.1f}s)", flush=True)
     return mapping
 
 
@@ -259,6 +270,7 @@ def parse_model_egs_specs(values):
 
 
 def load_contrib_model(name, contrib_dir, id_to_sample):
+    t0 = time.time()
     files = sorted(glob.glob(os.path.join(contrib_dir, "contrib_epoch*.npz")))
     if not files:
         print(f"[warn] no contrib_epoch*.npz in {contrib_dir}, skip {name}")
@@ -267,7 +279,8 @@ def load_contrib_model(name, contrib_dir, id_to_sample):
     all_ids = []
     id_seen = set()
     epochs = []
-    for fp in files:
+    print(f"[model] {name}: scanning {len(files)} epoch files for ids", flush=True)
+    for fi, fp in enumerate(files, start=1):
         m = re.search(r"contrib_epoch(\d+)\.npz$", os.path.basename(fp))
         epochs.append(int(m.group(1)) if m else len(epochs))
         d = np.load(fp, allow_pickle=True)
@@ -275,6 +288,12 @@ def load_contrib_model(name, contrib_dir, id_to_sample):
             if sid not in id_seen:
                 id_seen.add(sid)
                 all_ids.append(sid)
+        if fi == 1 or fi % 5 == 0 or fi == len(files):
+            print(
+                f"[model] {name}: scanned {fi}/{len(files)} files, "
+                f"unique egs ids={len(all_ids)}",
+                flush=True,
+            )
 
     n = len(all_ids)
     ne = len(files)
@@ -289,6 +308,7 @@ def load_contrib_model(name, contrib_dir, id_to_sample):
     has_weight = False
 
     id_to_utt_from_npz = {}
+    print(f"[model] {name}: filling epoch matrices ({n} egs ids x {ne} epochs)", flush=True)
     for ei, fp in enumerate(files):
         d = np.load(fp, allow_pickle=True)
         ids = d["ids"].astype(str)
@@ -313,8 +333,14 @@ def load_contrib_model(name, contrib_dir, id_to_sample):
         if "utt_ids" in d:
             for sid, uid in zip(ids, d["utt_ids"].astype(str)):
                 id_to_utt_from_npz.setdefault(sid, uid)
+        if ei == 0 or (ei + 1) % 5 == 0 or ei + 1 == len(files):
+            print(
+                f"[model] {name}: loaded epoch matrix {ei + 1}/{len(files)}",
+                flush=True,
+            )
 
     sample_to_rows = defaultdict(list)
+    print(f"[model] {name}: grouping egs ids to real samples", flush=True)
     for i, sid in enumerate(all_ids):
         raw = id_to_sample.get(sid)
         if not raw:
@@ -323,7 +349,8 @@ def load_contrib_model(name, contrib_dir, id_to_sample):
         sample_to_rows[raw].append(i)
 
     sample_data = {}
-    for sample, rows in sample_to_rows.items():
+    total_samples = len(sample_to_rows)
+    for si, (sample, rows) in enumerate(sample_to_rows.items(), start=1):
         idx = np.asarray(rows, dtype=np.int64)
         gn_traj = np.nanmean(gn[idx, :], axis=0)
         al_traj = np.nanmean(al[idx, :], axis=0)
@@ -367,10 +394,15 @@ def load_contrib_model(name, contrib_dir, id_to_sample):
             "grad_traj": [None if not np.isfinite(x) else round(float(x), 6) for x in gn_traj],
             "align_traj": [None if not np.isfinite(x) else round(float(x), 6) for x in al_traj],
         }
+        if si == 1 or si % 20000 == 0 or si == total_samples:
+            print(
+                f"[model] {name}: aggregated {si}/{total_samples} real samples",
+                flush=True,
+            )
 
     print(
         f"[model] {name}: epochs={ne}, egs={n}, samples={len(sample_data)}, "
-        f"weight={'yes' if has_weight else 'no'}"
+        f"weight={'yes' if has_weight else 'no'}, {time.time() - t0:.1f}s"
     )
     return {
         "name": name,
@@ -583,48 +615,42 @@ def export_csv(path, rows, models, meta):
             writer.writerow({k: fmt(out.get(k, "")) for k in fields})
 
 
-def make_html(path, rows, models, meta):
-    model_payload = []
-    for mi, m in enumerate(models):
-        compact = {}
-        for sample, d in m["sample_data"].items():
-            compact[sample] = {
-                "n_egs": d["n_egs"],
-                "mean_loss": d["mean_loss"],
-                "loss_pct": d.get("loss_pct"),
-                "final_correct": d["final_correct"],
-                "forget_events": d["forget_events"],
-                "frac_neg_align": d["frac_neg_align"],
-                "mean_align": d["mean_align"],
-                "mean_weight": d["mean_weight"],
-                "weight_low_pct": d.get("weight_low_pct"),
-                "score": d.get("model_suspicious_score"),
-                "loss_traj": d["loss_traj"],
-                "weight_traj": d["weight_traj"],
-                "grad_traj": d["grad_traj"],
-                "align_traj": d["align_traj"],
-            }
-        model_payload.append({
+def export_html_data(out_html, rows, models, meta, shard_size=1000):
+    t0 = time.time()
+    base = os.path.splitext(out_html)[0]
+    data_dir = base + "_data"
+    os.makedirs(data_dir, exist_ok=True)
+    print(f"[html-data] writing external data under {data_dir}", flush=True)
+
+    model_payload = [
+        {
             "name": m["name"],
             "epochs": m["epochs"],
             "has_weight": m["has_weight"],
             "color": MODEL_COLORS[mi % len(MODEL_COLORS)],
-            "samples": compact,
-        })
+        }
+        for mi, m in enumerate(models)
+    ]
 
     table_rows = []
-    for r in rows:
+    sample_to_shard = {}
+    for idx, r in enumerate(rows):
         m = meta.get(r["sample_name"], {})
+        shard_id = idx // max(shard_size, 1)
+        sample_to_shard[r["sample_name"]] = shard_id
         table_rows.append({
             **r,
             "json_label": m.get("json_label", ""),
             "file_path": m.get("file_path", ""),
+            "shard": shard_id,
         })
 
-    payload = {
+    summary_payload = {
         "rows": table_rows,
         "models": model_payload,
         "categories": CATEGORY_LABELS,
+        "sample_to_shard": sample_to_shard,
+        "shard_size": shard_size,
     }
 
     counts = defaultdict(int)
@@ -636,10 +662,59 @@ def make_html(path, rows, models, meta):
         for cat in CATEGORIES
     )
 
-    doc = HTML_TEMPLATE.replace("__PAYLOAD__", json.dumps(payload, ensure_ascii=False))
+    summary_name = os.path.basename(base) + "_summary.json"
+    summary_path = os.path.join(data_dir, summary_name)
+    print(f"[html-data] writing summary: {summary_path}", flush=True)
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary_payload, f, ensure_ascii=False, separators=(",", ":"))
+
+    total_shards = int(math.ceil(len(rows) / max(shard_size, 1)))
+    for shard_id in range(total_shards):
+        start = shard_id * shard_size
+        end = min(start + shard_size, len(rows))
+        shard = {}
+        for r in rows[start:end]:
+            sample = r["sample_name"]
+            per_model = {}
+            for m in models:
+                d = m["sample_data"].get(sample)
+                if not d:
+                    continue
+                per_model[m["name"]] = {
+                    "n_egs": d["n_egs"],
+                    "mean_loss": d["mean_loss"],
+                    "loss_pct": d.get("loss_pct"),
+                    "final_correct": d["final_correct"],
+                    "forget_events": d["forget_events"],
+                    "frac_neg_align": d["frac_neg_align"],
+                    "mean_align": d["mean_align"],
+                    "mean_weight": d["mean_weight"],
+                    "weight_low_pct": d.get("weight_low_pct"),
+                    "score": d.get("model_suspicious_score"),
+                    "loss_traj": d["loss_traj"],
+                    "weight_traj": d["weight_traj"],
+                    "grad_traj": d["grad_traj"],
+                    "align_traj": d["align_traj"],
+                }
+            shard[sample] = per_model
+
+        shard_name = f"detail_shard_{shard_id:04d}.json"
+        shard_path = os.path.join(data_dir, shard_name)
+        with open(shard_path, "w", encoding="utf-8") as f:
+            json.dump(shard, f, ensure_ascii=False, separators=(",", ":"))
+        if shard_id == 0 or (shard_id + 1) % 10 == 0 or shard_id + 1 == total_shards:
+            size_mb = os.path.getsize(shard_path) / 1e6
+            print(
+                f"[html-data] shard {shard_id + 1}/{total_shards}: "
+                f"samples={end - start}, size={size_mb:.1f} MB",
+                flush=True,
+            )
+
+    doc = HTML_TEMPLATE.replace("__SUMMARY_URL__", json.dumps(os.path.join(os.path.basename(data_dir), summary_name).replace("\\", "/")))
     doc = doc.replace("__COUNTS__", counts_html)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(out_html, "w", encoding="utf-8") as f:
         f.write(doc)
+    print(f"[html-data] html shell wrote {out_html} ({time.time() - t0:.1f}s)", flush=True)
 
 
 HTML_TEMPLATE = r"""<!doctype html>
@@ -690,7 +765,9 @@ canvas{width:100%;height:190px;border:1px solid var(--line);border-radius:7px;ba
   <section class="right" id="detail"><div class="hint">选择左侧一个样本查看各模型 epoch 曲线。loss 和 weight 会画在同一个坐标系里。</div></section>
 </div>
 <script>
-const DATA = __PAYLOAD__;
+const SUMMARY_URL = __SUMMARY_URL__;
+let DATA = {rows:[], models:[], categories:{}, sample_to_shard:{}};
+const shardCache = new Map();
 let activeCat = 'all';
 let activeName = null;
 let viewRows = [];
@@ -703,10 +780,7 @@ function filteredRows(){
   let rows = DATA.rows.filter(r => activeCat==='all' || r.category===activeCat);
   if(q) rows = rows.filter(r => (r.sample_name+' '+r.category_label+' '+(r.file_path||'')+' '+(r.json_label||'')).toLowerCase().includes(q));
   const sort = document.getElementById('sort').value;
-  const key = {
-    score:r=>r.mean_suspicious_score, loss:r=>r.high_loss_rate,
-    wrong:r=>r.wrong_rate, conflict:r=>r.conflict_rate, name:r=>-Infinity
-  }[sort];
+  const key = {score:r=>r.mean_suspicious_score, loss:r=>r.high_loss_rate, wrong:r=>r.wrong_rate, conflict:r=>r.conflict_rate, name:r=>-Infinity}[sort];
   rows.sort((a,b)=> sort==='name' ? a.sample_name.localeCompare(b.sample_name) : ((key(b)||0)-(key(a)||0) || a.sample_name.localeCompare(b.sample_name)));
   return rows;
 }
@@ -726,34 +800,54 @@ function render(){
     </tr>`).join('');
 }
 function selectRow(i){ if(viewRows[i]) selectSample(viewRows[i].sample_name); }
-function selectSample(name){
+async function loadShardForSample(name){
+  const shardId = DATA.sample_to_shard[name];
+  if(shardId === undefined || shardId === null) return {};
+  if(shardCache.has(shardId)) return shardCache.get(shardId);
+  const base = SUMMARY_URL.replace(/[^\/]+$/, '');
+  const url = base + `detail_shard_${String(shardId).padStart(4,'0')}.json`;
+  const res = await fetch(url);
+  if(!res.ok) throw new Error(`failed to load ${url}: ${res.status}`);
+  const data = await res.json();
+  shardCache.set(shardId, data);
+  return data;
+}
+async function selectSample(name){
   activeName = name;
   const r = DATA.rows.find(x=>x.sample_name===name);
   const d = document.getElementById('detail');
+  d.innerHTML = `<div class="hint">?? ${esc(name)} ?????...</div>`;
+  let details = {};
+  try {
+    const shard = await loadShardForSample(name);
+    details = shard[name] || {};
+  } catch (err) {
+    d.innerHTML = `<div class="hint">?????????${esc(err.message)}</div>`;
+    return;
+  }
   d.innerHTML = `
     <div class="detail">
       <h2>${esc(r.sample_name)}</h2>
       <div><span class="cat ${r.category}">${esc(r.category_label)}</span> <span class="small">${esc(r.reason)}</span></div>
       <div class="sub">${esc(r.file_path || '')}</div>
       <div class="grid">
-        <div class="metric"><span>可疑分</span><b>${val(r.mean_suspicious_score)}</b></div>
+        <div class="metric"><span>???</span><b>${val(r.mean_suspicious_score)}</b></div>
         <div class="metric"><span>wrong_rate</span><b>${pct(r.wrong_rate)}</b></div>
         <div class="metric"><span>high_loss</span><b>${pct(r.high_loss_rate)}</b></div>
         <div class="metric"><span>conflict</span><b>${pct(r.conflict_rate)}</b></div>
       </div>
     </div>
-    ${DATA.models.map((m, i)=>modelBlock(m, name, i)).join('')}`;
-  DATA.models.forEach((m,i)=>drawModelChart(m, name, i));
+    ${DATA.models.map((m, i)=>modelBlock(m, details[m.name], i)).join('')}`;
+  DATA.models.forEach((m,i)=>drawModelChart(m, details[m.name], i));
   render();
 }
-function modelBlock(m, name, i){
-  const s = m.samples[name];
-  if(!s) return `<div class="model"><div class="model-head"><span class="dot" style="background:${m.color}"></span>${esc(m.name)} <span class="small">无此样本</span></div></div>`;
+function modelBlock(m, s, i){
+  if(!s) return `<div class="model"><div class="model-head"><span class="dot" style="background:${m.color}"></span>${esc(m.name)} <span class="small">????</span></div></div>`;
   return `<div class="model">
-    <div class="model-head"><span class="dot" style="background:${m.color}"></span>${esc(m.name)} <span class="small">loss + weight 同坐标；grad/align 淡线</span></div>
+    <div class="model-head"><span class="dot" style="background:${m.color}"></span>${esc(m.name)} <span class="small">loss + weight ????grad/align ??</span></div>
     <div class="model-body">
       <div class="kv">
-        <span>egs数</span><span>${s.n_egs}</span>
+        <span>egs?</span><span>${s.n_egs}</span>
         <span>mean_loss</span><span>${val(s.mean_loss)}</span>
         <span>loss_pct</span><span>${pct(s.loss_pct)}</span>
         <span>final_correct</span><span>${s.final_correct}</span>
@@ -766,9 +860,9 @@ function modelBlock(m, name, i){
     </div>
   </div>`;
 }
-function finite(a){ return a.filter(x=>Number.isFinite(x)); }
-function drawModelChart(m, name, i){
-  const s = m.samples[name]; if(!s) return;
+function finite(a){ return (a||[]).filter(x=>Number.isFinite(x)); }
+function drawModelChart(m, s, i){
+  if(!s) return;
   const c = document.getElementById('c'+i), ctx = c.getContext('2d');
   const W=c.width,H=c.height,pad=34;
   ctx.clearRect(0,0,W,H); ctx.font='12px system-ui'; ctx.strokeStyle='#e5e7eb'; ctx.lineWidth=1;
@@ -794,7 +888,20 @@ function drawModelChart(m, name, i){
   let lx=pad; series.forEach(sr=>{ ctx.fillStyle=sr.color; ctx.fillRect(lx,10,10,10); ctx.fillStyle='#334155'; ctx.fillText(sr.name,lx+14,19); lx+=70; });
   ctx.fillStyle='#64748b'; ctx.fillText('epoch', W-pad-34, H-8);
 }
-render();
+async function boot(){
+  const detail = document.getElementById('detail');
+  detail.innerHTML = `<div class="hint">?? summary ??...</div>`;
+  try {
+    const res = await fetch(SUMMARY_URL);
+    if(!res.ok) throw new Error(`failed to load ${SUMMARY_URL}: ${res.status}`);
+    DATA = await res.json();
+    detail.innerHTML = `<div class="hint">????????????? epoch ???loss ? weight ???????????</div>`;
+    render();
+  } catch(err) {
+    detail.innerHTML = `<div class="hint">summary ?????${esc(err.message)}<br>???????? python -m http.server ??? http://localhost:8000/... ???</div>`;
+  }
+}
+boot();
 </script>
 </body>
 </html>
@@ -802,6 +909,7 @@ render();
 
 
 def main():
+    t_all = time.time()
     ap = argparse.ArgumentParser(description="Classify samples from multiple contrib directories.")
     ap.add_argument("--models", nargs="*", default=[], metavar="NAME:CONTRIB_DIR")
     ap.add_argument("--contribs", nargs="*", default=[], metavar="CONTRIB_DIR")
@@ -811,33 +919,60 @@ def main():
     ap.add_argument("--output", default="contrib_sample_classification.html")
     ap.add_argument("--csv", default="", help="Output CSV path. Defaults to OUTPUT basename + .csv.")
     ap.add_argument("--min-model-coverage", type=float, default=0.5)
+    ap.add_argument("--shard-size", type=int, default=1000, help="Samples per external detail JSON shard.")
     args = ap.parse_args()
+
+    print("=" * 72, flush=True)
+    print("[start] contrib sample classification", flush=True)
+    print(f"[args] output={args.output}", flush=True)
+    print(f"[args] min_model_coverage={args.min_model_coverage}, shard_size={args.shard_size}", flush=True)
 
     specs = parse_model_specs(args)
     model_egs_specs = parse_model_egs_specs(args.model_egs)
+    print(f"[args] models={len(specs)}", flush=True)
+    for name, path in specs:
+        print(f"  - {name}: {os.path.abspath(path)}", flush=True)
+
+    print("[stage 1/6] loading JSON metadata and egs map", flush=True)
     meta, json_names = load_json_name_map(args.json)
     common_egs_map = load_egs_map(args.egs, json_names=json_names)
 
+    print("[stage 2/6] loading contrib npz files", flush=True)
     models = []
-    for name, path in specs:
+    for idx, (name, path) in enumerate(specs, start=1):
+        print(f"[model {idx}/{len(specs)}] begin {name}", flush=True)
         egs_map = model_specific_egs(common_egs_map, model_egs_specs, name, json_names)
         model = load_contrib_model(name, path, egs_map)
         if model:
             models.append(model)
+        print(f"[model {idx}/{len(specs)}] done {name}", flush=True)
     if not models:
         raise SystemExit("No valid contrib model data loaded.")
 
+    print("[stage 3/6] classifying aligned real samples", flush=True)
+    t0 = time.time()
     rows = classify_samples(models, min_model_coverage=args.min_model_coverage)
+    print(f"[classify] {len(rows)} samples, {time.time() - t0:.1f}s")
     out_html = args.output
     out_csv = args.csv or os.path.splitext(out_html)[0] + ".csv"
-    export_csv(out_csv, rows, models, meta)
-    make_html(out_html, rows, models, meta)
 
+    print("[stage 4/6] writing CSV summary", flush=True)
+    t0 = time.time()
+    export_csv(out_csv, rows, models, meta)
+    print(f"[csv] wrote {out_csv}, {time.time() - t0:.1f}s")
+
+    print("[stage 5/6] writing external HTML data shards", flush=True)
+    t0 = time.time()
+    export_html_data(out_html, rows, models, meta, shard_size=args.shard_size)
+    print(f"[html] wrote shell + data shards for {out_html}, {time.time() - t0:.1f}s")
+
+    print("[stage 6/6] finished", flush=True)
     print("[done] samples:", len(rows))
     for cat in CATEGORIES:
         print(f"  {cat}: {sum(1 for r in rows if r['category'] == cat)}")
     print("[done] csv :", os.path.abspath(out_csv))
     print("[done] html:", os.path.abspath(out_html))
+    print(f"[done] total: {time.time() - t_all:.1f}s")
 
 
 if __name__ == "__main__":
