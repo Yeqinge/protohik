@@ -570,6 +570,21 @@ def fmt(v):
     return "" if v is None else str(v)
 
 
+def json_safe(value):
+    """Convert numpy values and non-finite floats to strict JSON values."""
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value) if np.isfinite(value) else None
+    return value
+
+
 def export_csv(path, rows, models, meta):
     fields = [
         "sample_name", "category", "category_label", "reason",
@@ -633,11 +648,9 @@ def export_html_data(out_html, rows, models, meta, shard_size=1000):
     ]
 
     table_rows = []
-    sample_to_shard = {}
     for idx, r in enumerate(rows):
         m = meta.get(r["sample_name"], {})
         shard_id = idx // max(shard_size, 1)
-        sample_to_shard[r["sample_name"]] = shard_id
         table_rows.append({
             **r,
             "json_label": m.get("json_label", ""),
@@ -649,7 +662,6 @@ def export_html_data(out_html, rows, models, meta, shard_size=1000):
         "rows": table_rows,
         "models": model_payload,
         "categories": CATEGORY_LABELS,
-        "sample_to_shard": sample_to_shard,
         "shard_size": shard_size,
     }
 
@@ -666,7 +678,8 @@ def export_html_data(out_html, rows, models, meta, shard_size=1000):
     summary_path = os.path.join(data_dir, summary_name)
     print(f"[html-data] writing summary: {summary_path}", flush=True)
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary_payload, f, ensure_ascii=False, separators=(",", ":"))
+        json.dump(json_safe(summary_payload), f, ensure_ascii=False,
+                  separators=(",", ":"), allow_nan=False)
 
     total_shards = int(math.ceil(len(rows) / max(shard_size, 1)))
     for shard_id in range(total_shards):
@@ -701,7 +714,8 @@ def export_html_data(out_html, rows, models, meta, shard_size=1000):
         shard_name = f"detail_shard_{shard_id:04d}.json"
         shard_path = os.path.join(data_dir, shard_name)
         with open(shard_path, "w", encoding="utf-8") as f:
-            json.dump(shard, f, ensure_ascii=False, separators=(",", ":"))
+            json.dump(json_safe(shard), f, ensure_ascii=False,
+                      separators=(",", ":"), allow_nan=False)
         if shard_id == 0 or (shard_id + 1) % 10 == 0 or shard_id + 1 == total_shards:
             size_mb = os.path.getsize(shard_path) / 1e6
             print(
@@ -710,7 +724,20 @@ def export_html_data(out_html, rows, models, meta, shard_size=1000):
                 flush=True,
             )
 
-    doc = HTML_TEMPLATE.replace("__SUMMARY_URL__", json.dumps(os.path.join(os.path.basename(data_dir), summary_name).replace("\\", "/")))
+    template_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "classify_contrib_template.html",
+    )
+    if os.path.exists(template_path):
+        print(f"[html-data] using template: {template_path}", flush=True)
+        with open(template_path, encoding="utf-8") as f:
+            template = f.read()
+    else:
+        raise FileNotFoundError(
+            f"HTML template not found: {template_path}. "
+            "Keep classify_contrib_template.html beside this script."
+        )
+    doc = template.replace("__SUMMARY_URL__", json.dumps(os.path.join(os.path.basename(data_dir), summary_name).replace("\\", "/")))
     doc = doc.replace("__COUNTS__", counts_html)
     with open(out_html, "w", encoding="utf-8") as f:
         f.write(doc)
