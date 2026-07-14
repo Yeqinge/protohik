@@ -29,12 +29,14 @@ from __future__ import annotations
 import argparse
 from array import array
 import datetime as dt
+import html
 import json
 import os
 import re
 import struct
 import sys
 import webbrowser
+import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -68,6 +70,24 @@ BIN_INT_FIELDS = [
     "trainOrTest",
     "manualOrPseudo",
     "flat",
+]
+STATUS_DEFS = [
+    ("unparseable", "无法识别编号"),
+    ("missing_mismatch", "有缺失 + 有不一致"),
+    ("present_mismatch", "无缺失 + 有不一致"),
+    ("missing_consistent", "有缺失 + 无不一致"),
+    ("present_consistent", "无缺失 + 无不一致"),
+]
+STATUS_LABELS = dict(STATUS_DEFS)
+SOURCE_EXPORT_FILTERS = [
+    ("unparseable", "无法识别编号"),
+    ("missing_mismatch", "有缺失_有不一致"),
+    ("present_mismatch", "无缺失_有不一致"),
+    ("missing_consistent", "有缺失_无不一致"),
+    ("present_consistent", "无缺失_无不一致"),
+    ("has_missing", "有缺失"),
+    ("has_mismatch", "有不一致"),
+    ("all_present", "无缺失"),
 ]
 
 
@@ -388,6 +408,501 @@ def build_binary_report(payload: Dict[str, Any]) -> Tuple[bytes, Dict[str, int]]
         "record_table_bytes": len(rows_bytes),
     }
     return binary, stats
+
+
+def value_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def is_normal_label(label: Any) -> bool:
+    return value_text(label).strip().lower() == "normal"
+
+
+def is_abnormal_like_label(label: Any) -> bool:
+    text = value_text(label).strip().lower()
+    return text in {"abnormal", "anomaly", "alarm"} or "abnormal" in text
+
+
+def build_segment_groups(records: List[Record]) -> Dict[str, Dict[int, Record]]:
+    groups: Dict[str, Dict[int, Record]] = defaultdict(dict)
+    for rec in records:
+        try:
+            groups[str(rec["groupKey"])][int(rec["segment"])] = rec
+        except Exception:
+            continue
+    return groups
+
+
+def classify_browser_record(rec: Record, groups: Dict[str, Dict[int, Record]], before: int, after: int) -> Dict[str, Any]:
+    segment = int(rec.get("segment", -1))
+    segment_width = int(rec.get("segmentWidth", 0))
+    if segment < 0 or segment_width == 0:
+        return {
+            "key": "unparseable",
+            "label": STATUS_LABELS["unparseable"],
+            "has_missing": False,
+            "has_mismatch": False,
+            "missing_count": 0,
+            "mismatch_count": 0,
+            "existing_neighbor_count": 0,
+            "effective_window_size": 0,
+            "requested_before": before,
+            "requested_after": after,
+            "checked_start_segment": None,
+            "checked_end_segment": None,
+            "group_min_segment": None,
+            "group_max_segment": None,
+            "weighted_inconsistency": 1.0,
+            "missing_weight_ratio": 0.0,
+            "normal_to_abnormal_count": 0,
+            "normal_to_abnormal_weight": 0.0,
+            "group_key": rec.get("groupKey", ""),
+            "segment": rec.get("segmentToken") or rec.get("segment", ""),
+        }
+
+    group = groups.get(str(rec["groupKey"]), {})
+    segments = sorted(k for k in group.keys() if isinstance(k, int))
+    group_min = segments[0] if segments else segment
+    group_max = segments[-1] if segments else segment
+    check_start = max(segment - before, group_min)
+    check_end = min(segment + after, group_max)
+    target_label = value_text(rec.get("label", ""))
+
+    missing = 0
+    mismatch = 0
+    existing = 0
+    observed_weight = 0.0
+    mismatch_weight = 0.0
+    missing_weight = 0.0
+    total_neighbor_weight = 0.0
+    normal_to_abnormal = 0
+    normal_to_abnormal_weight = 0.0
+
+    for seg in range(check_start, check_end + 1):
+        distance = abs(seg - segment)
+        if distance == 0:
+            continue
+        weight = 1.0 / (distance + 1)
+        total_neighbor_weight += weight
+        neighbor = group.get(seg)
+        if not neighbor:
+            missing += 1
+            missing_weight += weight
+            continue
+        existing += 1
+        observed_weight += weight
+        if value_text(neighbor.get("label", "")) != target_label:
+            mismatch += 1
+            mismatch_weight += weight
+            if is_normal_label(target_label) and is_abnormal_like_label(neighbor.get("label", "")):
+                normal_to_abnormal += 1
+                normal_to_abnormal_weight += weight
+
+    if mismatch > 0 and missing > 0:
+        key = "missing_mismatch"
+    elif mismatch > 0:
+        key = "present_mismatch"
+    elif missing > 0:
+        key = "missing_consistent"
+    else:
+        key = "present_consistent"
+
+    return {
+        "key": key,
+        "label": STATUS_LABELS[key],
+        "has_missing": missing > 0,
+        "has_mismatch": mismatch > 0,
+        "missing_count": missing,
+        "mismatch_count": mismatch,
+        "existing_neighbor_count": existing,
+        "effective_window_size": max(0, check_end - check_start + 1),
+        "requested_before": before,
+        "requested_after": after,
+        "checked_start_segment": check_start,
+        "checked_end_segment": check_end,
+        "group_min_segment": group_min,
+        "group_max_segment": group_max,
+        "weighted_inconsistency": round(mismatch_weight / observed_weight, 6) if observed_weight > 0 else 0.0,
+        "missing_weight_ratio": round(missing_weight / total_neighbor_weight, 6) if total_neighbor_weight > 0 else 0.0,
+        "normal_to_abnormal_count": normal_to_abnormal,
+        "normal_to_abnormal_weight": round(normal_to_abnormal_weight, 6),
+        "group_key": rec.get("groupKey", ""),
+        "segment": segment,
+    }
+
+
+def build_status_items(payload: Dict[str, Any], original_records: List[Record], before: int, after: int) -> List[Dict[str, Any]]:
+    groups = build_segment_groups(payload["records"])
+    items: List[Dict[str, Any]] = []
+    for rec in payload["records"]:
+        status = classify_browser_record(rec, groups, before, after)
+        original = original_records[int(rec["index"])] if int(rec["index"]) < len(original_records) else {}
+        items.append({"browser": rec, "original": original, "status": status})
+    return items
+
+
+def status_counts(items: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {key: 0 for key, _ in STATUS_DEFS}
+    for item in items:
+        key = str(item["status"]["key"])
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def matches_status_filter(item: Dict[str, Any], filter_key: str) -> bool:
+    status = item["status"]
+    if filter_key == "all":
+        return True
+    if filter_key == "has_missing":
+        return bool(status["has_missing"])
+    if filter_key == "has_mismatch":
+        return bool(status["has_mismatch"])
+    if filter_key == "all_present":
+        return status["key"] != "unparseable" and not status["has_missing"]
+    return status["key"] == filter_key
+
+
+def safe_filename(value: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\s]+', "_", value.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return cleaned or "all"
+
+
+def export_status_json(items: List[Dict[str, Any]], out_path: Path, source_json: Path, before: int, after: int) -> None:
+    counts = status_counts(items)
+    grouped = {key: [] for key, _ in STATUS_DEFS}
+    for item in items:
+        row = safe_value(item["original"])
+        if not isinstance(row, dict):
+            row = {"value": row}
+        row = dict(row)
+        row["time_context_status"] = item["status"]
+        grouped.setdefault(item["status"]["key"], []).append(row)
+
+    output = {
+        "summary": {
+            "source_json": str(source_json),
+            "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "before": before,
+            "after": after,
+            "record_count": len(items),
+            "status_counts": counts,
+            "status_labels": STATUS_LABELS,
+        },
+        "groups": {
+            key: {
+                "label": STATUS_LABELS.get(key, key),
+                "count": len(grouped.get(key, [])),
+                "datas": grouped.get(key, []),
+            }
+            for key, _ in STATUS_DEFS
+        },
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+
+def export_summary_html(items: List[Dict[str, Any]], out_path: Path, source_json: Path, before: int, after: int) -> None:
+    counts = status_counts(items)
+    max_count = max([1] + list(counts.values()))
+    max_missing = max([1] + [int(item["status"]["missing_count"]) for item in items])
+    max_mismatch = max([1] + [int(item["status"]["mismatch_count"]) for item in items])
+    colors = {
+        "unparseable": "#991b1b",
+        "missing_mismatch": "#dc2626",
+        "present_mismatch": "#ef4444",
+        "missing_consistent": "#d97706",
+        "present_consistent": "#15803d",
+    }
+
+    bars = []
+    for key, label in STATUS_DEFS:
+        count = counts.get(key, 0)
+        width = max(2.0, count / max_count * 100)
+        bars.append(
+            f'<div class="hist-row"><div class="hist-label">{html.escape(label)}</div>'
+            f'<div class="hist-track"><div class="hist-bar" style="width:{width:.2f}%;background:{colors[key]}"></div></div>'
+            f'<div class="hist-value">{count:,}</div></div>'
+        )
+
+    points = []
+    for item in items[:5000]:
+        status = item["status"]
+        x = 54 + int(status["missing_count"]) / max_missing * (760 - 54 * 1.4)
+        y = 430 - 54 - int(status["mismatch_count"]) / max_mismatch * (430 - 54 * 1.35)
+        title = f'{item["browser"].get("id", "")} | {status["label"]} | missing={status["missing_count"]} mismatch={status["mismatch_count"]}'
+        points.append(
+            f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.2" fill="{colors.get(status["key"], "#64748b")}" fill-opacity="0.42">'
+            f'<title>{html.escape(title)}</title></circle>'
+        )
+
+    rows = []
+    for item in items[:800]:
+        rec = item["browser"]
+        status = item["status"]
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(value_text(rec.get('id', '')))}</td>"
+            f"<td>{html.escape(value_text(rec.get('groupKey', '')))}</td>"
+            f"<td>{html.escape(value_text(rec.get('segment', '')))}</td>"
+            f"<td>{html.escape(value_text(rec.get('label', '')))}</td>"
+            f"<td>{html.escape(value_text(status['label']))}</td>"
+            f"<td>{status['missing_count']}</td>"
+            f"<td>{status['mismatch_count']}</td>"
+            f"<td>{status['weighted_inconsistency']:.6f}</td>"
+            "</tr>"
+        )
+
+    svg = f"""
+      <svg viewBox="0 0 760 430" role="img" aria-label="missing mismatch scatter">
+        <rect width="760" height="430" fill="#fff"/>
+        <line x1="54" y1="376" x2="738" y2="376" stroke="#94a3b8"/>
+        <line x1="54" y1="24" x2="54" y2="376" stroke="#94a3b8"/>
+        {''.join(points)}
+        <text x="380" y="416" text-anchor="middle" fill="#475569" font-size="13">missing count</text>
+        <text x="18" y="215" text-anchor="middle" transform="rotate(-90 18 215)" fill="#475569" font-size="13">mismatch count</text>
+      </svg>
+    """
+    doc = f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>样本时间维度状态汇总</title>
+<style>
+body{{margin:0;background:#f6f8fb;color:#111827;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",Arial,sans-serif;line-height:1.5}}
+.page{{max-width:1320px;margin:0 auto;padding:24px}} h1{{font-size:26px;margin:0 0 8px}} h2{{font-size:18px;margin:0 0 12px}}
+.meta{{color:#64748b;font-size:13px;overflow-wrap:anywhere}} .summary{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:16px 0}}
+.metric,.panel{{background:#fff;border:1px solid #d7dee8;border-radius:8px;box-shadow:0 10px 28px rgba(15,23,42,.05)}} .metric{{padding:12px 14px;min-height:82px}}
+.metric-label{{color:#64748b;font-size:12px;margin-bottom:5px}} .metric-value{{font-size:21px;font-weight:750}}
+.grid{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(360px,.65fr);gap:14px}} .panel{{padding:16px}} .status-hist{{display:grid;gap:8px}}
+.hist-row{{display:grid;grid-template-columns:150px minmax(0,1fr) 80px;gap:10px;align-items:center;font-size:12px}} .hist-label{{font-weight:800;color:#334155}}
+.hist-track{{height:12px;border-radius:999px;background:#e5e7eb;overflow:hidden}} .hist-bar{{height:100%;border-radius:inherit}} .hist-value{{text-align:right;color:#64748b;font-family:ui-monospace,Consolas,monospace}}
+table{{width:100%;border-collapse:collapse;background:#fff}} th,td{{border-bottom:1px solid #d7dee8;padding:8px 10px;text-align:left;font-size:13px;white-space:nowrap}} th{{background:#eef2f7;color:#334155}}
+.table-wrap{{max-height:520px;overflow:auto;border:1px solid #d7dee8;border-radius:8px}} @media(max-width:980px){{.summary,.grid{{grid-template-columns:1fr}}}}
+</style></head><body><main class="page">
+<header><h1>样本时间维度状态汇总</h1><div class="meta">源 JSON: {html.escape(str(source_json))}<br>生成时间: {dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}<br>窗口: -{before} / +{after}</div></header>
+<div class="summary">
+<div class="metric"><div class="metric-label">样本数</div><div class="metric-value">{len(items):,}</div></div>
+<div class="metric"><div class="metric-label">有缺失</div><div class="metric-value">{counts.get("missing_mismatch",0)+counts.get("missing_consistent",0):,}</div></div>
+<div class="metric"><div class="metric-label">有不一致</div><div class="metric-value">{counts.get("missing_mismatch",0)+counts.get("present_mismatch",0):,}</div></div>
+<div class="metric"><div class="metric-label">无缺失无不一致</div><div class="metric-value">{counts.get("present_consistent",0):,}</div></div>
+<div class="metric"><div class="metric-label">无法识别</div><div class="metric-value">{counts.get("unparseable",0):,}</div></div>
+</div>
+<div class="grid"><section class="panel"><h2>缺失/不一致散点分布</h2>{svg}</section><section class="panel"><h2>状态分类统计</h2><div class="status-hist">{''.join(bars)}</div></section></div>
+<section class="panel" style="margin-top:14px"><h2>样本明细预览</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>group</th><th>segment</th><th>label</th><th>状态</th><th>缺失</th><th>不一致</th><th>加权不一致</th></tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>
+</main></body></html>"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(doc, encoding="utf-8")
+
+
+def column_name(index: int) -> str:
+    name = ""
+    n = index + 1
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        name = chr(65 + rem) + name
+    return name
+
+
+def worksheet_xml(rows: List[List[Any]]) -> str:
+    body = []
+    for r_idx, row in enumerate(rows, 1):
+        cells = []
+        for c_idx, cell in enumerate(row):
+            ref = f"{column_name(c_idx)}{r_idx}"
+            text = html.escape(value_text(cell), quote=True)
+            cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>')
+        body.append(f'<row r="{r_idx}">{"".join(cells)}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<sheetData>{"".join(body)}</sheetData></worksheet>'
+    )
+
+
+def safe_sheet_name(name: str, fallback: str) -> str:
+    cleaned = re.sub(r'[\\/?*\[\]:]+', " ", name).strip() or fallback
+    return cleaned[:31]
+
+
+def export_status_xlsx(items: List[Dict[str, Any]], out_path: Path, source_json: Path, before: int, after: int) -> None:
+    counts = status_counts(items)
+    headers = [
+        "ID",
+        "group_key",
+        "segment",
+        "label",
+        "status_key",
+        "status_label",
+        "has_missing",
+        "has_mismatch",
+        "missing_count",
+        "mismatch_count",
+        "weighted_inconsistency",
+        "missing_weight_ratio",
+        "before",
+        "after",
+        "duration",
+        "sample_rate",
+        "detector_id",
+        "unit_id",
+        "channel_id",
+        "time_point",
+        "project",
+        "file_path",
+    ]
+
+    def item_row(item: Dict[str, Any]) -> List[Any]:
+        rec = item["browser"]
+        status = item["status"]
+        return [
+            rec.get("id", ""),
+            rec.get("groupKey", ""),
+            rec.get("segment", ""),
+            rec.get("label", ""),
+            status["key"],
+            status["label"],
+            status["has_missing"],
+            status["has_mismatch"],
+            status["missing_count"],
+            status["mismatch_count"],
+            status["weighted_inconsistency"],
+            status["missing_weight_ratio"],
+            before,
+            after,
+            rec.get("duration", ""),
+            rec.get("sampleRate", ""),
+            rec.get("detectorId", ""),
+            rec.get("unitId", ""),
+            rec.get("channelId", ""),
+            rec.get("timePoint", ""),
+            rec.get("project", ""),
+            rec.get("filePath", ""),
+        ]
+
+    sheets: List[Tuple[str, List[List[Any]]]] = [
+        (
+            "汇总",
+            [
+                ["source_json", str(source_json)],
+                ["generated_at", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+                ["before", before],
+                ["after", after],
+                ["record_count", len(items)],
+                [],
+                ["status_key", "status_label", "count"],
+                *[[key, STATUS_LABELS.get(key, key), counts.get(key, 0)] for key, _ in STATUS_DEFS],
+            ],
+        )
+    ]
+    for key, label in STATUS_DEFS:
+        rows = [headers]
+        rows.extend(item_row(item) for item in items if item["status"]["key"] == key)
+        sheets.append((label, rows))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        overrides = "".join(
+            f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for i in range(1, len(sheets) + 1)
+        )
+        workbook_sheets = "".join(
+            f'<sheet name="{html.escape(safe_sheet_name(name, f"Sheet{i}"), quote=True)}" sheetId="{i}" r:id="rId{i}"/>'
+            for i, (name, _) in enumerate(sheets, 1)
+        )
+        workbook_rels = "".join(
+            f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>'
+            for i in range(1, len(sheets) + 1)
+        )
+        zf.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            f"{overrides}</Types>",
+        )
+        zf.writestr(
+            "_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>",
+        )
+        zf.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f"<sheets>{workbook_sheets}</sheets></workbook>",
+        )
+        zf.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f"{workbook_rels}</Relationships>",
+        )
+        for i, (_, rows) in enumerate(sheets, 1):
+            zf.writestr(f"xl/worksheets/sheet{i}.xml", worksheet_xml(rows))
+
+
+def export_source_bat(items: List[Dict[str, Any]], out_path: Path, filter_key: str, filter_label: str) -> None:
+    selected = [item for item in items if matches_status_filter(item, filter_key)]
+    folder_name = f"sample_context_sources_{safe_filename(filter_key)}_{safe_filename(filter_label)}"
+    seen = set()
+    lines = [
+        "@echo off",
+        "setlocal",
+        f'set "OUT_DIR=%~dp0{folder_name}"',
+        'mkdir "%OUT_DIR%" 2>nul',
+        'cd /d "%OUT_DIR%"',
+        f"rem Status filter: {filter_key} / {filter_label}",
+        "",
+    ]
+    for item in selected:
+        rec = item["browser"]
+        src = value_text(rec.get("filePath") or rec.get("id") or "").strip()
+        if not src or src in seen:
+            continue
+        seen.add(src)
+        lines.append(f"rem {item['status']['label']} | {rec.get('id', '')}")
+        lines.append(f'copy /Y "{src.replace(chr(34), chr(34) + chr(34))}" .')
+    lines.extend(["", f"echo Copied {len(seen)} source files for {filter_label} to %CD%", "pause"])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\r\n".join(lines), encoding="utf-8")
+
+
+def run_extra_exports(args: argparse.Namespace, payload: Dict[str, Any], original_records: List[Record], json_path: Path, output_path: Path) -> None:
+    requested = set(args.export or [])
+    if not requested:
+        return
+    if "all" in requested:
+        requested.update({"xlsx", "json", "html", "sources"})
+    items = build_status_items(payload, original_records, args.before, args.after)
+    prefix = args.export_prefix.expanduser().resolve() if args.export_prefix else output_path.with_suffix("")
+
+    if "xlsx" in requested:
+        path = Path(str(prefix) + "_status_summary.xlsx")
+        print(f"      Export XLSX: {path}")
+        export_status_xlsx(items, path, json_path, args.before, args.after)
+    if "json" in requested:
+        path = Path(str(prefix) + "_status_summary.json")
+        print(f"      Export JSON: {path}")
+        export_status_json(items, path, json_path, args.before, args.after)
+    if "html" in requested:
+        path = Path(str(prefix) + "_summary.html")
+        print(f"      Export summary HTML: {path}")
+        export_summary_html(items, path, json_path, args.before, args.after)
+    if "sources" in requested:
+        filters = SOURCE_EXPORT_FILTERS if "all" in (args.export or []) else [(args.status_filter, args.status_filter_label or args.status_filter)]
+        for filter_key, filter_label in filters:
+            path = Path(str(prefix) + f"_copy_sources_{safe_filename(filter_key)}.bat")
+            print(f"      Export source BAT: {path}")
+            export_source_bat(items, path, filter_key, filter_label)
 
 
 def html_template(data_file_name: str) -> str:
@@ -1068,26 +1583,6 @@ def html_template(data_file_name: str) -> str:
             <input id="afterInput" type="number" min="0" step="1">
           </div>
         </div>
-        <div class="export-control">
-          <div>
-            <label for="exportType">导出</label>
-            <select id="exportType">
-              <option value="xlsx">导出 XLSX</option>
-              <option value="json">导出 JSON</option>
-              <option value="html">导出汇总 HTML</option>
-              <option value="sources">导出源文件</option>
-              <option value="all">导出全部信息</option>
-            </select>
-          </div>
-          <div>
-            <label for="exportCsvBtn">&nbsp;</label>
-            <button class="export-btn" id="exportCsvBtn" type="button">执行导出</button>
-          </div>
-        </div>
-        <div class="export-progress" id="exportProgress">
-          <div class="export-progress-track"><span class="export-progress-bar" id="exportProgressBar"></span></div>
-          <div class="export-progress-text" id="exportProgressText">等待导出</div>
-        </div>
       </div>
       <div class="sample-list" id="sampleList"></div>
       <div class="sample-pager">
@@ -1425,6 +1920,39 @@ def html_template(data_file_name: str) -> str:
       if (filterValue === 'normal') return isNormalLabel(rec.label);
       if (filterValue === 'abnormal') return isAbnormalLikeLabel(rec.label);
       return true;
+    }}
+
+    function collectItemsForExport(options = {{}}) {{
+      const query = els.idSearch.value.trim().toLowerCase();
+      const statusFilter = options.ignoreStatusFilter ? 'all' : els.statusFilter.value;
+      const targetLabelFilter = els.targetLabelFilter.value;
+      const {{ before, after }} = currentWindowParams();
+      const items = [];
+      for (const rec of records) {{
+        const fields = [
+          rec.id,
+          rec.idBase,
+          rec.groupKey,
+          rec.label,
+          rec.filePath,
+          rec.detectorId,
+          rec.channelId,
+          rec.timePoint,
+          rec.project,
+        ];
+        if (query && !fields.some(value => valueText(value).toLowerCase().includes(query))) {{
+          continue;
+        }}
+        if (!targetLabelMatchesFilter(rec, targetLabelFilter)) {{
+          continue;
+        }}
+        const status = classifyRecord(rec, before, after);
+        if (!statusMatchesFilter(status, statusFilter)) {{
+          continue;
+        }}
+        items.push({{ rec, status }});
+      }}
+      return items;
     }}
 
     function getFilteredRecords(options = {{}}) {{
@@ -1840,6 +2368,30 @@ def html_template(data_file_name: str) -> str:
       return out;
     }}
 
+    function compactJsonRecord(rec, status, before, after) {{
+      return {{
+        ID: rec.id,
+        id_base: rec.idBase,
+        group_key: rec.groupKey,
+        segment: displaySegment(rec),
+        parsed_segment: rec.parsedSegment,
+        label: rec.label,
+        duration: rec.duration,
+        sample_rate: rec.sampleRate,
+        file_path: rec.filePath,
+        detector_id: rec.detectorId,
+        unit_id: rec.unitId,
+        channel_id: rec.channelId,
+        time_point: rec.timePoint,
+        project: rec.project,
+        md5: rec.md5,
+        used_or_not: rec.usedOrNot,
+        train_or_test: rec.trainOrTest,
+        manual_or_pseudo: rec.manualOrPseudo,
+        time_context_status: statusPayload(rec, status, before, after),
+      }};
+    }}
+
     async function exportCurrentCsv() {{
       setExportProgress(8, '正在整理 XLSX 数据...');
       await nextFrame();
@@ -1908,8 +2460,7 @@ def html_template(data_file_name: str) -> str:
         const rec = records[i];
         const status = classifyRecord(rec, before, after);
         counts[status.key] = (counts[status.key] || 0) + 1;
-        const row = rebuildOriginalLikeRecord(rec);
-        row.time_context_status = statusPayload(rec, status, before, after);
+        const row = compactJsonRecord(rec, status, before, after);
         const piece = (i === 0 ? '' : ',\n') + JSON.stringify(row);
         if (buffer.length + piece.length > flushLimit) {{
           chunks.push(buffer);
@@ -1990,7 +2541,7 @@ def html_template(data_file_name: str) -> str:
       setExportProgress(8, '正在统计当前窗口并绘制汇总 HTML...');
       await nextFrame();
       const {{ before, after }} = currentWindowParams();
-      const items = getFilteredRecords();
+      const items = collectItemsForExport();
       const counts = statusSummary(items);
       const ob = String.fromCharCode(123);
       const cb = String.fromCharCode(125);
@@ -2534,7 +3085,6 @@ def html_template(data_file_name: str) -> str:
       rebuildSelect(els.sampleSelect.value);
       renderAll();
     }});
-    els.exportCsvBtn.addEventListener('click', handleExport);
     els.listPrevBtn.addEventListener('click', () => {{
       listPageStart = Math.max(0, listPageStart - LIST_PAGE_SIZE);
       rebuildSelect('');
@@ -2587,6 +3137,40 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Deprecated; kept for compatibility. The new .bin format is an uncompressed typed binary table.",
     )
+    parser.add_argument(
+        "--export",
+        nargs="+",
+        choices=["xlsx", "json", "html", "sources", "all"],
+        default=[],
+        help="Optional extra exports generated by this Python script: xlsx json html sources all.",
+    )
+    parser.add_argument(
+        "--export-prefix",
+        type=Path,
+        default=None,
+        help="Output prefix for extra exports. Default: same as --output without suffix.",
+    )
+    parser.add_argument(
+        "--status-filter",
+        choices=[
+            "all",
+            "unparseable",
+            "missing_mismatch",
+            "present_mismatch",
+            "missing_consistent",
+            "present_consistent",
+            "has_missing",
+            "has_mismatch",
+            "all_present",
+        ],
+        default="all",
+        help="Status filter used by --export sources when --export all is not selected.",
+    )
+    parser.add_argument(
+        "--status-filter-label",
+        default=None,
+        help="Optional human-readable label used in source BAT names/comments.",
+    )
     parser.add_argument("--open", action="store_true", help="Open the generated HTML with the default browser.")
     return parser.parse_args(argv)
 
@@ -2626,6 +3210,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     bin_output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_text, encoding="utf-8")
     bin_output_path.write_bytes(payload_bytes)
+
+    if args.export:
+        print("      Writing extra exports from Python...")
+        run_extra_exports(args, payload, records, json_path, output_path)
 
     print("[6/6] Done.")
     print(f"Report generated: {output_path}")
