@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Multi-Model Contribution Classifier</title>
+<style>
+:root{--bg:#f4f6fa;--surf:#fff;--surf2:#f0f3f8;--surf3:#e8edf5;--bdr:#dde3ee;--bdr2:#c8d0e0;--tx:#1a2035;--mt:#6b7a99;--mt2:#9aa3ba;--ac:#2563eb;--ac2:#1d4ed8;--acbg:#eff4ff;--red:#dc2626;--orange:#ea580c;--purple:#7c3aed;--green:#16a34a;--mono:Consolas,"SFMono-Regular",monospace;--sans:Inter,"Segoe UI",sans-serif;--radius:6px;--shadow:0 1px 3px rgba(0,0,0,.08)}
+*{box-sizing:border-box;margin:0;padding:0}html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--tx);font:13px var(--sans)}
+.layout{display:grid;grid-template-columns:620px 1fr;grid-template-rows:52px 1fr;height:100vh}.header{grid-column:1/-1;display:flex;align-items:center;gap:12px;padding:0 18px;border-bottom:1px solid var(--bdr);background:var(--surf);box-shadow:var(--shadow);z-index:10}.htitle{font:600 13px var(--mono);color:var(--ac);letter-spacing:.04em}.hmeta{font:11px var(--mono);color:var(--mt)}.hbadges{margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.status,.model-pill{border:1px solid var(--bdr2);border-radius:4px;padding:3px 8px;font:10px var(--mono);background:var(--surf2)}.status{color:var(--ac)}.model-pill{display:inline-flex;align-items:center;gap:5px}.dot{width:7px;height:7px;border-radius:50%}
+.left{display:flex;min-width:0;flex-direction:column;overflow:hidden;background:var(--surf);border-right:1px solid var(--bdr)}.controls{padding:10px 12px;border-bottom:1px solid var(--bdr);display:grid;gap:7px;background:var(--surf2)}.search-row,.filter-row{display:flex;gap:6px}.search{flex:1;padding:7px 9px;border:1px solid var(--bdr2);border-radius:var(--radius);font:11px var(--mono);outline:none}.search:focus,select:focus{border-color:var(--ac);box-shadow:0 0 0 3px rgba(37,99,235,.12)}select{min-width:120px;padding:6px 8px;border:1px solid var(--bdr2);border-radius:var(--radius);background:var(--surf);font:11px var(--mono);outline:none}.export{margin-left:auto;padding:6px 12px;border:0;border-radius:var(--radius);background:var(--ac);color:#fff;font:500 10px var(--mono);cursor:pointer}.export:hover{background:var(--ac2)}
+.list-head,.row{display:grid;grid-template-columns:38px minmax(170px,1fr) 132px 64px 64px 58px;gap:5px;align-items:center;padding:0 10px}.list-head{height:29px;border-bottom:2px solid var(--bdr);background:var(--surf3);color:var(--mt);font:9px var(--mono);text-transform:uppercase}.list{flex:1;overflow:auto;position:relative}.inner{position:relative}.row{position:absolute;width:100%;height:36px;border-bottom:1px solid var(--bdr);cursor:pointer}.row:hover{background:var(--surf2)}.row.sel{background:var(--acbg);border-left:3px solid var(--ac);padding-left:7px}.rank,.num{font:10px var(--mono);color:var(--mt);text-align:right}.uid{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:10px var(--mono)}.badge{display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;border:1px solid;border-radius:4px;padding:2px 6px;white-space:nowrap;font:9px var(--mono)}.suspicious_noisy{color:var(--red);border-color:#fca5a5;background:#fef2f2}.boundary_ambiguous{color:var(--orange);border-color:#fdba74;background:#fff7ed}.hard_learnable{color:var(--ac);border-color:#93c5fd;background:#eff6ff}.clean_easy{color:var(--green);border-color:#86efac;background:#f0fdf4}.influential{color:var(--purple);border-color:#c4b5fd;background:#f5f3ff}.unknown{color:var(--mt);border-color:var(--bdr2);background:var(--surf2)}.pagination{display:flex;align-items:center;gap:8px;padding:6px 12px;border-top:1px solid var(--bdr);background:var(--surf2);font:10px var(--mono);color:var(--mt)}.pagination span{flex:1;text-align:center}.pagination button{padding:3px 10px;border:1px solid var(--bdr2);border-radius:4px;background:var(--surf);cursor:pointer}.pagination button:disabled{opacity:.35}
+.right{display:flex;min-width:0;flex-direction:column;overflow:hidden}.detail-head{padding:10px 20px;border-bottom:1px solid var(--bdr);background:var(--surf);box-shadow:var(--shadow)}.sample-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:600 12px var(--mono)}.reason{margin-top:5px;color:var(--mt);font-size:11px}.model-stats{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.stat{min-width:138px;padding:6px 9px;border:1px solid var(--bdr);border-radius:var(--radius);background:var(--surf)}.stat-name{font:600 9px var(--mono);text-transform:uppercase}.stat-values{display:flex;gap:10px;margin-top:4px}.stat-item label{display:block;color:var(--mt);font:8px var(--mono)}.stat-item b{font:600 12px var(--mono)}.meta{display:none;gap:5px 16px;flex-wrap:wrap;padding:7px 20px;border-bottom:1px solid var(--bdr);background:var(--surf2);font:10px var(--mono)}.meta.show{display:flex}.meta b{color:var(--mt2);font-weight:400;text-transform:uppercase}.path{flex-basis:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--mt)}
+.tabs{display:flex;padding:0 16px;border-bottom:1px solid var(--bdr);background:var(--surf2)}.tab{padding:8px 14px;border-bottom:2px solid transparent;color:var(--mt);font:11px var(--mono);cursor:pointer}.tab.active{border-bottom-color:var(--ac);color:var(--ac);font-weight:600}.chart-area{position:relative;flex:1;min-height:0;padding:14px 18px 10px}.placeholder,.error{height:100%;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--mt2);font:11px var(--mono)}.error{padding:20px;color:var(--red);white-space:pre-wrap}.chart-panel{display:none;height:100%;flex-direction:column}.chart-panel.active{display:flex}.chart-title{padding-bottom:7px;color:var(--mt);font:9px var(--mono);text-transform:uppercase}.legend{display:flex;gap:14px;flex-wrap:wrap;padding-bottom:8px;font:10px var(--mono)}.legend span{display:inline-flex;align-items:center;gap:5px}.line-key{width:16px;height:3px;border-radius:2px}.dash-key{width:16px;border-top:2px dashed}.canvas-wrap{position:relative;flex:1;min-height:220px;background:var(--surf)}canvas{position:absolute;inset:0;width:100%;height:100%}
+@media(max-width:1050px){.layout{grid-template-columns:480px 1fr}.list-head,.row{grid-template-columns:32px minmax(120px,1fr) 110px 52px 52px 45px}}@media(max-width:760px){html,body{overflow:auto}.layout{display:block;height:auto}.header{height:auto;min-height:52px}.left{height:58vh;border-right:0}.right{height:70vh}.list-head,.row{grid-template-columns:30px minmax(110px,1fr) 106px 48px}.hide-sm{display:none}}
+</style>
+</head>
+<body>
+<div class="layout">
+  <header class="header"><span class="htitle">CONTRIB SAMPLE CLASSIFIER</span><span class="hmeta" id="hmeta">正在加载...</span><div class="hbadges" id="hbadges"><span class="status" id="status">LOADING</span></div></header>
+  <section class="left">
+    <div class="controls">
+      <div class="search-row"><input id="search" class="search" placeholder="搜索样本名、标签或路径" autocomplete="off"><button class="export" onclick="exportVisibleCSV()">CSV</button></div>
+      <div class="filter-row"><select id="category"><option value="all">全部分类</option></select><select id="sort"><option value="score">按可疑分排序</option><option value="wrong">按错误率排序</option><option value="loss">按高 loss 比例排序</option><option value="name">按样本名排序</option></select></div>
+    </div>
+    <div class="list-head"><span>#</span><span>sample</span><span>category</span><span style="text-align:right">score</span><span style="text-align:right">wrong</span><span class="hide-sm" style="text-align:right">models</span></div>
+    <div class="list" id="list"><div class="inner" id="inner"></div></div>
+    <div class="pagination"><button id="prev">&#9664;</button><span id="page">-</span><button id="next">&#9654;</button></div>
+  </section>
+  <section class="right">
+    <div class="detail-head"><div class="sample-title" id="sample-title">- 点击左侧选择一个样本 -</div><div class="reason" id="reason"></div><div class="model-stats" id="model-stats"></div></div>
+    <div class="meta" id="meta"></div>
+    <div class="tabs"><button class="tab active" data-tab="lw">loss + weight</button><button class="tab" data-tab="grad">grad_norm</button><button class="tab" data-tab="align">align</button></div>
+    <div class="chart-area" id="chart-area"><div class="placeholder" id="placeholder">选择样本后显示各模型的 epoch 曲线</div>
+      <div class="chart-panel" id="panel-lw"><div class="chart-title">loss 与 weight 同坐标系（实线 loss，虚线 weight）</div><div class="legend" id="legend-lw"></div><div class="canvas-wrap"><canvas id="chart-lw"></canvas></div></div>
+      <div class="chart-panel" id="panel-grad"><div class="chart-title">grad_norm 轨迹</div><div class="legend" id="legend-grad"></div><div class="canvas-wrap"><canvas id="chart-grad"></canvas></div></div>
+      <div class="chart-panel" id="panel-align"><div class="chart-title">align 轨迹</div><div class="legend" id="legend-align"></div><div class="canvas-wrap"><canvas id="chart-align"></canvas></div></div>
+    </div>
+  </section>
+</div>
+<script>
+const SUMMARY_URL=__SUMMARY_URL__;
+const PAGE=100,ROW_H=36;
+let DATA={rows:[],models:[],categories:{}},filtered=[],pageStart=0,selected='',activeTab='lw',currentDetails=null;
+const shardCache=new Map();
+const $=id=>document.getElementById(id);
+const finite=x=>typeof x==='number'&&Number.isFinite(x);
+const fmt=(x,n=3)=>finite(x)?x.toFixed(n):'-';
+const pct=x=>finite(x)?(x*100).toFixed(1)+'%':'-';
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function rebuild(){
+  const q=$('search').value.trim().toLowerCase(),cat=$('category').value,sort=$('sort').value;
+  filtered=DATA.rows.filter(r=>(cat==='all'||r.category===cat)&&(!q||(r.sample_name+' '+r.category_label+' '+(r.json_label||'')+' '+(r.file_path||'')).toLowerCase().includes(q)));
+  const key={score:'mean_suspicious_score',wrong:'wrong_rate',loss:'high_loss_rate'}[sort];
+  filtered.sort((a,b)=>sort==='name'?a.sample_name.localeCompare(b.sample_name):((finite(b[key])?b[key]:-1)-(finite(a[key])?a[key]:-1)||a.sample_name.localeCompare(b.sample_name)));
+  pageStart=0;renderPage();
+}
+function renderPage(){
+  const slice=filtered.slice(pageStart,pageStart+PAGE),inner=$('inner');inner.style.height=(slice.length*ROW_H)+'px';
+  inner.innerHTML=slice.map((r,i)=>`<div class="row ${r.sample_name===selected?'sel':''}" style="top:${i*ROW_H}px" data-index="${pageStart+i}"><span class="rank">${pageStart+i+1}</span><span class="uid" title="${esc(r.sample_name)}">${esc(r.sample_name)}</span><span><span class="badge ${r.category}">${esc(r.category_label)}</span></span><span class="num">${fmt(r.mean_suspicious_score)}</span><span class="num">${pct(r.wrong_rate)}</span><span class="num hide-sm">${r.models_present}</span></div>`).join('');
+  inner.querySelectorAll('.row').forEach(el=>el.onclick=()=>selectSample(filtered[Number(el.dataset.index)]));
+  const pages=Math.max(1,Math.ceil(filtered.length/PAGE)),p=Math.floor(pageStart/PAGE)+1;$('page').textContent=`${p}/${pages} (${filtered.length.toLocaleString()})`;$('prev').disabled=pageStart===0;$('next').disabled=pageStart+PAGE>=filtered.length;$('list').scrollTop=0;
+}
+async function loadDetails(row){
+  const id=row.shard;if(shardCache.has(id))return shardCache.get(id)[row.sample_name]||{};
+  const base=SUMMARY_URL.replace(/[^/]+$/,'');const url=base+`detail_shard_${String(id).padStart(4,'0')}.json`;
+  const res=await fetch(url,{cache:'no-store'});if(!res.ok)throw new Error(`${url}\nHTTP ${res.status}`);
+  const shard=await res.json();shardCache.set(id,shard);return shard[row.sample_name]||{};
+}
+async function selectSample(row){
+  selected=row.sample_name;renderPage();$('sample-title').textContent=row.sample_name;$('reason').textContent='正在加载 epoch 明细...';$('model-stats').innerHTML='';$('meta').classList.remove('show');
+  try{currentDetails=await loadDetails(row);}catch(e){$('reason').textContent='明细加载失败';$('chart-area').innerHTML=`<div class="error">${esc(e.message)}\n请确认 HTML 和数据目录一起复制，并通过 http.server 打开。</div>`;return}
+  $('reason').innerHTML=`<span class="badge ${row.category}">${esc(row.category_label)}</span> &nbsp;${esc(row.reason)}`;
+  $('model-stats').innerHTML=DATA.models.map(m=>{const s=currentDetails[m.name];return `<div class="stat" style="border-color:${m.color}66"><div class="stat-name" style="color:${m.color}">${esc(m.name)}</div>${s?`<div class="stat-values"><span class="stat-item"><label>loss</label><b>${fmt(s.mean_loss)}</b></span><span class="stat-item"><label>weight</label><b>${fmt(s.mean_weight)}</b></span><span class="stat-item"><label>correct</label><b>${s.final_correct}</b></span><span class="stat-item"><label>egs</label><b>${s.n_egs}</b></span></div>`:'<div class="reason">未覆盖</div>'}</div>`}).join('');
+  const meta=[['label',row.json_label],['path',row.file_path]].filter(x=>x[1]);if(meta.length){$('meta').innerHTML=meta.map(([k,v])=>`<span class="${k==='path'?'path':''}"><b>${k}</b> ${esc(v)}</span>`).join('');$('meta').classList.add('show')}
+  $('placeholder').style.display='none';document.querySelectorAll('.chart-panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+activeTab));drawActive();
+}
+function seriesFor(tab){
+  const out=[];DATA.models.forEach(m=>{const s=currentDetails&&currentDetails[m.name];if(!s)return;if(tab==='lw'){out.push({label:m.name+' loss',data:s.loss_traj,color:m.color,dash:false});if((s.weight_traj||[]).some(finite))out.push({label:m.name+' weight',data:s.weight_traj,color:m.color,dash:true})}else{const a=tab==='grad'?s.grad_traj:s.align_traj;if((a||[]).some(finite))out.push({label:m.name,data:a,color:m.color,dash:false})}});return out;
+}
+function drawActive(){if(!currentDetails)return;drawChart($('chart-'+activeTab),seriesFor(activeTab),$('legend-'+activeTab),activeTab)}
+function drawChart(canvas,series,legend,tab){
+  legend.innerHTML=series.map(s=>`<span><i class="${s.dash?'dash-key':'line-key'}" style="${s.dash?'border-color':'background'}:${s.color}"></i>${esc(s.label)}</span>`).join('');
+  const rect=canvas.parentElement.getBoundingClientRect(),dpr=Math.min(devicePixelRatio||1,2),w=Math.max(300,Math.floor(rect.width)),h=Math.max(220,Math.floor(rect.height));canvas.width=w*dpr;canvas.height=h*dpr;const c=canvas.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);
+  const vals=series.flatMap(s=>(s.data||[]).filter(finite));if(!vals.length){c.fillStyle='#9aa3ba';c.font='12px Consolas';c.fillText('该指标没有采集到有效数据',24,36);return}
+  let ymin=Math.min(...vals),ymax=Math.max(...vals);if(tab==='align'){ymin=Math.min(-1,ymin);ymax=Math.max(1,ymax)}if(ymin===ymax){ymin-=.5;ymax+=.5}const extra=(ymax-ymin)*.06;ymin-=extra;ymax+=extra;
+  const L=58,R=18,T=18,B=38,pw=w-L-R,ph=h-T-B,n=Math.max(...series.map(s=>s.data.length));const xp=i=>L+(n<=1?0:i/(n-1))*pw,yp=v=>T+(ymax-v)/(ymax-ymin)*ph;
+  c.font='10px Consolas';c.lineWidth=1;c.strokeStyle='#e8edf5';c.fillStyle='#6b7a99';for(let i=0;i<5;i++){const y=T+ph*i/4;c.beginPath();c.moveTo(L,y);c.lineTo(w-R,y);c.stroke();const v=ymax-(ymax-ymin)*i/4;c.fillText(v.toFixed(3),4,y+3)}
+  const epochs=DATA.models.reduce((a,m)=>m.epochs.length>a.length?m.epochs:a,[]);const ticks=Math.min(8,n);for(let i=0;i<ticks;i++){const j=Math.round((n-1)*i/Math.max(1,ticks-1)),x=xp(j),lab=epochs[j]??j;c.fillText(String(lab),Math.max(L,x-8),h-14)}c.fillText('epoch',w-R-30,h-2);
+  series.forEach(s=>{c.strokeStyle=s.color;c.lineWidth=s.dash?1.7:2.2;c.setLineDash(s.dash?[6,4]:[]);c.beginPath();let open=false;(s.data||[]).forEach((v,i)=>{if(!finite(v)){open=false;return}const x=xp(i),y=yp(v);if(!open){c.moveTo(x,y);open=true}else c.lineTo(x,y)});c.stroke()});c.setLineDash([]);
+}
+function exportVisibleCSV(){const fields=['sample_name','category','reason','mean_suspicious_score','wrong_rate','high_loss_rate','conflict_rate','models_present'];const lines=[fields.join(',')].concat(filtered.map(r=>fields.map(k=>'"'+String(r[k]??'').replace(/"/g,'""')+'"').join(',')));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}));a.download='contrib_visible.csv';a.click();URL.revokeObjectURL(a.href)}
+async function boot(){
+  try{const res=await fetch(SUMMARY_URL,{cache:'no-store'});if(!res.ok)throw new Error(`${SUMMARY_URL}\nHTTP ${res.status}`);DATA=await res.json();
+    $('hmeta').textContent=`${DATA.rows.length.toLocaleString()} samples · ${DATA.models.length} 模型`;$('hbadges').innerHTML=DATA.models.map(m=>`<span class="model-pill"><i class="dot" style="background:${m.color}"></i>${esc(m.name)}</span>`).join('');
+    $('category').innerHTML='<option value="all">全部分类</option>'+Object.entries(DATA.categories).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join('');rebuild();
+    if(filtered.length)await selectSample(filtered[0]);
+  }catch(e){$('status').textContent='LOAD FAILED';$('hmeta').textContent='数据加载失败';$('chart-area').innerHTML=`<div class="error">${esc(e.message)}\n\n请在输出目录执行：python -m http.server 8000\n然后访问 http://localhost:8000/你的文件.html</div>`;console.error(e)}
+}
+$('search').addEventListener('input',()=>{clearTimeout(window._st);window._st=setTimeout(rebuild,160)});$('category').onchange=rebuild;$('sort').onchange=rebuild;$('prev').onclick=()=>{pageStart=Math.max(0,pageStart-PAGE);renderPage()};$('next').onclick=()=>{pageStart+=PAGE;renderPage()};document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{activeTab=t.dataset.tab;document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===t));document.querySelectorAll('.chart-panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+activeTab));requestAnimationFrame(drawActive)});window.addEventListener('resize',()=>requestAnimationFrame(drawActive));
+boot();
+</script>
+</body>
+</html>
