@@ -634,9 +634,8 @@ def export_csv(path, rows, models, meta):
 def export_html_data(out_html, rows, models, meta, shard_size=1000):
     t0 = time.time()
     base = os.path.splitext(out_html)[0]
-    data_dir = base + "_data"
-    os.makedirs(data_dir, exist_ok=True)
-    print(f"[html-data] writing external data under {data_dir}", flush=True)
+    bin_path = base + "_data.bin"
+    print(f"[html-data] writing one binary file: {bin_path}", flush=True)
 
     model_payload = [
         {
@@ -647,116 +646,105 @@ def export_html_data(out_html, rows, models, meta, shard_size=1000):
         }
         for mi, m in enumerate(models)
     ]
-
-    summary_payload = {
+    row_strings = []
+    for r in rows:
+        sample_meta = meta.get(r["sample_name"], {})
+        row_strings.append([
+            r["sample_name"], r.get("reason", ""),
+            sample_meta.get("json_label", ""), sample_meta.get("file_path", ""),
+        ])
+    manifest = {
+        "n": len(rows),
         "models": model_payload,
         "categories": CATEGORY_LABELS,
         "category_order": CATEGORIES,
-        "shard_size": shard_size,
+        "row_strings": row_strings,
     }
-
-    counts = defaultdict(int)
-    for r in rows:
-        counts[r["category"]] += 1
-    counts_html = "".join(
-        f'<button class="chip" data-cat="{html.escape(cat)}" onclick="setCategory(\'{html.escape(cat)}\')">'
-        f"{html.escape(CATEGORY_LABELS[cat])}<b>{counts[cat]}</b></button>"
-        for cat in CATEGORIES
-    )
-
-    index_name = os.path.basename(base) + "_index.bin"
-    index_path = os.path.join(data_dir, index_name)
-    summary_payload["index_file"] = index_name
-
-    print(f"[html-data] writing binary sample index: {index_path}", flush=True)
-    name_blobs = [r["sample_name"].encode("utf-8") for r in rows]
-    names_blob = b"\n".join(name_blobs)
+    manifest_blob = json.dumps(
+        json_safe(manifest), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
     category_to_code = {name: i for i, name in enumerate(CATEGORIES)}
 
-    def f32_values(key):
+    def row_f32(key):
         return np.asarray([
             float(r.get(key)) if isinstance(r.get(key), (int, float, np.integer, np.floating)) else np.nan
             for r in rows
         ], dtype="<f4")
 
-    binary = bytearray(struct.pack("<8sIIII", b"CCLSBIN1", 1, len(rows), len(names_blob), 0))
+    def model_f32(model, key):
+        return np.asarray([
+            model["sample_data"].get(r["sample_name"], {}).get(key, np.nan)
+            for r in rows
+        ], dtype="<f4")
 
-    def append_aligned(payload):
-        binary.extend(payload)
-        binary.extend(b"\0" * ((-len(binary)) % 4))
+    def quantized_trajectory(model, key):
+        ne = len(model["epochs"])
+        values = np.full((len(rows), ne), np.nan, dtype=np.float32)
+        for i, r in enumerate(rows):
+            traj = model["sample_data"].get(r["sample_name"], {}).get(key, [])
+            if traj:
+                take = min(ne, len(traj))
+                values[i, :take] = np.asarray([
+                    np.nan if v is None else v for v in traj[:take]
+                ], dtype=np.float32)
+        valid = np.isfinite(values)
+        if valid.any():
+            lo, hi = float(values[valid].min()), float(values[valid].max())
+            if hi <= lo:
+                hi = lo + 1.0
+        else:
+            lo, hi = 0.0, 1.0
+        out = np.full(values.shape, 255, dtype=np.uint8)
+        out[valid] = np.clip(np.rint((values[valid] - lo) / (hi - lo) * 254.0), 0, 254).astype(np.uint8)
+        return lo, hi, out
 
-    append_aligned(np.asarray([category_to_code.get(r["category"], len(CATEGORIES) - 1) for r in rows], dtype=np.uint8).tobytes())
-    append_aligned(np.asarray([r.get("models_present", 0) for r in rows], dtype="<u2").tobytes())
-    append_aligned(np.asarray([i // max(shard_size, 1) for i in range(len(rows))], dtype="<u4").tobytes())
-    for key in ("mean_suspicious_score", "wrong_rate", "high_loss_rate", "conflict_rate", "model_coverage"):
-        append_aligned(f32_values(key).tobytes())
-    binary.extend(names_blob)
-    with open(index_path, "wb") as f:
-        f.write(binary)
-    print(f"[html-data] binary index size={len(binary) / 1e6:.1f} MB", flush=True)
+    with open(bin_path, "wb") as f:
+        f.write(struct.pack("<8sII", b"CCLSALL1", 1, len(manifest_blob)))
+        f.write(manifest_blob)
+        f.write(b"\0" * ((-f.tell()) % 4))
 
-    summary_name = os.path.basename(base) + "_summary.json"
-    summary_path = os.path.join(data_dir, summary_name)
-    print(f"[html-data] writing summary: {summary_path}", flush=True)
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(json_safe(summary_payload), f, ensure_ascii=False,
-                  separators=(",", ":"), allow_nan=False)
+        def append_aligned(payload):
+            f.write(payload)
+            pad = (-f.tell()) % 4
+            if pad:
+                f.write(b"\0" * pad)
 
-    total_shards = int(math.ceil(len(rows) / max(shard_size, 1)))
-    for shard_id in range(total_shards):
-        start = shard_id * shard_size
-        end = min(start + shard_size, len(rows))
-        shard = {}
-        for r in rows[start:end]:
-            sample = r["sample_name"]
-            per_model = {}
-            for m in models:
-                d = m["sample_data"].get(sample)
-                if not d:
-                    continue
-                per_model[m["name"]] = {
-                    "n_egs": d["n_egs"],
-                    "mean_loss": d["mean_loss"],
-                    "loss_pct": d.get("loss_pct"),
-                    "final_correct": d["final_correct"],
-                    "forget_events": d["forget_events"],
-                    "frac_neg_align": d["frac_neg_align"],
-                    "mean_align": d["mean_align"],
-                    "mean_weight": d["mean_weight"],
-                    "weight_low_pct": d.get("weight_low_pct"),
-                    "score": d.get("model_suspicious_score"),
-                    "loss_traj": d["loss_traj"],
-                    "weight_traj": d["weight_traj"],
-                    "grad_traj": d["grad_traj"],
-                    "align_traj": d["align_traj"],
-                }
-            sample_meta = meta.get(sample, {})
-            shard[sample] = {
-                "summary": {
-                    **r,
-                    "json_label": sample_meta.get("json_label", ""),
-                    "file_path": sample_meta.get("file_path", ""),
-                    "detector_id": sample_meta.get("detector_id", ""),
-                    "channel_id": sample_meta.get("channel_id", ""),
-                    "project": sample_meta.get("project", ""),
-                    "duration": sample_meta.get("duration", ""),
-                    "time_point": sample_meta.get("time_point", ""),
-                },
-                "models": per_model,
-            }
+        append_aligned(np.asarray([
+            category_to_code.get(r["category"], len(CATEGORIES) - 1) for r in rows
+        ], dtype=np.uint8).tobytes())
+        append_aligned(np.asarray([r.get("models_present", 0) for r in rows], dtype="<u2").tobytes())
+        for key in ("mean_suspicious_score", "wrong_rate", "high_loss_rate", "conflict_rate", "model_coverage"):
+            append_aligned(row_f32(key).tobytes())
 
-        shard_name = f"detail_shard_{shard_id:04d}.json"
-        shard_path = os.path.join(data_dir, shard_name)
-        with open(shard_path, "w", encoding="utf-8") as f:
-            json.dump(json_safe(shard), f, ensure_ascii=False,
-                      separators=(",", ":"), allow_nan=False)
-        if shard_id == 0 or (shard_id + 1) % 10 == 0 or shard_id + 1 == total_shards:
-            size_mb = os.path.getsize(shard_path) / 1e6
-            print(
-                f"[html-data] shard {shard_id + 1}/{total_shards}: "
-                f"samples={end - start}, size={size_mb:.1f} MB",
-                flush=True,
-            )
+        static_keys = (
+            "mean_loss", "loss_pct", "frac_neg_align", "mean_align",
+            "mean_weight", "weight_low_pct", "model_suspicious_score",
+        )
+        trajectory_keys = ("loss_traj", "weight_traj", "grad_traj", "align_traj")
+        for mi, model in enumerate(models, start=1):
+            print(f"[html-data] packing model {mi}/{len(models)}: {model['name']}", flush=True)
+            present = np.asarray([
+                r["sample_name"] in model["sample_data"] for r in rows
+            ], dtype=np.uint8)
+            append_aligned(present.tobytes())
+            append_aligned(np.asarray([
+                model["sample_data"].get(r["sample_name"], {}).get("n_egs", 0) for r in rows
+            ], dtype="<u2").tobytes())
+            append_aligned(np.asarray([
+                model["sample_data"].get(r["sample_name"], {}).get("final_correct", -1) for r in rows
+            ], dtype=np.int8).tobytes())
+            append_aligned(np.asarray([
+                model["sample_data"].get(r["sample_name"], {}).get("forget_events", 0) for r in rows
+            ], dtype="<u2").tobytes())
+            for key in static_keys:
+                append_aligned(model_f32(model, key).tobytes())
+
+            for key in trajectory_keys:
+                lo, hi, packed = quantized_trajectory(model, key)
+                append_aligned(np.asarray([lo, hi], dtype="<f4").tobytes())
+                append_aligned(packed.tobytes())
+
+    print(f"[html-data] binary size={os.path.getsize(bin_path) / 1e6:.1f} MB", flush=True)
 
     template_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -771,11 +759,10 @@ def export_html_data(out_html, rows, models, meta, shard_size=1000):
             f"HTML template not found: {template_path}. "
             "Keep classify_contrib_template.html beside this script."
         )
-    doc = template.replace("__SUMMARY_URL__", json.dumps(os.path.join(os.path.basename(data_dir), summary_name).replace("\\", "/")))
-    doc = doc.replace("__COUNTS__", counts_html)
+    doc = template.replace("__DATA_URL__", json.dumps(os.path.basename(bin_path).replace("\\", "/")))
     with open(out_html, "w", encoding="utf-8") as f:
         f.write(doc)
-    print(f"[html-data] html shell wrote {out_html} ({time.time() - t0:.1f}s)", flush=True)
+    print(f"[html-data] html + one bin wrote in {time.time() - t0:.1f}s", flush=True)
 
 
 HTML_TEMPLATE = r"""<!doctype html>
@@ -980,13 +967,13 @@ def main():
     ap.add_argument("--output", default="contrib_sample_classification.html")
     ap.add_argument("--csv", default="", help="Output CSV path. Defaults to OUTPUT basename + .csv.")
     ap.add_argument("--min-model-coverage", type=float, default=0.5)
-    ap.add_argument("--shard-size", type=int, default=1000, help="Samples per external detail JSON shard.")
+    ap.add_argument("--shard-size", type=int, default=1000, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     print("=" * 72, flush=True)
     print("[start] contrib sample classification", flush=True)
     print(f"[args] output={args.output}", flush=True)
-    print(f"[args] min_model_coverage={args.min_model_coverage}, shard_size={args.shard_size}", flush=True)
+    print(f"[args] min_model_coverage={args.min_model_coverage}", flush=True)
 
     specs = parse_model_specs(args)
     model_egs_specs = parse_model_egs_specs(args.model_egs)
@@ -1022,10 +1009,10 @@ def main():
     export_csv(out_csv, rows, models, meta)
     print(f"[csv] wrote {out_csv}, {time.time() - t0:.1f}s")
 
-    print("[stage 5/6] writing external HTML data shards", flush=True)
+    print("[stage 5/6] writing HTML and one combined BIN file", flush=True)
     t0 = time.time()
     export_html_data(out_html, rows, models, meta, shard_size=args.shard_size)
-    print(f"[html] wrote shell + data shards for {out_html}, {time.time() - t0:.1f}s")
+    print(f"[html] wrote HTML + BIN for {out_html}, {time.time() - t0:.1f}s")
 
     print("[stage 6/6] finished", flush=True)
     print("[done] samples:", len(rows))
