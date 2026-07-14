@@ -45,10 +45,10 @@
   </section>
 </div>
 <script>
-const SUMMARY_URL=__SUMMARY_URL__;
+const DATA_URL=__DATA_URL__;
 const PAGE=100,ROW_H=36;
 let DATA={rows:[],models:[],categories:{}},filtered=[],pageStart=0,selected='',activeTab='loss',currentDetails=null;
-const shardCache=new Map();
+let MDL=[];
 const $=id=>document.getElementById(id);
 const finite=x=>typeof x==='number'&&Number.isFinite(x);
 const fmt=(x,n=3)=>finite(x)?x.toFixed(n):'-';
@@ -68,16 +68,21 @@ function renderPage(){
   inner.querySelectorAll('.row').forEach(el=>el.onclick=()=>selectSample(filtered[Number(el.dataset.index)]));
   const pages=Math.max(1,Math.ceil(filtered.length/PAGE)),p=Math.floor(pageStart/PAGE)+1;$('page').textContent=`${p}/${pages} (${filtered.length.toLocaleString()})`;$('prev').disabled=pageStart===0;$('next').disabled=pageStart+PAGE>=filtered.length;$('list').scrollTop=0;
 }
-async function loadDetails(row){
-  const id=row.shard;if(shardCache.has(id))return shardCache.get(id)[row.sample_name]||{};
-  const base=SUMMARY_URL.replace(/[^/]+$/,'');const url=base+`detail_shard_${String(id).padStart(4,'0')}.json`;
-  const res=await fetch(url,{cache:'no-store'});if(!res.ok)throw new Error(`${url}\nHTTP ${res.status}`);
-  const shard=await res.json();shardCache.set(id,shard);return shard[row.sample_name]||{summary:{},models:{}};
+function decodeTrajectory(model,type,idx){
+  const ne=model.ne,q=model[type+'Q'],range=model.ranges[type];if(!q||!ne)return [];
+  const out=new Array(ne),base=idx*ne,lo=range[0],span=range[1]-range[0];
+  for(let e=0;e<ne;e++){const v=q[base+e];out[e]=v===255?null:lo+(v/254)*span}return out;
 }
-async function selectSample(row){
-  selected=row.sample_name;renderPage();$('sample-title').textContent=row.sample_name;$('reason').textContent='正在加载 epoch 明细...';$('model-stats').innerHTML='';$('meta').classList.remove('show');
-  let entry;
-  try{entry=await loadDetails(row);row={...row,...(entry.summary||{})};currentDetails=entry.models||{};}catch(e){$('reason').textContent='明细加载失败';$('chart-area').innerHTML=`<div class="error">${esc(e.message)}\n请确认 HTML 和数据目录一起复制，并通过 http.server 打开。</div>`;return}
+function loadDetails(row){
+  const details={};
+  DATA.models.forEach((def,mi)=>{const m=MDL[mi],i=row._idx;if(!m||!m.present[i])return;details[def.name]={
+    n_egs:m.nEgs[i],mean_loss:m.meanLoss[i],loss_pct:m.lossPct[i],final_correct:m.correct[i],forget_events:m.forget[i],
+    frac_neg_align:m.negAlign[i],mean_align:m.meanAlign[i],mean_weight:m.meanWeight[i],weight_low_pct:m.weightLowPct[i],score:m.score[i],
+    loss_traj:decodeTrajectory(m,'loss',i),weight_traj:decodeTrajectory(m,'weight',i),grad_traj:decodeTrajectory(m,'grad',i),align_traj:decodeTrajectory(m,'align',i)
+  }});return details;
+}
+function selectSample(row){
+  selected=row.sample_name;renderPage();$('sample-title').textContent=row.sample_name;$('model-stats').innerHTML='';$('meta').classList.remove('show');currentDetails=loadDetails(row);
   $('reason').innerHTML=`<span class="badge ${row.category}">${esc(row.category_label)}</span> &nbsp;${esc(row.reason)}`;
   $('model-stats').innerHTML=DATA.models.map(m=>{const s=currentDetails[m.name];return `<div class="stat" style="border-color:${m.color}66"><div class="stat-name" style="color:${m.color}">${esc(m.name)}</div>${s?`<div class="stat-values"><span class="stat-item"><label>loss</label><b>${fmt(s.mean_loss)}</b></span><span class="stat-item"><label>weight</label><b>${fmt(s.mean_weight)}</b></span><span class="stat-item"><label>correct</label><b>${s.final_correct}</b></span><span class="stat-item"><label>egs</label><b>${s.n_egs}</b></span></div>`:'<div class="reason">未覆盖</div>'}</div>`}).join('');
   const meta=[['label',row.json_label],['path',row.file_path]].filter(x=>x[1]);if(meta.length){$('meta').innerHTML=meta.map(([k,v])=>`<span class="${k==='path'?'path':''}"><b>${k}</b> ${esc(v)}</span>`).join('');$('meta').classList.add('show')}
@@ -98,25 +103,27 @@ function drawChart(canvas,series,legend,tab){
   series.forEach(s=>{c.strokeStyle=s.color;c.lineWidth=s.dash?1.7:2.2;c.setLineDash(s.dash?[6,4]:[]);c.beginPath();let open=false;(s.data||[]).forEach((v,i)=>{if(!finite(v)){open=false;return}const x=xp(i),y=yp(v);if(!open){c.moveTo(x,y);open=true}else c.lineTo(x,y)});c.stroke()});c.setLineDash([]);
 }
 function exportVisibleCSV(){const fields=['sample_name','category','reason','mean_suspicious_score','wrong_rate','high_loss_rate','conflict_rate','models_present'];const lines=[fields.join(',')].concat(filtered.map(r=>fields.map(k=>'"'+String(r[k]??'').replace(/"/g,'""')+'"').join(',')));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}));a.download='contrib_visible.csv';a.click();URL.revokeObjectURL(a.href)}
-function parseIndex(buf){
-  const dv=new DataView(buf),magic=new TextDecoder().decode(new Uint8Array(buf,0,8));if(magic!=='CCLSBIN1')throw new Error('索引文件格式错误: '+magic);
-  const version=dv.getUint32(8,true),n=dv.getUint32(12,true),namesBytes=dv.getUint32(16,true);if(version!==1)throw new Error('不支持的索引版本: '+version);
-  let o=24;const align=()=>{o=(o+3)&~3};
-  const categories=new Uint8Array(buf,o,n);o+=n;align();
-  const present=new Uint16Array(buf,o,n);o+=n*2;align();
-  const shards=new Uint32Array(buf,o,n);o+=n*4;align();
-  const takeF32=()=>{const a=new Float32Array(buf,o,n);o+=n*4;align();return a};
-  const scores=takeF32(),wrong=takeF32(),loss=takeF32(),conflict=takeF32(),coverage=takeF32();
-  const names=new TextDecoder('utf-8').decode(new Uint8Array(buf,o,namesBytes)).split('\n');
-  if(names.length!==n)throw new Error(`索引样本名数量不匹配: ${names.length}/${n}`);
-  return Array.from({length:n},(_,i)=>({sample_name:names[i],category:DATA.category_order[categories[i]]||'unknown',category_label:DATA.categories[DATA.category_order[categories[i]]]||'采集不足',models_present:present[i],shard:shards[i],mean_suspicious_score:scores[i],wrong_rate:wrong[i],high_loss_rate:loss[i],conflict_rate:conflict[i],model_coverage:coverage[i]}));
+function parseDataBin(buf){
+  const dv=new DataView(buf),magic=new TextDecoder().decode(new Uint8Array(buf,0,8));if(magic!=='CCLSALL1')throw new Error('BIN 文件格式错误: '+magic);
+  const version=dv.getUint32(8,true),manifestLen=dv.getUint32(12,true);if(version!==1)throw new Error('不支持的 BIN 版本: '+version);
+  DATA=JSON.parse(new TextDecoder('utf-8').decode(new Uint8Array(buf,16,manifestLen)));const n=DATA.n;
+  let o=16+manifestLen;const align=()=>{o=(o+3)&~3};align();
+  const takeU8=count=>{const a=new Uint8Array(buf,o,count);o+=count;align();return a};
+  const takeI8=count=>{const a=new Int8Array(buf,o,count);o+=count;align();return a};
+  const takeU16=count=>{const a=new Uint16Array(buf,o,count);o+=count*2;align();return a};
+  const takeF32=count=>{const a=new Float32Array(buf,o,count);o+=count*4;align();return a};
+  const categories=takeU8(n),presentCount=takeU16(n),scores=takeF32(n),wrong=takeF32(n),loss=takeF32(n),conflict=takeF32(n),coverage=takeF32(n);
+  DATA.rows=Array.from({length:n},(_,i)=>{const strings=DATA.row_strings[i]||[];const cat=DATA.category_order[categories[i]]||'unknown';return {
+    _idx:i,sample_name:strings[0]||String(i),reason:strings[1]||'',json_label:strings[2]||'',file_path:strings[3]||'',category:cat,category_label:DATA.categories[cat]||'采集不足',
+    models_present:presentCount[i],mean_suspicious_score:scores[i],wrong_rate:wrong[i],high_loss_rate:loss[i],conflict_rate:conflict[i],model_coverage:coverage[i]
+  }});delete DATA.row_strings;
+  MDL=DATA.models.map(def=>{const ne=def.epochs.length,m={ne,ranges:{}};m.present=takeU8(n);m.nEgs=takeU16(n);m.correct=takeI8(n);m.forget=takeU16(n);m.meanLoss=takeF32(n);m.lossPct=takeF32(n);m.negAlign=takeF32(n);m.meanAlign=takeF32(n);m.meanWeight=takeF32(n);m.weightLowPct=takeF32(n);m.score=takeF32(n);const size=n*ne;['loss','weight','grad','align'].forEach(type=>{const rr=takeF32(2);m.ranges[type]=[rr[0],rr[1]];m[type+'Q']=takeU8(size)});return m});
 }
 async function boot(){
-  try{const res=await fetch(SUMMARY_URL,{cache:'no-store'});if(!res.ok)throw new Error(`${SUMMARY_URL}\nHTTP ${res.status}`);DATA=await res.json();
-    $('hmeta').textContent='正在加载二进制样本索引...';const base=SUMMARY_URL.replace(/[^/]+$/,'');const indexUrl=base+DATA.index_file;const ir=await fetch(indexUrl,{cache:'no-store'});if(!ir.ok)throw new Error(`${indexUrl}\nHTTP ${ir.status}`);DATA.rows=parseIndex(await ir.arrayBuffer());
+  try{const res=await fetch(DATA_URL,{cache:'no-store'});if(!res.ok)throw new Error(`${DATA_URL}\nHTTP ${res.status}`);$('hmeta').textContent='正在解析单个 BIN 文件...';parseDataBin(await res.arrayBuffer());
     $('hmeta').textContent=`${DATA.rows.length.toLocaleString()} samples · ${DATA.models.length} 模型`;$('hbadges').innerHTML=DATA.models.map(m=>`<span class="model-pill"><i class="dot" style="background:${m.color}"></i>${esc(m.name)}</span>`).join('');
     $('category').innerHTML='<option value="all">全部分类</option>'+Object.entries(DATA.categories).map(([k,v])=>`<option value="${k}">${esc(v)}</option>`).join('');rebuild();
-    if(filtered.length)await selectSample(filtered[0]);
+    if(filtered.length)selectSample(filtered[0]);
   }catch(e){$('status').textContent='LOAD FAILED';$('hmeta').textContent='数据加载失败';$('chart-area').innerHTML=`<div class="error">${esc(e.message)}\n\n请在输出目录执行：python -m http.server 8000\n然后访问 http://localhost:8000/你的文件.html</div>`;console.error(e)}
 }
 $('search').addEventListener('input',()=>{clearTimeout(window._st);window._st=setTimeout(rebuild,160)});$('category').onchange=rebuild;$('sort').onchange=rebuild;$('prev').onclick=()=>{pageStart=Math.max(0,pageStart-PAGE);renderPage()};$('next').onclick=()=>{pageStart+=PAGE;renderPage()};document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{activeTab=t.dataset.tab;document.querySelectorAll('.tab').forEach(x=>{const on=x===t;x.classList.toggle('active',on);x.setAttribute('aria-selected',String(on))});document.querySelectorAll('.chart-panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+activeTab));requestAnimationFrame(drawActive)});window.addEventListener('resize',()=>requestAnimationFrame(drawActive));
