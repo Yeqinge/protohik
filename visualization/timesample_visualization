@@ -1900,38 +1900,55 @@ def html_template(data_file_name: str) -> str:
       setExportProgress(8, '正在给全量样本写入状态标签...');
       await nextFrame();
       const {{ before, after }} = currentWindowParams();
-      const datas = records.map(rec => {{
+      const counts = Object.fromEntries(STATUS_DEFS.map(([key]) => [key, 0]));
+      const chunks = [];
+      let buffer = '';
+      const flushLimit = 1024 * 1024;
+      for (let i = 0; i < records.length; i += 1) {{
+        const rec = records[i];
         const status = classifyRecord(rec, before, after);
+        counts[status.key] = (counts[status.key] || 0) + 1;
         const row = rebuildOriginalLikeRecord(rec);
         row.time_context_status = statusPayload(rec, status, before, after);
-        return row;
-      }});
-      const counts = statusSummary(records.map(rec => ({{ rec, status: classifyRecord(rec, before, after) }})));
-      const out = {{
-        meta: {{
-          source_json: meta.sourceJson || '',
-          generated_at: new Date().toISOString(),
-          before,
-          after,
-          record_count: datas.length,
-          status_counts: counts,
-          status_labels: STATUS_LABELS,
-        }},
-        datas,
+        const piece = (i === 0 ? '' : ',\n') + JSON.stringify(row);
+        if (buffer.length + piece.length > flushLimit) {{
+          chunks.push(buffer);
+          buffer = '';
+        }}
+        buffer += piece;
+        if (i > 0 && i % 1000 === 0) {{
+          setExportProgress(8 + Math.min(68, i / Math.max(records.length, 1) * 68), `正在生成 JSON：${{i.toLocaleString()}} / ${{records.length.toLocaleString()}}`);
+          await nextFrame();
+        }}
+      }}
+      if (buffer) chunks.push(buffer);
+      const metaOut = {{
+        source_json: meta.sourceJson || '',
+        generated_at: new Date().toISOString(),
+        before,
+        after,
+        record_count: records.length,
+        status_counts: counts,
+        status_labels: STATUS_LABELS,
       }};
       setExportProgress(78, '正在生成 JSON 文件...');
       await nextFrame();
-      const blob = new Blob([JSON.stringify(out, null, 2)], {{ type: 'application/json;charset=utf-8' }});
+      const blobParts = ['{{"meta":', JSON.stringify(metaOut), ',"datas":[\n'].concat(chunks, ['\n]}}']);
+      const blob = new Blob(blobParts, {{ type: 'application/json;charset=utf-8' }});
       downloadBlob(blob, `sample_context_tagged_${{exportStamp()}}.json`);
-      setExportProgress(100, `JSON 已开始下载：${{datas.length.toLocaleString()}} 条`);
+      setExportProgress(100, `JSON 已开始下载：${{records.length.toLocaleString()}} 条`);
     }}
 
     function buildSummaryScatter(items) {{
       const width = 760;
       const height = 430;
       const pad = 54;
-      const maxMissing = Math.max(1, ...items.map(item => item.status.missing));
-      const maxMismatch = Math.max(1, ...items.map(item => item.status.mismatch));
+      let maxMissing = 1;
+      let maxMismatch = 1;
+      for (const item of items) {{
+        if (item.status.missing > maxMissing) maxMissing = item.status.missing;
+        if (item.status.mismatch > maxMismatch) maxMismatch = item.status.mismatch;
+      }}
       const colorByStatus = Object.fromEntries(STATUS_DEFS.map(([key, , color]) => [key, color]));
       const ticks = [0, 0.25, 0.5, 0.75, 1];
       const grid = ticks.map(t => {{
