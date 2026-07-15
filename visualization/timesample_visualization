@@ -85,6 +85,7 @@ SOURCE_EXPORT_FILTERS = [
     ("present_consistent", "无缺失_无不一致"),
     ("has_missing", "有缺失"),
     ("has_mismatch", "有不一致"),
+    ("no_mismatch", "无不一致"),
     ("all_present", "无缺失"),
 ]
 
@@ -559,6 +560,8 @@ def matches_status_filter(item: Dict[str, Any], filter_key: str) -> bool:
         return bool(status["has_missing"])
     if filter_key == "has_mismatch":
         return bool(status["has_mismatch"])
+    if filter_key == "no_mismatch":
+        return status["key"] != "unparseable" and not status["has_mismatch"]
     if filter_key == "all_present":
         return status["key"] != "unparseable" and not status["has_missing"]
     return status["key"] == filter_key
@@ -672,7 +675,7 @@ table{{width:100%;border-collapse:collapse;background:#fff}} th,td{{border-botto
 <header><h1>样本时间维度状态汇总</h1><div class="meta">源 JSON: {html.escape(str(source_json))}<br>生成时间: {dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}<br>窗口: -{before} / +{after}</div></header>
 <div class="toolbar">
   <div><label for="datasetFilter">数据集</label><select id="datasetFilter"><option value="all">全部数据集</option>{dataset_options}</select></div>
-  <div><label for="statusFilter">状态</label><select id="statusFilter"><option value="all">全部状态</option><option value="has_missing">有缺失</option><option value="has_mismatch">有不一致</option><option value="all_present">无缺失</option></select></div>
+  <div><label for="statusFilter">状态</label><select id="statusFilter"><option value="all">全部状态</option><option value="has_missing">有缺失</option><option value="has_mismatch">有不一致</option><option value="no_mismatch">无不一致</option><option value="all_present">无缺失</option></select></div>
   <div class="muted" id="filterNote"></div>
 </div>
 <div class="summary" id="summary"></div>
@@ -698,6 +701,7 @@ function matchesStatus(row, key) {{
   if (key === 'all') return true;
   if (key === 'has_missing') return row.missing > 0;
   if (key === 'has_mismatch') return row.mismatch > 0;
+  if (key === 'no_mismatch') return row.statusKey !== 'unparseable' && row.mismatch === 0;
   if (key === 'all_present') return row.statusKey !== 'unparseable' && row.missing === 0;
   return row.statusKey === key;
 }}
@@ -1672,6 +1676,7 @@ def html_template(data_file_name: str) -> str:
             <option value="present_consistent">无缺失 + 无不一致</option>
             <option value="has_missing">有缺失</option>
             <option value="has_mismatch">有不一致</option>
+            <option value="no_mismatch">无不一致</option>
             <option value="all_present">都存在</option>
           </select>
         </div>
@@ -2039,6 +2044,7 @@ def html_template(data_file_name: str) -> str:
       if (status.key === 'unparseable') return filterValue === 'unparseable';
       if (filterValue === 'has_missing' || filterValue === 'any_missing') return status.missing > 0;
       if (filterValue === 'has_mismatch') return status.mismatch > 0;
+      if (filterValue === 'no_mismatch') return status.key !== 'unparseable' && status.mismatch === 0;
       if (filterValue === 'all_present') return status.key !== 'unparseable' && status.missing === 0;
       return status.key === filterValue;
     }}
@@ -2729,6 +2735,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "present_consistent",
             "has_missing",
             "has_mismatch",
+            "no_mismatch",
             "all_present",
         ],
         default="all",
