@@ -171,10 +171,10 @@ def normalize_sample_name(raw, json_names=None):
 
 def load_json_name_map(path):
     if not path:
-        return {}, set()
+        return {}, set(), {"kind": "none"}
     if not os.path.exists(path):
         print(f"[warn] JSON file not found, ignored: {path}")
-        return {}, set()
+        return {}, set(), {"kind": "none"}
 
     t0 = time.time()
     print(f"[json] reading {path} ...", flush=True)
@@ -182,7 +182,21 @@ def load_json_name_map(path):
         data = json.load(f)
     print(f"[json] parsed JSON in {time.time() - t0:.1f}s", flush=True)
 
-    items = data if isinstance(data, list) else data.get("datas", data.get("data", data.get("items", [])))
+    data_key = None
+    if isinstance(data, list):
+        items = data
+        json_layout = {"kind": "list"}
+    else:
+        for candidate in ("datas", "data", "items"):
+            if isinstance(data.get(candidate), list):
+                data_key = candidate
+                break
+        items = data.get(data_key, []) if data_key else []
+        json_layout = {
+            "kind": "dict",
+            "data_key": data_key or "datas",
+            "extra": {k: v for k, v in data.items() if k != data_key},
+        }
     meta = {}
     names = set()
     for item in items:
@@ -197,7 +211,8 @@ def load_json_name_map(path):
         if not name:
             continue
         names.add(name)
-        meta[name] = {
+        entry = meta.setdefault(name, {})
+        entry.update({
             "json_label": item.get("label", ""),
             "file_path": item.get("file_path", item.get("wav_path", item.get("path", ""))),
             "detector_id": item.get("detector_id", ""),
@@ -205,9 +220,10 @@ def load_json_name_map(path):
             "project": item.get("project", ""),
             "duration": item.get("duration", ""),
             "time_point": item.get("time_point", ""),
-        }
+        })
+        entry.setdefault("_original_records", []).append(item)
     print(f"[json] loaded {len(items)} records, {len(names)} normalized names ({time.time() - t0:.1f}s)", flush=True)
-    return meta, names
+    return meta, names, json_layout
 
 
 def load_egs_map(path, json_names=None):
@@ -645,7 +661,7 @@ def build_export_records(rows, models, meta):
     for row in rows:
         sample = row["sample_name"]
         out = dict(row)
-        out.update(meta.get(sample, {}))
+        out.update({k: v for k, v in meta.get(sample, {}).items() if not k.startswith("_")})
         for model in models:
             name = model["name"]
             d = model["sample_data"].get(sample, {})
@@ -660,27 +676,32 @@ def build_export_records(rows, models, meta):
     return records
 
 
-def export_grouped_json(path, records, selected_categories=None):
+def export_original_json(path, records, meta, json_layout, selected_categories=None):
     selected = list(selected_categories or CATEGORIES)
     filtered_records = [r for r in records if r.get("category") in selected]
-    counts = {cat: sum(1 for r in filtered_records if r.get("category") == cat) for cat in selected}
-    payload = {
-        "summary": {
-            "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "record_count": len(filtered_records),
-            "selected_categories": selected,
-            "category_counts": counts,
-            "category_labels": {cat: CATEGORY_LABELS[cat] for cat in selected},
-        },
-        "groups": {
-            cat: {
-                "label": CATEGORY_LABELS[cat],
-                "count": counts[cat],
-                "datas": [r for r in records if r.get("category") == cat],
-            }
-            for cat in selected
-        },
+    metadata_fields = {
+        "json_label", "file_path", "detector_id", "channel_id", "project",
+        "duration", "time_point",
     }
+    exported_items = []
+    for record in filtered_records:
+        sample = record["sample_name"]
+        classification = {
+            k: v for k, v in record.items()
+            if k not in metadata_fields and not str(k).startswith("_")
+        }
+        originals = meta.get(sample, {}).get("_original_records") or [{"ID": sample}]
+        for original in originals:
+            item = dict(json_safe(original)) if isinstance(original, dict) else {"value": json_safe(original)}
+            item["contrib_classification"] = classification
+            exported_items.append(item)
+
+    layout = json_layout or {"kind": "none"}
+    if layout.get("kind") == "list":
+        payload = exported_items
+    else:
+        payload = dict(json_safe(layout.get("extra", {})))
+        payload[layout.get("data_key", "datas")] = exported_items
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, allow_nan=False)
 
@@ -788,22 +809,61 @@ def export_source_lists(directory, records, formats):
 
 
 def export_summary_html(path, records):
-    counts = {cat: sum(1 for r in records if r.get("category") == cat) for cat in CATEGORIES}
-    max_count = max(counts.values()) if counts else 1
-    bars = "".join(
-        f'<div class="bar-row"><span>{html.escape(CATEGORY_LABELS[cat])}</span><i><b style="width:{counts[cat] / max(max_count, 1) * 100:.2f}%"></b></i><strong>{counts[cat]}</strong></div>'
-        for cat in CATEGORIES
-    )
-    preview = "".join(
-        f'<tr><td>{html.escape(str(r.get("sample_name", "")))}</td><td>{html.escape(str(r.get("category_label", "")))}</td><td>{fmt(r.get("mean_suspicious_score"))}</td><td>{fmt(r.get("wrong_rate"))}</td><td>{html.escape(str(r.get("reason", "")))}</td></tr>'
-        for r in records[:5000]
-    )
-    doc = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Contrib 分类汇总</title><style>body{{margin:0;background:#f4f6fa;color:#1a2035;font:13px "Segoe UI",sans-serif}}main{{max-width:1280px;margin:auto;padding:24px}}h1{{font-size:22px}}.panel{{background:#fff;border:1px solid #dde3ee;border-radius:8px;padding:16px;margin-top:14px}}.bar-row{{display:grid;grid-template-columns:150px 1fr 70px;gap:12px;align-items:center;margin:10px 0}}.bar-row i{{height:12px;background:#e8edf5;border-radius:4px;overflow:hidden}}.bar-row b{{display:block;height:100%;background:#2563eb}}table{{width:100%;border-collapse:collapse}}th,td{{padding:8px;border-bottom:1px solid #e8edf5;text-align:left}}th{{position:sticky;top:0;background:#f0f3f8}}.scroll{{max-height:620px;overflow:auto}}</style></head><body><main><h1>Contrib 样本分类汇总</h1><div>样本数：{len(records)}　生成时间：{dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</div><section class="panel">{bars}</section><section class="panel scroll"><table><thead><tr><th>样本名</th><th>分类</th><th>score</th><th>wrong</th><th>原因</th></tr></thead><tbody>{preview}</tbody></table></section></main></body></html>'''
+    compact = [
+        {
+            "sample": r.get("sample_name", ""),
+            "project": str(r.get("project", "") or ""),
+            "category": r.get("category", "unknown"),
+            "category_label": r.get("category_label", ""),
+            "score": r.get("mean_suspicious_score"),
+            "wrong": r.get("wrong_rate"),
+            "reason": r.get("reason", ""),
+        }
+        for r in records
+    ]
+    data_json = json.dumps(json_safe(compact), ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    labels_json = json.dumps(CATEGORY_LABELS, ensure_ascii=False, separators=(",", ":"))
+    doc = r'''<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Contrib 分类汇总</title>
+<style>
+body{margin:0;background:#f4f6fa;color:#1a2035;font:13px "Segoe UI",sans-serif}main{max-width:1280px;margin:auto;padding:24px}h1{font-size:22px;margin:0 0 6px}.muted{color:#6b7a99}.panel{background:#fff;border:1px solid #dde3ee;border-radius:8px;padding:16px;margin-top:14px}.filters{display:flex;gap:12px;align-items:end;flex-wrap:wrap}.field{display:grid;gap:5px;min-width:220px}.field label{font-weight:600;color:#374151}.field select{height:36px;padding:0 10px;border:1px solid #c8d0e0;border-radius:6px;background:#fff;color:#1a2035}.result{margin-left:auto;font:12px Consolas,monospace;color:#6b7a99}.bar-row{display:grid;grid-template-columns:150px 1fr 70px;gap:12px;align-items:center;margin:10px 0}.bar-row i{height:12px;background:#e8edf5;border-radius:4px;overflow:hidden}.bar-row b{display:block;height:100%;background:#2563eb;border-radius:4px}.bar-row strong{text-align:right;font:12px Consolas,monospace}table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #e8edf5;text-align:left}th{position:sticky;top:0;background:#f0f3f8}.scroll{max-height:620px;overflow:auto}.empty{text-align:center;color:#9aa3ba;padding:30px}@media(max-width:700px){main{padding:12px}.field{min-width:100%;width:100%}.result{margin-left:0}.bar-row{grid-template-columns:110px 1fr 55px}}
+</style></head><body><main>
+<h1>Contrib 样本分类汇总</h1><div class="muted">生成时间：__GENERATED__</div>
+<section class="panel filters">
+  <div class="field"><label for="project-filter">数据集（project）</label><select id="project-filter"></select></div>
+  <div class="field"><label for="category-filter">分类类型</label><select id="category-filter"></select></div>
+  <div class="result" id="result-count"></div>
+</section>
+<section class="panel" id="bars"></section>
+<section class="panel scroll"><table><thead><tr><th>样本名</th><th>project</th><th>分类</th><th>score</th><th>wrong</th><th>原因</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty" hidden>当前筛选没有匹配样本</div></section>
+</main><script>
+const DATA=__DATA__;
+const CATEGORY_LABELS=__CATEGORY_LABELS__;
+const projectFilter=document.getElementById('project-filter');
+const categoryFilter=document.getElementById('category-filter');
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const number=(v,d=4)=>typeof v==='number'&&Number.isFinite(v)?v.toFixed(d):'-';
+const projects=[...new Set(DATA.map(r=>r.project||''))].sort((a,b)=>a.localeCompare(b));
+projectFilter.innerHTML='<option value="__all__">全部数据集</option>'+projects.map(p=>`<option value="${esc(p)}">${esc(p||'未标注')}</option>`).join('');
+categoryFilter.innerHTML='<option value="__all__">全部分类</option>'+Object.entries(CATEGORY_LABELS).map(([k,v])=>`<option value="${esc(k)}">${esc(v)}</option>`).join('');
+function selectedRows(){const p=projectFilter.value,c=categoryFilter.value;return DATA.filter(r=>(p==='__all__'||r.project===p)&&(c==='__all__'||r.category===c))}
+function render(){
+  const rows=selectedRows(),counts={};Object.keys(CATEGORY_LABELS).forEach(k=>counts[k]=0);rows.forEach(r=>counts[r.category]=(counts[r.category]||0)+1);const max=Math.max(1,...Object.values(counts));
+  document.getElementById('result-count').textContent=`${rows.length.toLocaleString()} / ${DATA.length.toLocaleString()} samples`;
+  document.getElementById('bars').innerHTML=Object.entries(CATEGORY_LABELS).map(([k,label])=>`<div class="bar-row"><span>${esc(label)}</span><i><b style="width:${counts[k]/max*100}%"></b></i><strong>${counts[k].toLocaleString()}</strong></div>`).join('');
+  const shown=rows.slice(0,5000);document.getElementById('rows').innerHTML=shown.map(r=>`<tr><td>${esc(r.sample)}</td><td>${esc(r.project||'未标注')}</td><td>${esc(r.category_label)}</td><td>${number(r.score)}</td><td>${number(r.wrong)}</td><td>${esc(r.reason)}</td></tr>`).join('');
+  document.getElementById('empty').hidden=rows.length!==0;
+}
+projectFilter.addEventListener('change',render);categoryFilter.addEventListener('change',render);render();
+</script></body></html>'''
+    doc = doc.replace("__GENERATED__", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    doc = doc.replace("__DATA__", data_json).replace("__CATEGORY_LABELS__", labels_json)
     with open(path, "w", encoding="utf-8") as f:
         f.write(doc)
 
 
-def run_extra_exports(args, rows, models, meta, out_html):
+def run_extra_exports(args, rows, models, meta, out_html, json_layout=None):
     requested = set(args.export or [])
     if not requested:
         return []
@@ -819,7 +879,7 @@ def run_extra_exports(args, rows, models, meta, out_html):
         selected = CATEGORIES if "all" in selected else list(dict.fromkeys(selected))
         suffix = "" if selected == CATEGORIES else "_" + safe_filename("+".join(selected))
         path = os.path.join(export_dir, stem + f"_classification{suffix}.json")
-        export_grouped_json(path, records, selected)
+        export_original_json(path, records, meta, json_layout, selected)
         outputs.append(path)
     if "xlsx" in requested:
         path = os.path.join(export_dir, stem + "_classification.xlsx"); export_classification_xlsx(path, records); outputs.append(path)
@@ -1202,7 +1262,7 @@ def main():
         print(f"  - {name}: {os.path.abspath(path)}", flush=True)
 
     print("[stage 1/7] loading JSON metadata and egs map", flush=True)
-    meta, json_names = load_json_name_map(args.json)
+    meta, json_names, json_layout = load_json_name_map(args.json)
     common_egs_map = load_egs_map(args.egs, json_names=json_names)
 
     print("[stage 2/7] loading contrib npz files", flush=True)
@@ -1236,7 +1296,7 @@ def main():
 
     print("[stage 6/7] writing optional extra products", flush=True)
     t0 = time.time()
-    extra_outputs = run_extra_exports(args, rows, models, meta, out_html)
+    extra_outputs = run_extra_exports(args, rows, models, meta, out_html, json_layout)
     if extra_outputs:
         for path in extra_outputs:
             print(f"[export] {os.path.abspath(path)}", flush=True)
