@@ -212,7 +212,7 @@ def load_json_name_map(path):
             continue
         names.add(name)
         entry = meta.setdefault(name, {})
-        entry.update({
+        next_meta = {
             "json_label": item.get("label", ""),
             "file_path": item.get("file_path", item.get("wav_path", item.get("path", ""))),
             "detector_id": item.get("detector_id", ""),
@@ -220,7 +220,19 @@ def load_json_name_map(path):
             "project": item.get("project", ""),
             "duration": item.get("duration", ""),
             "time_point": item.get("time_point", ""),
-        })
+        }
+        for key, value in next_meta.items():
+            text = "" if value is None else str(value).strip()
+            if not text:
+                continue
+            current = entry.get(key, "")
+            if not str(current).strip():
+                entry[key] = value
+            elif key == "project":
+                parts = [p.strip() for p in str(current).split(" | ") if p.strip()]
+                if text not in parts:
+                    parts.append(text)
+                    entry[key] = " | ".join(parts)
         entry.setdefault("_original_records", []).append(item)
     print(f"[json] loaded {len(items)} records, {len(names)} normalized names ({time.time() - t0:.1f}s)", flush=True)
     return meta, names, json_layout
@@ -606,6 +618,17 @@ def json_safe(value):
     return value
 
 
+def first_original_value(meta_entry, *keys):
+    for original in meta_entry.get("_original_records", []) if isinstance(meta_entry, dict) else []:
+        if not isinstance(original, dict):
+            continue
+        for key in keys:
+            value = original.get(key)
+            if value is not None and str(value).strip():
+                return value
+    return ""
+
+
 def export_csv(path, rows, models, meta):
     fields = [
         "sample_name", "category", "category_label", "reason",
@@ -661,7 +684,12 @@ def build_export_records(rows, models, meta):
     for row in rows:
         sample = row["sample_name"]
         out = dict(row)
-        out.update({k: v for k, v in meta.get(sample, {}).items() if not k.startswith("_")})
+        sample_meta = meta.get(sample, {})
+        out.update({k: v for k, v in sample_meta.items() if not k.startswith("_")})
+        if not str(out.get("project", "")).strip():
+            out["project"] = first_original_value(sample_meta, "project")
+        if not str(out.get("file_path", "")).strip():
+            out["file_path"] = first_original_value(sample_meta, "file_path", "wav_path", "path")
         for model in models:
             name = model["name"]
             d = model["sample_data"].get(sample, {})
@@ -680,7 +708,7 @@ def export_original_json(path, records, meta, json_layout, selected_categories=N
     selected = list(selected_categories or CATEGORIES)
     filtered_records = [r for r in records if r.get("category") in selected]
     metadata_fields = {
-nz        "json_label", "file_path", "detector_id", "channel_id", "project",
+        "json_label", "file_path", "detector_id", "channel_id", "project",
         "duration", "time_point",
     }
     grouped = {cat: [] for cat in CATEGORIES}
