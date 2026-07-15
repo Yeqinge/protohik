@@ -611,7 +611,7 @@ def export_summary_html(items: List[Dict[str, Any]], out_path: Path, source_json
     for item in items:
         rec = item["browser"]
         status = item["status"]
-        dataset = value_text(rec.get("trainOrTest", "")).strip() or "未标注"
+        dataset = value_text(rec.get("project", "")).strip() or "未标注"
         datasets.add(dataset)
         rows_data.append(
             {
@@ -909,6 +909,15 @@ def export_source_bat(items: List[Dict[str, Any]], out_path: Path, filter_key: s
     selected = [item for item in items if matches_status_filter(item, filter_key)]
     folder_name = f"sample_context_sources_{safe_filename(filter_key)}_{safe_filename(filter_label)}"
     seen = set()
+    source_paths: List[Tuple[str, str, str]] = []
+    for item in selected:
+        rec = item["browser"]
+        src = value_text(rec.get("filePath") or rec.get("id") or "").strip()
+        if not src or src in seen:
+            continue
+        seen.add(src)
+        source_paths.append((src, value_text(rec.get("id", "")), value_text(item["status"]["label"])))
+
     lines = [
         "@echo off",
         "setlocal",
@@ -916,19 +925,43 @@ def export_source_bat(items: List[Dict[str, Any]], out_path: Path, filter_key: s
         'mkdir "%OUT_DIR%" 2>nul',
         'cd /d "%OUT_DIR%"',
         f"rem Status filter: {filter_key} / {filter_label}",
+        "rem This .bat works only when source paths are reachable from Windows.",
+        "rem If files are on a Linux server, use the sibling .sh script on that server.",
         "",
     ]
-    for item in selected:
-        rec = item["browser"]
-        src = value_text(rec.get("filePath") or rec.get("id") or "").strip()
-        if not src or src in seen:
-            continue
-        seen.add(src)
-        lines.append(f"rem {item['status']['label']} | {rec.get('id', '')}")
+    for src, rec_id, status_label in source_paths:
+        lines.append(f"rem {status_label} | {rec_id}")
         lines.append(f'copy /Y "{src.replace(chr(34), chr(34) + chr(34))}" .')
-    lines.extend(["", f"echo Copied {len(seen)} source files for {filter_label} to %CD%", "pause"])
+    lines.extend(["", f"echo Copied {len(source_paths)} source files for {filter_label} to %CD%", "pause"])
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\r\n".join(lines), encoding="utf-8")
+
+    list_path = out_path.with_suffix(".txt")
+    list_lines = [
+        f"# Status filter: {filter_key} / {filter_label}",
+        f"# Count: {len(source_paths)}",
+        "# One source path per line.",
+        "",
+    ]
+    list_lines.extend(src for src, _, _ in source_paths)
+    list_path.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+
+    sh_path = out_path.with_suffix(".sh")
+    sh_lines = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        f"OUT_DIR=\"$(dirname \"$0\")/{folder_name}\"",
+        "mkdir -p \"$OUT_DIR\"",
+        f"# Status filter: {filter_key} / {filter_label}",
+        f"# Count: {len(source_paths)}",
+        "",
+    ]
+    for src, rec_id, status_label in source_paths:
+        escaped = src.replace("'", "'\"'\"'")
+        sh_lines.append(f"# {status_label} | {rec_id}")
+        sh_lines.append(f"cp -f -- '{escaped}' \"$OUT_DIR\"/")
+    sh_lines.extend(["", 'echo "Copied source files to $OUT_DIR"'])
+    sh_path.write_text("\n".join(sh_lines) + "\n", encoding="utf-8")
 
 
 def run_extra_exports(args: argparse.Namespace, payload: Dict[str, Any], original_records: List[Record], json_path: Path, output_path: Path) -> None:
@@ -938,7 +971,20 @@ def run_extra_exports(args: argparse.Namespace, payload: Dict[str, Any], origina
     if "all" in requested:
         requested.update({"xlsx", "json", "html", "sources"})
     items = build_status_items(payload, original_records, args.before, args.after)
-    prefix = args.export_prefix.expanduser().resolve() if args.export_prefix else output_path.with_suffix("")
+    if args.export_prefix:
+        export_base = args.export_prefix.expanduser().resolve()
+        if export_base.suffix:
+            export_dir = export_base.parent
+            file_stem = export_base.stem
+        else:
+            export_dir = export_base
+            file_stem = output_path.stem
+    else:
+        export_dir = output_path.parent if getattr(args, "output_dir", None) else output_path.with_name(f"{output_path.stem}_exports")
+        file_stem = output_path.stem
+    export_dir.mkdir(parents=True, exist_ok=True)
+    prefix = export_dir / file_stem
+    print(f"      Export directory: {export_dir}")
 
     if "xlsx" in requested:
         path = Path(str(prefix) + "_status_summary.xlsx")
@@ -956,7 +1002,7 @@ def run_extra_exports(args: argparse.Namespace, payload: Dict[str, Any], origina
         filters = SOURCE_EXPORT_FILTERS if "all" in (args.export or []) else [(args.status_filter, args.status_filter_label or args.status_filter)]
         for filter_key, filter_label in filters:
             path = Path(str(prefix) + f"_copy_sources_{safe_filename(filter_key)}.bat")
-            print(f"      Export source BAT: {path}")
+            print(f"      Export source scripts: {path.with_suffix('.*')}")
             export_source_bat(items, path, filter_key, filter_label)
 
 
@@ -2629,6 +2675,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Output data bin path. Default: same as HTML with .bin extension.",
     )
     parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Put the report HTML, bin, and default extra exports in this named directory.",
+    )
+    parser.add_argument(
         "--no-compress",
         action="store_true",
         help="Deprecated; kept for compatibility. The new .bin format is an uncompressed typed binary table.",
@@ -2644,7 +2696,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--export-prefix",
         type=Path,
         default=None,
-        help="Output prefix for extra exports. Default: same as --output without suffix.",
+        help="Directory or file prefix for extra exports. Default: <output stem>_exports/<output stem>.",
     )
     parser.add_argument(
         "--status-filter",
@@ -2677,7 +2729,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise ValueError("--before and --after must be >= 0.")
 
     json_path = args.json.expanduser().resolve()
-    output_path = args.output.expanduser().resolve()
+    output_path = args.output.expanduser()
+    if args.output_dir:
+        output_dir = args.output_dir.expanduser().resolve()
+        output_path = output_dir / output_path.name
+    else:
+        output_path = output_path.resolve()
     bin_output_path = args.bin_output.expanduser().resolve() if args.bin_output else output_path.with_suffix(".bin")
 
     print(f"[1/6] Reading JSON: {json_path}")
