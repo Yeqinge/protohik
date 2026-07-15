@@ -570,10 +570,19 @@ def safe_filename(value: str) -> str:
     return cleaned or "all"
 
 
-def export_status_json(items: List[Dict[str, Any]], out_path: Path, source_json: Path, before: int, after: int) -> None:
-    counts = status_counts(items)
+def export_status_json(
+    items: List[Dict[str, Any]],
+    out_path: Path,
+    source_json: Path,
+    before: int,
+    after: int,
+    filter_key: str = "all",
+    filter_label: str = "all",
+) -> None:
+    filtered_items = [item for item in items if matches_status_filter(item, filter_key)]
+    counts = status_counts(filtered_items)
     grouped = {key: [] for key, _ in STATUS_DEFS}
-    for item in items:
+    for item in filtered_items:
         row = safe_value(item["original"])
         if not isinstance(row, dict):
             row = {"value": row}
@@ -587,7 +596,9 @@ def export_status_json(items: List[Dict[str, Any]], out_path: Path, source_json:
             "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "before": before,
             "after": after,
-            "record_count": len(items),
+            "status_filter": filter_key,
+            "status_filter_label": filter_label,
+            "record_count": len(filtered_items),
             "status_counts": counts,
             "status_labels": STATUS_LABELS,
         },
@@ -905,7 +916,8 @@ def export_status_xlsx(items: List[Dict[str, Any]], out_path: Path, source_json:
             zf.writestr(f"xl/worksheets/sheet{i}.xml", worksheet_xml(rows))
 
 
-def export_source_bat(items: List[Dict[str, Any]], out_path: Path, filter_key: str, filter_label: str) -> None:
+def export_source_scripts(items: List[Dict[str, Any]], out_path: Path, filter_key: str, filter_label: str, formats: Iterable[str]) -> None:
+    formats = set(formats)
     selected = [item for item in items if matches_status_filter(item, filter_key)]
     folder_name = f"sample_context_sources_{safe_filename(filter_key)}_{safe_filename(filter_label)}"
     seen = set()
@@ -918,50 +930,55 @@ def export_source_bat(items: List[Dict[str, Any]], out_path: Path, filter_key: s
         seen.add(src)
         source_paths.append((src, value_text(rec.get("id", "")), value_text(item["status"]["label"])))
 
-    lines = [
-        "@echo off",
-        "setlocal",
-        f'set "OUT_DIR=%~dp0{folder_name}"',
-        'mkdir "%OUT_DIR%" 2>nul',
-        'cd /d "%OUT_DIR%"',
-        f"rem Status filter: {filter_key} / {filter_label}",
-        "rem This .bat works only when source paths are reachable from Windows.",
-        "rem If files are on a Linux server, use the sibling .sh script on that server.",
-        "",
-    ]
-    for src, rec_id, status_label in source_paths:
-        lines.append(f"rem {status_label} | {rec_id}")
-        lines.append(f'copy /Y "{src.replace(chr(34), chr(34) + chr(34))}" .')
-    lines.extend(["", f"echo Copied {len(source_paths)} source files for {filter_label} to %CD%", "pause"])
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text("\r\n".join(lines), encoding="utf-8")
 
-    list_path = out_path.with_suffix(".txt")
-    list_lines = [
-        f"# Status filter: {filter_key} / {filter_label}",
-        f"# Count: {len(source_paths)}",
-        "# One source path per line.",
-        "",
-    ]
-    list_lines.extend(src for src, _, _ in source_paths)
-    list_path.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+    if "bat" in formats:
+        bat_path = out_path.with_suffix(".bat")
+        lines = [
+            "@echo off",
+            "setlocal",
+            f'set "OUT_DIR=%~dp0{folder_name}"',
+            'mkdir "%OUT_DIR%" 2>nul',
+            'cd /d "%OUT_DIR%"',
+            f"rem Status filter: {filter_key} / {filter_label}",
+            "rem This .bat works only when source paths are reachable from Windows.",
+            "rem If files are on a Linux server, use the sibling .sh script on that server.",
+            "",
+        ]
+        for src, rec_id, status_label in source_paths:
+            lines.append(f"rem {status_label} | {rec_id}")
+            lines.append(f'copy /Y "{src.replace(chr(34), chr(34) + chr(34))}" .')
+        lines.extend(["", f"echo Copied {len(source_paths)} source files for {filter_label} to %CD%", "pause"])
+        bat_path.write_text("\r\n".join(lines), encoding="utf-8")
 
-    sh_path = out_path.with_suffix(".sh")
-    sh_lines = [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        f"OUT_DIR=\"$(dirname \"$0\")/{folder_name}\"",
-        "mkdir -p \"$OUT_DIR\"",
-        f"# Status filter: {filter_key} / {filter_label}",
-        f"# Count: {len(source_paths)}",
-        "",
-    ]
-    for src, rec_id, status_label in source_paths:
-        escaped = src.replace("'", "'\"'\"'")
-        sh_lines.append(f"# {status_label} | {rec_id}")
-        sh_lines.append(f"cp -f -- '{escaped}' \"$OUT_DIR\"/")
-    sh_lines.extend(["", 'echo "Copied source files to $OUT_DIR"'])
-    sh_path.write_text("\n".join(sh_lines) + "\n", encoding="utf-8")
+    if "txt" in formats:
+        list_path = out_path.with_suffix(".txt")
+        list_lines = [
+            f"# Status filter: {filter_key} / {filter_label}",
+            f"# Count: {len(source_paths)}",
+            "# One source path per line.",
+            "",
+        ]
+        list_lines.extend(src for src, _, _ in source_paths)
+        list_path.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+
+    if "sh" in formats:
+        sh_path = out_path.with_suffix(".sh")
+        sh_lines = [
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            f"OUT_DIR=\"$(dirname \"$0\")/{folder_name}\"",
+            "mkdir -p \"$OUT_DIR\"",
+            f"# Status filter: {filter_key} / {filter_label}",
+            f"# Count: {len(source_paths)}",
+            "",
+        ]
+        for src, rec_id, status_label in source_paths:
+            escaped = src.replace("'", "'\"'\"'")
+            sh_lines.append(f"# {status_label} | {rec_id}")
+            sh_lines.append(f"cp -f -- '{escaped}' \"$OUT_DIR\"/")
+        sh_lines.extend(["", 'echo "Copied source files to $OUT_DIR"'])
+        sh_path.write_text("\n".join(sh_lines) + "\n", encoding="utf-8")
 
 
 def run_extra_exports(args: argparse.Namespace, payload: Dict[str, Any], original_records: List[Record], json_path: Path, output_path: Path) -> None:
@@ -991,9 +1008,12 @@ def run_extra_exports(args: argparse.Namespace, payload: Dict[str, Any], origina
         print(f"      Export XLSX: {path}")
         export_status_xlsx(items, path, json_path, args.before, args.after)
     if "json" in requested:
-        path = Path(str(prefix) + "_status_summary.json")
+        json_filter = args.status_filter
+        json_filter_label = args.status_filter_label or json_filter
+        suffix = "" if json_filter == "all" else f"_{safe_filename(json_filter)}"
+        path = Path(str(prefix) + f"_status_summary{suffix}.json")
         print(f"      Export JSON: {path}")
-        export_status_json(items, path, json_path, args.before, args.after)
+        export_status_json(items, path, json_path, args.before, args.after, json_filter, json_filter_label)
     if "html" in requested:
         path = Path(str(prefix) + "_summary.html")
         print(f"      Export summary HTML: {path}")
@@ -1001,9 +1021,9 @@ def run_extra_exports(args: argparse.Namespace, payload: Dict[str, Any], origina
     if "sources" in requested:
         filters = SOURCE_EXPORT_FILTERS if "all" in (args.export or []) else [(args.status_filter, args.status_filter_label or args.status_filter)]
         for filter_key, filter_label in filters:
-            path = Path(str(prefix) + f"_copy_sources_{safe_filename(filter_key)}.bat")
+            path = Path(str(prefix) + f"_copy_sources_{safe_filename(filter_key)}.sh")
             print(f"      Export source scripts: {path.with_suffix('.*')}")
-            export_source_bat(items, path, filter_key, filter_label)
+            export_source_scripts(items, path, filter_key, filter_label, args.source_script_formats)
 
 
 def html_template(data_file_name: str) -> str:
@@ -2712,12 +2732,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "all_present",
         ],
         default="all",
-        help="Status filter used by --export sources when --export all is not selected.",
+        help="Status filter used by --export json and by --export sources when --export all is not selected.",
     )
     parser.add_argument(
         "--status-filter-label",
         default=None,
         help="Optional human-readable label used in source BAT names/comments.",
+    )
+    parser.add_argument(
+        "--source-script-formats",
+        nargs="+",
+        choices=["sh", "bat", "txt"],
+        default=["sh"],
+        help="Source-file export formats. Default: sh. Use 'sh bat txt' to also generate Windows scripts and path lists.",
     )
     parser.add_argument("--open", action="store_true", help="Open the generated HTML with the default browser.")
     return parser.parse_args(argv)
