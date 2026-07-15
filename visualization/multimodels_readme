@@ -1,0 +1,711 @@
+# classify_contrib_samples.py 使用说明
+
+`classify_contrib_samples.py` 用来汇总多个模型训练过程中采集到的 contrib 数据，把 egs 小样本聚合回真实样本，并根据 loss、预测正确性、forget events、align、weight、influence 等指标给样本分类。脚本会生成主 CSV、主交互 HTML 和可选的额外 JSON/XLSX/HTML/source copy 脚本。
+
+适用场景：
+
+- 对比多个模型对同一批训练样本的学习行为。
+- 找出疑似错标、边界混淆、困难但可学、干净易学、高影响样本。
+- 将 contrib 里的 egs 行号重新对齐到原始 JSON 样本信息，例如 `project`、`file_path`、`label`。
+- 将一个真实样本的多个 egs chunk 聚合成一个最终分类结果。
+
+## 基本命令
+
+```bash
+python classify_contrib_samples.py \
+  --models model_a:/path/to/model_a/contrib model_b:/path/to/model_b/contrib \
+  --egs /path/to/train.egs.csv \
+  --json /path/to/original_samples.json \
+  --output contrib_sample_classification.html \
+  --export all
+```
+
+Windows PowerShell 示例：
+
+```powershell
+python .\classify_contrib_samples.py `
+  --models model_a:D:\exp\model_a\contrib model_b:D:\exp\model_b\contrib `
+  --egs D:\data\train.egs.csv `
+  --json D:\data\samples.json `
+  --output D:\out\contrib_sample_classification.html `
+  --export all
+```
+
+也可以不手动命名模型，直接传 contrib 目录：
+
+```bash
+python classify_contrib_samples.py \
+  --contribs /path/to/run1/contrib /path/to/run2/contrib \
+  --egs /path/to/train.egs.csv \
+  --json /path/to/original_samples.json \
+  --output report.html
+```
+
+如果不同模型使用不同 egs 文件：
+
+```bash
+python classify_contrib_samples.py \
+  --models m1:/path/to/m1/contrib m2:/path/to/m2/contrib \
+  --model-egs m1:/path/to/m1/train.egs.csv m2:/path/to/m2/train.egs.csv \
+  --json /path/to/original_samples.json \
+  --output report.html
+```
+
+## 输入文件
+
+### 1. contrib 目录
+
+每个模型的 contrib 目录中应包含：
+
+```text
+contrib_epoch0.npz
+contrib_epoch1.npz
+contrib_epoch2.npz
+...
+```
+
+脚本会读取 `contrib_epoch*.npz`。常用字段如下：
+
+| 字段 | 是否必须 | 含义 |
+|---|---:|---|
+| `ids` | 是 | contrib 样本 id。通常对应 egs 文件行号或数据行号 |
+| `utt_ids` | 否 | 原始 utt/sample id。没有 egs 映射时可作为兜底 |
+| `loss` | 建议有 | 每个 egs 样本的 loss |
+| `pred` | 建议有 | 预测类别 |
+| `target` | 建议有 | 标签类别 |
+| `correct` | 建议有 | 是否预测正确，1 表示正确，0 表示错误 |
+| `grad_norm` | 可选 | 梯度范数 |
+| `align` | 可选 | 样本梯度与整体训练方向的对齐程度 |
+| `focal_weight` | 可选 | loss 函数提供的样本权重，例如 focal/prototype 权重 |
+
+如果某个模型没有 `focal_weight`，不会影响整体分类。weight 只作为辅助证据。
+
+### 2. egs 文件
+
+`--egs` 用于把 contrib 里的 `ids` 对回真实样本名。
+
+egs 文件可以是 CSV、TSV 或空格分隔文本。第一行可以是表头，例如：
+
+```csv
+id,file_path,label
+0,/data/wav/sample_001.wav,normal
+1,/data/wav/sample_002.wav,normal
+```
+
+脚本会自动选择最像样本名或路径的列。优先级大致为：
+
+```text
+sample_name, sample, utt_id, utt, wav_id, audio_id,
+file_name, filename, wav_path, file_path, path, ark, feat, id
+```
+
+注意：普通 `id` 优先级较低，因为很多数据里的 `id` 只是数字行号。
+
+行号映射规则：
+
+- 如果 egs 有表头，第一条数据的物理行号是 `2`。
+- 脚本同时保留零基数据行号兜底，例如第一条数据也会映射为 `0`。
+- 这样可以兼容两种 contrib id：真实文件行号和零基数据行号。
+
+### 3. 原始 JSON 文件
+
+`--json` 用于补充真实样本信息，例如 `project`、`label`、`file_path`、`duration`。
+
+支持以下结构：
+
+```json
+[
+  {"ID": "sample_001.wav", "project": "A", "label": "normal"}
+]
+```
+
+或：
+
+```json
+{
+  "datas": [
+    {"ID": "sample_001.wav", "project": "A", "label": "normal"}
+  ]
+}
+```
+
+也支持顶层字段名为 `data` 或 `items`。
+
+脚本会尝试从这些字段中读取样本名：
+
+```text
+sample_name, name, utt_id, id, ID, file_path, wav_path, path
+```
+
+常用元信息字段：
+
+| 字段 | 用途 |
+|---|---|
+| `project` | 额外 summary HTML 的数据集筛选 |
+| `label` | 原始 JSON 标签 |
+| `file_path` / `wav_path` / `path` | 源文件路径和 source copy 脚本 |
+| `detector_id` | 设备或检测器信息 |
+| `channel_id` | 通道信息 |
+| `duration` | 时长 |
+| `time_point` | 时间点 |
+
+## 样本名对齐规则
+
+脚本会做标准化，尽量把 JSON、egs、contrib 的不同写法对齐。
+
+会自动处理：
+
+- 路径转 basename：`/a/b/sample_001.wav` -> `sample_001`
+- 音频扩展名：`.wav`、`.flac`、`.mp3` 等可有可无
+- 特征扩展名：`.ark`、`.npy`、`.npz`
+- chunk 后缀：`sample_001`、`sample-001`、`sample_chunk001` -> `sample`
+- 部分标签前缀：`normal_sample`、`abnormal_sample` 等会去掉常见前缀
+
+如果一个真实样本对应多个 egs 小样本，脚本会把它们聚合。例如：
+
+```text
+motor_abc_001.wav
+motor_abc_002.wav
+motor_abc_003.wav
+```
+
+最终会聚合成：
+
+```text
+motor_abc
+```
+
+如果 JSON 中一个真实样本对应多条原始记录，额外 JSON 导出会保留这些原始记录。
+
+## 聚合方式
+
+每个模型内，脚本先把同一个真实样本的多个 egs chunk 聚合。
+
+主要聚合指标：
+
+| 指标 | 含义 |
+|---|---|
+| `n_egs` | 该真实样本对应多少个 egs chunk |
+| `n_epochs` | 有有效 loss 的 epoch 数 |
+| `mean_loss` | epoch loss 均值 |
+| `last_loss` | 最后一个有效 epoch 的 loss |
+| `mean_weight` | weight 均值，没有 weight 的模型为 NaN |
+| `last_weight` | 最后一个有效 weight |
+| `mean_grad_norm` | 平均梯度范数 |
+| `self_influence` | 自影响近似值，基于 grad norm 汇总 |
+| `mean_align` | align 均值 |
+| `frac_neg_align` | align 小于 0 的比例 |
+| `forget_events` | 从学会变成忘掉的次数 |
+| `final_correct` | 最后有效 epoch 是否预测正确 |
+| `correct_rate` | 各 epoch 正确率均值 |
+
+对于一个真实样本，在某个 epoch 内：
+
+- 多个 chunk 的 loss 会取均值。
+- 多个 chunk 的 correct 会先求平均。
+- 平均 correct 大于等于 `0.5` 时，该真实样本在该 epoch 视为正确。
+
+## 多模型百分位
+
+不同模型的 raw loss、grad norm、weight 尺度可能不同，所以脚本不会直接比较 raw 值。
+
+每个模型内部会先转成百分位：
+
+| 百分位字段 | 含义 |
+|---|---|
+| `loss_pct` | loss 在该模型内的相对排名。越大表示越高 loss |
+| `last_loss_pct` | last loss 的相对排名 |
+| `forget_pct` | forget events 的相对排名 |
+| `neg_align_pct` | 负 align 比例的相对排名 |
+| `influence_pct` | self influence 的相对排名 |
+| `weight_low_pct` | 低 weight 的相对排名。越大表示 weight 越低 |
+
+这样做的好处是适合多个模型对比，不要求每个模型的 loss 数值范围完全一致。
+
+## 分类规则
+
+分类前会先统计跨模型比例。
+
+| 字段 | 含义 |
+|---|---|
+| `model_coverage` | 有多少比例的模型采集到了该样本 |
+| `wrong_rate` | 有多少模型最终预测错 |
+| `high_loss_rate` | 有多少模型认为该样本是高 loss。条件是 `loss_pct >= 0.90` |
+| `unstable_rate` | 有多少模型认为该样本不稳定。条件是 `forget_pct >= 0.80` 或 `forget_events >= 2` |
+| `conflict_rate` | 有多少模型认为该样本和训练方向冲突。条件是 `frac_neg_align >= 0.50` 或 `neg_align_pct >= 0.80` |
+| `low_weight_rate` | 有 weight 的模型中，有多少认为该样本低可信。条件是 `weight_low_pct >= 0.80` |
+| `mean_suspicious_score` | 多模型平均可疑分 |
+
+最终类别按顺序判断，前面的优先级更高。
+
+### suspicious_noisy
+
+疑似错标或坏样本。
+
+满足任一条件：
+
+```text
+wrong_rate >= 0.60
+and high_loss_rate >= 0.50
+and conflict_rate >= 0.40
+```
+
+或：
+
+```text
+low_weight_rate >= 0.60
+and wrong_rate >= 0.40
+and high_loss_rate >= 0.40
+```
+
+或：
+
+```text
+mean_suspicious_score >= 0.75
+```
+
+解释：多个模型都学不好、loss 高、预测错，并且梯度方向冲突时，优先认为是疑似错标或坏样本。
+
+### boundary_ambiguous
+
+边界或混淆样本。
+
+满足任一条件：
+
+```text
+0.30 <= wrong_rate <= 0.70
+```
+
+或：
+
+```text
+unstable_rate >= 0.50
+```
+
+或：
+
+```text
+mean_suspicious_score >= 0.55
+```
+
+解释：不同模型之间意见不一致，或者训练中反复学会又忘掉，通常说明样本处在类别边界或标注本身较难。
+
+### hard_learnable
+
+困难但可学样本。
+
+条件：
+
+```text
+high_loss_rate >= 0.50
+and wrong_rate < 0.30
+```
+
+解释：loss 高，但大多数模型最终能预测对。这类样本不一定是错标，可能是有价值的困难样本。
+
+### clean_easy
+
+干净易学样本。
+
+条件：
+
+```text
+wrong_rate <= 0.20
+and high_loss_rate <= 0.20
+and conflict_rate <= 0.20
+and unstable_rate <= 0.20
+```
+
+如果前面类别都不满足，并且综合可疑分较低，也会归到 `clean_easy`。
+
+### influential
+
+高影响样本。
+
+条件：
+
+```text
+influence_rate >= 0.50
+```
+
+注意：当前代码里 `influential` 的判断排在 `clean_easy` 后面。所以如果一个样本既干净又高影响，会优先归为 `clean_easy`。如果你的目标是专门抓高影响样本，可以把 `influential` 判断提前。
+
+### unknown
+
+采集不足。
+
+条件：
+
+```text
+model_coverage < --min-model-coverage
+```
+
+默认 `--min-model-coverage=0.5`。例如有 4 个模型，某样本只在 1 个模型中出现，则可能被归为 `unknown`。
+
+## 输出产物
+
+假设命令为：
+
+```bash
+python classify_contrib_samples.py \
+  --models m1:/exp/m1/contrib m2:/exp/m2/contrib \
+  --egs train.egs.csv \
+  --json samples.json \
+  --output out/contrib_report.html \
+  --export all
+```
+
+默认主产物：
+
+```text
+out/contrib_report.html
+out/contrib_report_data.bin
+out/contrib_report.csv
+```
+
+额外产物目录：
+
+```text
+out/contrib_report_exports/
+```
+
+如果使用 `--export all`，会生成：
+
+```text
+contrib_report_classification.json
+contrib_report_classification.xlsx
+contrib_report_summary.html
+category_csv/
+sources/
+```
+
+### 主 HTML
+
+主 HTML 是详细交互页面：
+
+- 左侧样本列表。
+- 按分类、分数、loss、wrong、conflict 排序。
+- 右侧展示每个模型的指标。
+- 展示 epoch 曲线，包括 loss、weight、grad、align。
+
+主 HTML 会读取同目录下的 `_data.bin`，所以建议通过本地 HTTP 服务打开：
+
+```bash
+cd out
+python -m http.server 8000
+```
+
+然后浏览器打开：
+
+```text
+http://localhost:8000/contrib_report.html
+```
+
+如果直接双击 HTML，浏览器可能因为本地文件安全限制无法读取 `.bin`。
+
+### 主 CSV
+
+主 CSV 是每个真实样本一行的汇总表。
+
+常用字段：
+
+| 字段 | 含义 |
+|---|---|
+| `sample_name` | 聚合后的真实样本名 |
+| `category` | 分类 key |
+| `category_label` | 分类中文名 |
+| `reason` | 分类原因 |
+| `models_present` | 有多少个模型采集到该样本 |
+| `model_coverage` | 模型覆盖率 |
+| `wrong_rate` | 多模型错误比例 |
+| `high_loss_rate` | 多模型高 loss 比例 |
+| `unstable_rate` | 多模型不稳定比例 |
+| `conflict_rate` | 多模型冲突比例 |
+| `low_weight_rate` | 有 weight 模型中的低 weight 比例 |
+| `mean_suspicious_score` | 综合可疑分 |
+| `project` | 从原始 JSON 对齐得到的数据集名 |
+| `file_path` | 从原始 JSON 对齐得到的源文件路径 |
+
+后面还会有每个模型自己的字段，例如：
+
+```text
+m1_mean_loss
+m1_loss_pct
+m1_final_correct
+m1_forget_events
+m1_frac_neg_align
+m1_mean_weight
+m1_score
+```
+
+### 额外 JSON
+
+用 `--export json` 或 `--export all` 生成。
+
+结构接近 `sample_context_visualizer.py` 的导出结构：
+
+```json
+{
+  "summary": {
+    "source_json": "...",
+    "generated_at": "...",
+    "category_filter": "all",
+    "record_count": 123,
+    "category_counts": {
+      "suspicious_noisy": 10,
+      "boundary_ambiguous": 20
+    },
+    "category_labels": {
+      "suspicious_noisy": "疑似错标/坏样本"
+    }
+  },
+  "groups": {
+    "suspicious_noisy": {
+      "label": "疑似错标/坏样本",
+      "count": 10,
+      "datas": [
+        {
+          "ID": "xxx.wav",
+          "project": "dataset_a",
+          "label": "normal",
+          "file_path": "/path/to/xxx.wav",
+          "contrib_classification": {
+            "sample_name": "xxx",
+            "category": "suspicious_noisy",
+            "reason": "...",
+            "wrong_rate": 1.0
+          }
+        }
+      ]
+    }
+  }
+}
+```
+
+重点：
+
+- `datas` 里的每条记录保留原始 JSON 字段。
+- 脚本只额外添加 `contrib_classification`。
+- 如果一个真实样本对应原始 JSON 多条记录，这些原始记录都会出现在对应分类的 `datas` 中。
+
+只导出某类 JSON：
+
+```bash
+python classify_contrib_samples.py \
+  ... \
+  --export json \
+  --export-category suspicious_noisy
+```
+
+导出多个类别：
+
+```bash
+python classify_contrib_samples.py \
+  ... \
+  --export json \
+  --export-category suspicious_noisy boundary_ambiguous
+```
+
+### 额外 summary HTML
+
+用 `--export html` 或 `--export all` 生成：
+
+```text
+contrib_report_exports/contrib_report_summary.html
+```
+
+这个页面用于快速汇总分类结果：
+
+- 可按 `project` 筛选。
+- 可按分类类型筛选。
+- 显示分类数量柱状统计。
+- 显示样本表格。
+
+如果 summary HTML 里 `project` 为空，优先检查：
+
+- `--json` 是否传入了正确的原始 JSON。
+- egs 表头是否能让脚本选中真实样本名或 `file_path` 列。
+- 运行日志中是否出现了正确的 sample column。
+
+正常日志示例：
+
+```text
+[egs] header detected, sample column #1: file_path
+```
+
+如果显示选中了普通 `id` 列，而你的 `id` 只是数字行号，说明 egs 表头可能不规范，需要调整 egs 表头或脚本的列名优先级。
+
+### category_csv
+
+用 `--export category_csv` 或 `--export all` 生成：
+
+```text
+category_csv/suspicious_noisy.csv
+category_csv/boundary_ambiguous.csv
+category_csv/hard_learnable.csv
+category_csv/clean_easy.csv
+category_csv/influential.csv
+category_csv/unknown.csv
+```
+
+每个 CSV 只包含对应分类的样本。
+
+### sources
+
+用 `--export sources` 或 `--export all` 生成。
+
+默认生成 `.sh`：
+
+```text
+sources/copy_suspicious_noisy.sh
+sources/copy_boundary_ambiguous.sh
+...
+```
+
+这些脚本会根据原始 JSON 中的 `file_path` 复制源文件到分类目录。
+
+默认格式是 `sh`。如果还想生成 Windows bat 或纯路径 txt：
+
+```bash
+python classify_contrib_samples.py \
+  ... \
+  --export sources \
+  --source-script-formats sh bat txt
+```
+
+## 参数说明
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--models` | 空 | 模型名和 contrib 目录，格式 `NAME:PATH` |
+| `--contribs` | 空 | 只给 contrib 目录，模型名自动从路径推断 |
+| `--egs` | 空 | 共享 egs 文件 |
+| `--model-egs` | 空 | 每个模型单独的 egs 文件，格式 `NAME:EGS_PATH` |
+| `--json` | 空 | 原始 JSON 元信息 |
+| `--output` | `contrib_sample_classification.html` | 主 HTML 输出路径 |
+| `--csv` | 空 | 主 CSV 输出路径。为空时使用 output 同名 `.csv` |
+| `--export` | 空 | 额外产物，可选 `xlsx json html sources category_csv all` |
+| `--export-dir` | 空 | 额外产物目录。默认是 `<output_stem>_exports` |
+| `--export-category` | `all` | 额外 JSON 导出的分类 |
+| `--source-script-formats` | `sh` | source copy 脚本格式，可选 `sh bat txt` |
+| `--min-model-coverage` | `0.5` | 最低模型覆盖率 |
+
+## 推荐工作流
+
+第一次跑建议生成所有产物：
+
+```bash
+python classify_contrib_samples.py \
+  --models m1:/path/m1/contrib m2:/path/m2/contrib \
+  --egs /path/train.egs.csv \
+  --json /path/samples.json \
+  --output /path/out/contrib_report.html \
+  --export all
+```
+
+然后检查终端日志：
+
+```text
+[json] loaded ... records, ... normalized names
+[egs] header detected, sample column #?: ...
+[egs] loaded ... data rows
+[model] ... samples=...
+[classify] ... samples
+```
+
+再打开 summary HTML 快速看各分类和 project：
+
+```text
+contrib_report_exports/contrib_report_summary.html
+```
+
+最后用主 HTML 看具体样本的 epoch 曲线：
+
+```bash
+cd /path/out
+python -m http.server 8000
+```
+
+## 常见问题
+
+### 1. 额外 JSON 里样本只有 ID，没有原始 JSON 字段
+
+原因通常是样本名没有对齐成功，脚本走了兜底：
+
+```json
+{"ID": "sample"}
+```
+
+排查：
+
+- 确认命令传了 `--json`。
+- 确认 JSON 中有 `ID`、`id`、`file_path`、`wav_path`、`path` 等可识别字段。
+- 确认 egs 里被选中的列是真实样本名或路径，不是纯数字行号。
+- 看日志中的 sample column：
+
+```text
+[egs] header detected, sample column #1: file_path
+```
+
+### 2. summary HTML 里的 project 为空
+
+原因通常也是 JSON 没对齐到样本，或原始 JSON 的 `project` 字段名不叫 `project`。
+
+排查：
+
+- 检查原始 JSON 中是否真有 `project`。
+- 检查大小写是否一致。当前脚本读取的是小写 `project`。
+- 检查额外 JSON 的 `groups[*].datas[*]` 中是否有原始 `project`。
+- 如果额外 JSON 中有 `project`，但 summary HTML 没有，说明是 summary 生成阶段的问题。
+- 如果额外 JSON 中也没有 `project`，说明是样本对齐或字段名问题。
+
+### 3. 主 HTML 打不开或一直加载
+
+主 HTML 需要读取 `_data.bin`。建议用 HTTP server 打开：
+
+```bash
+cd output_dir
+python -m http.server 8000
+```
+
+浏览器访问：
+
+```text
+http://localhost:8000/contrib_report.html
+```
+
+### 4. 某些模型没有 weight，会影响分类吗
+
+不会。weight 是辅助证据。没有 weight 的模型不会参与 `low_weight_rate` 计算，也不会因为没有 weight 被惩罚。
+
+### 5. 多模型 loss 尺度不同，能比较吗
+
+可以。脚本用的是每个模型内部百分位，例如 `loss_pct`，不是直接比较 raw loss。
+
+### 6. `unknown` 太多怎么办
+
+降低模型覆盖率要求：
+
+```bash
+--min-model-coverage 0.25
+```
+
+或者检查某些模型是否没有采集到完整样本。
+
+### 7. 想优先抓高影响样本怎么办
+
+当前 `influential` 判断在 `clean_easy` 后面。如果你希望高影响样本优先被单独分类，可以把 `classify_samples()` 中 `influence_rate >= 0.50` 的判断提前到 `clean_easy` 之前。
+
+## 结果解释建议
+
+推荐优先人工复核：
+
+1. `suspicious_noisy`
+2. `boundary_ambiguous`
+3. `hard_learnable`
+4. `influential`
+
+`clean_easy` 通常可以作为较稳定训练样本保留。
+
+`suspicious_noisy` 不等于一定错标，它只是“多个模型都给出可疑证据”。最好结合原始音频、邻近片段、标签规则一起判断。
+
