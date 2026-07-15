@@ -147,6 +147,27 @@ def looks_like_header(parts):
     return any(k in joined for k in ("utt", "id", "ark", "path", "label", "feat"))
 
 
+def choose_egs_name_column(header_parts):
+    if not header_parts:
+        return 0
+    normalized = [str(p).strip().lower() for p in header_parts]
+    exact_priority = [
+        "sample_name", "sample", "utt_id", "utt", "utterance_id",
+        "wav_id", "audio_id", "file_name", "filename",
+        "wav_path", "file_path", "path", "ark", "feat", "feature_path",
+        "id",
+    ]
+    normalized_priority = [p.lower() for p in exact_priority]
+    for wanted in normalized_priority:
+        for idx, name in enumerate(normalized):
+            if name == wanted:
+                return idx
+    for idx, name in enumerate(normalized):
+        if any(token in name for token in ("utt", "sample", "wav", "audio", "file", "path")):
+            return idx
+    return 0
+
+
 def normalize_sample_name(raw, json_names=None):
     if raw is None:
         return ""
@@ -169,6 +190,35 @@ def normalize_sample_name(raw, json_names=None):
     return chunk_stripped
 
 
+def sample_name_candidates(raw):
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    candidates = []
+    values = [text, text.replace("\\", "/"), os.path.basename(text.replace("\\", "/"))]
+    for value in values:
+        stem = re.sub(r"\.(wav|flac|mp3|ogg|ark|npy|npz)$", "", value, flags=re.IGNORECASE)
+        stem = LABEL_PREFIXES.sub("", stem)
+        chunk_stripped = re.sub(r"([_-])(?:chunk|seg)?\d{1,6}$", "", stem, flags=re.IGNORECASE)
+        for candidate in (value, stem, chunk_stripped):
+            candidate = str(candidate).strip().strip('"').strip("'")
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def find_meta_entry(meta, sample):
+    if not isinstance(meta, dict):
+        return {}
+    for candidate in sample_name_candidates(sample):
+        if candidate in meta:
+            return meta[candidate]
+    normalized = normalize_sample_name(sample)
+    return meta.get(normalized, {})
+
+
 def load_json_name_map(path):
     if not path:
         return {}, set(), {"kind": "none"}
@@ -185,7 +235,7 @@ def load_json_name_map(path):
     data_key = None
     if isinstance(data, list):
         items = data
-        json_layout = {"kind": "list"}
+        json_layout = {"kind": "list", "source_json": os.path.abspath(path)}
     else:
         for candidate in ("datas", "data", "items"):
             if isinstance(data.get(candidate), list):
@@ -195,6 +245,7 @@ def load_json_name_map(path):
         json_layout = {
             "kind": "dict",
             "data_key": data_key or "datas",
+            "source_json": os.path.abspath(path),
             "extra": {k: v for k, v in data.items() if k != data_key},
         }
     meta = {}
@@ -252,23 +303,40 @@ def load_egs_map(path, json_names=None):
     delim = sniff_delimiter(first)
     first_parts = split_egs_line(first, delim)
     has_header = looks_like_header(first_parts)
+    name_col = choose_egs_name_column(first_parts) if has_header else 0
+    if has_header:
+        header_name = first_parts[name_col] if name_col < len(first_parts) else ""
+        print(f"[egs] header detected, sample column #{name_col}: {header_name}", flush=True)
 
     mapping = {}
     data_idx = 0
     file_idx = 0
+    json_name_set = json_names if isinstance(json_names, set) else set(json_names or [])
+
+    def pick_raw_name(parts):
+        if has_header and name_col < len(parts):
+            return parts[name_col]
+        if json_name_set:
+            for part in parts:
+                normalized = normalize_sample_name(part, json_names=json_name_set)
+                if normalized in json_name_set:
+                    return part
+        return parts[0]
 
     def add_line(idx, line):
         nonlocal data_idx
         parts = split_egs_line(line, delim)
         if not parts:
             return
-        raw_name = parts[0]
+        raw_name = pick_raw_name(parts)
         sample = normalize_sample_name(raw_name, json_names=json_names)
         if not sample:
             return
-        # contrib ids may be file line numbers, or data row numbers after header.
-        mapping[str(idx)] = sample
-        mapping[str(data_idx)] = sample
+        # contrib ids are commonly either zero-based data row ids or physical
+        # egs file line numbers. With a header, the first data row is line 2.
+        physical_line = idx + 1 if has_header else idx + 1
+        mapping.setdefault(str(data_idx), sample)
+        mapping[str(physical_line)] = sample
         data_idx += 1
         if data_idx % 500000 == 0:
             print(f"[egs] processed {data_idx} rows ({time.time() - t0:.1f}s)", flush=True)
@@ -654,7 +722,7 @@ def export_csv(path, rows, models, meta):
         writer.writeheader()
         for row in rows:
             out = {k: row.get(k, "") for k in fields}
-            out.update(meta.get(row["sample_name"], {}))
+            out.update(find_meta_entry(meta, row["sample_name"]))
             for m in models:
                 d = m["sample_data"].get(row["sample_name"], {})
                 name = m["name"]
@@ -684,7 +752,7 @@ def build_export_records(rows, models, meta):
     for row in rows:
         sample = row["sample_name"]
         out = dict(row)
-        sample_meta = meta.get(sample, {})
+        sample_meta = find_meta_entry(meta, sample)
         out.update({k: v for k, v in sample_meta.items() if not k.startswith("_")})
         if not str(out.get("project", "")).strip():
             out["project"] = first_original_value(sample_meta, "project")
@@ -718,7 +786,7 @@ def export_original_json(path, records, meta, json_layout, selected_categories=N
             k: v for k, v in record.items()
             if k not in metadata_fields and not str(k).startswith("_")
         }
-        originals = meta.get(sample, {}).get("_original_records") or [{"ID": sample}]
+        originals = find_meta_entry(meta, sample).get("_original_records") or [{"ID": sample}]
         for original in originals:
             item = dict(json_safe(original)) if isinstance(original, dict) else {"value": json_safe(original)}
             item["contrib_classification"] = classification
@@ -732,21 +800,20 @@ def export_original_json(path, records, meta, json_layout, selected_categories=N
     layout = json_layout or {"kind": "none"}
     payload = {
         "summary": {
+            "source_json": layout.get("source_json", ""),
             "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "selected_categories": selected,
-            "sample_count": len(filtered_records),
+            "category_filter": "all" if selected == CATEGORIES else "+".join(selected),
             "record_count": sum(counts.values()),
-            "category_sample_counts": sample_counts,
-            "category_record_counts": counts,
+            "category_counts": counts,
             "category_labels": CATEGORY_LABELS,
-            "source_json_layout": json_safe(layout),
+            "sample_count": len(filtered_records),
+            "category_sample_counts": sample_counts,
             "note": "Each item in groups[*].datas keeps the original JSON fields and adds contrib_classification.",
         },
         "groups": {
             cat: {
                 "label": CATEGORY_LABELS.get(cat, cat),
-                "sample_count": sample_counts.get(cat, 0),
-                "record_count": counts.get(cat, 0),
+                "count": counts.get(cat, 0),
                 "datas": grouped.get(cat, []),
             }
             for cat in CATEGORIES
@@ -959,7 +1026,7 @@ def export_html_data(out_html, rows, models, meta, shard_size=1000):
     ]
     row_strings = []
     for r in rows:
-        sample_meta = meta.get(r["sample_name"], {})
+        sample_meta = find_meta_entry(meta, r["sample_name"])
         row_strings.append([
             r["sample_name"], r.get("reason", ""),
             sample_meta.get("json_label", ""), sample_meta.get("file_path", ""),
