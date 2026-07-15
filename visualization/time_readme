@@ -1,0 +1,357 @@
+# Sample Context Visualizer
+
+`sample_context_visualizer.py` 用于检查音频小片段在同一条长时间序列中的前后上下文 label 是否一致。它会读取标注 JSON，按样本 ID 解析大样本分组和 segment 编号，生成可交互 HTML 报告，并可选导出状态汇总 JSON、XLSX、汇总 HTML、服务器源文件复制脚本。
+
+## 输入 JSON
+
+支持两种顶层格式：
+
+```json
+{"datas": [ ... ]}
+```
+
+或：
+
+```json
+[ ... ]
+```
+
+每条记录至少需要能提供样本 ID。脚本按以下优先级取 ID：
+
+```text
+ID -> id -> file_name -> filename -> file_path 的 basename
+```
+
+典型字段示例：
+
+```json
+{
+  "ID": "A_000123.wav",
+  "label": "normal",
+  "project": "dataset_a",
+  "file_path": "/data/audio/A_000123.wav",
+  "duration": 1.0,
+  "sample_rate": 16000
+}
+```
+
+## 分组规则
+
+脚本默认认为 ID 最后一段下划线后的数字是 segment 编号：
+
+```text
+D0003_U0046_C03_xxx_512_215.wav
+```
+
+会被解析为：
+
+```text
+groupKey = D0003_U0046_C03_xxx_512_
+segment  = 215
+```
+
+同一个 `groupKey` 下的样本被认为属于同一条长时间序列。
+
+如果 ID 末尾不是数字编号，会进入 `unparseable` 状态，不参与前后窗口一致性计算。
+
+## 状态分类
+
+状态基于两个维度：
+
+- 是否有缺失 segment
+- 是否有 label 不一致
+
+具体状态：
+
+| key | 含义 |
+|---|---|
+| `unparseable` | 无法识别编号 |
+| `missing_mismatch` | 有缺失 + 有不一致 |
+| `present_mismatch` | 无缺失 + 有不一致 |
+| `missing_consistent` | 有缺失 + 无不一致 |
+| `present_consistent` | 无缺失 + 无不一致 |
+
+聚合筛选：
+
+| key | 包含 |
+|---|---|
+| `has_missing` | `missing_mismatch` + `missing_consistent` |
+| `has_mismatch` | `missing_mismatch` + `present_mismatch` |
+| `no_mismatch` | `missing_consistent` + `present_consistent` |
+| `all_present` | `present_mismatch` + `present_consistent` |
+
+序列开头和结尾超出真实 segment 范围的部分不会被算作缺失。只有在同一 `groupKey` 的真实最小/最大 segment 范围内部断号，才算缺失。
+
+## 基本用法
+
+只生成交互式 HTML 和 bin 数据：
+
+```bash
+python sample_context_visualizer.py ^
+  --json audio.json ^
+  --before 5 ^
+  --after 5 ^
+  --output sample_context_report.html
+```
+
+会生成：
+
+```text
+sample_context_report.html
+sample_context_report.bin
+```
+
+HTML 默认通过 `fetch()` 加载同目录下的 `.bin`。如果浏览器阻止本地文件读取，在输出目录运行：
+
+```bash
+python -m http.server 8000
+```
+
+然后打开：
+
+```text
+http://localhost:8000/sample_context_report.html
+```
+
+## 输出到指定文件夹
+
+推荐使用 `--output-dir`，把 HTML、bin 和导出文件都放在同一个命名文件夹里：
+
+```bash
+python sample_context_visualizer.py ^
+  --json audio.json ^
+  --output sample_context_report.html ^
+  --output-dir my_report ^
+  --export all
+```
+
+输出示例：
+
+```text
+my_report/
+  sample_context_report.html
+  sample_context_report.bin
+  sample_context_report_status_summary.xlsx
+  sample_context_report_status_summary.json
+  sample_context_report_summary.html
+  sample_context_report_copy_sources_*.sh
+```
+
+## 额外导出
+
+通过 `--export` 指定额外导出内容：
+
+```bash
+--export xlsx
+--export json
+--export html
+--export sources
+--export all
+```
+
+可以组合：
+
+```bash
+python sample_context_visualizer.py ^
+  --json audio.json ^
+  --output-dir my_report ^
+  --export json html sources
+```
+
+### XLSX
+
+```bash
+--export xlsx
+```
+
+生成：
+
+```text
+*_status_summary.xlsx
+```
+
+包含汇总 sheet 和各状态分类 sheet。
+
+### JSON
+
+```bash
+--export json
+```
+
+生成：
+
+```text
+*_status_summary.json
+```
+
+JSON 顶层结构：
+
+```json
+{
+  "summary": {
+    "status_counts": {}
+  },
+  "groups": {
+    "missing_mismatch": {
+      "count": 0,
+      "datas": []
+    }
+  }
+}
+```
+
+每条原始 JSON 记录会增加：
+
+```json
+"time_context_status": {
+  "key": "missing_mismatch",
+  "label": "有缺失 + 有不一致",
+  "has_missing": true,
+  "has_mismatch": true
+}
+```
+
+只导出某个状态：
+
+```bash
+python sample_context_visualizer.py ^
+  --json audio.json ^
+  --output-dir my_report ^
+  --export json ^
+  --status-filter missing_mismatch
+```
+
+只导出“无不一致”的两个状态：
+
+```bash
+--export json --status-filter no_mismatch
+```
+
+### 汇总 HTML
+
+```bash
+--export html
+```
+
+生成：
+
+```text
+*_summary.html
+```
+
+汇总 HTML 包含：
+
+- 数据集筛选：使用原始记录中的 `project` 字段
+- 状态筛选
+- 指标卡
+- 缺失/不一致状态矩阵
+- 状态分类条形图
+- 明细预览表
+
+### 源文件脚本
+
+```bash
+--export sources
+```
+
+默认只生成服务器可运行的 `.sh`：
+
+```text
+*_copy_sources_has_mismatch.sh
+```
+
+服务器上运行：
+
+```bash
+bash *_copy_sources_has_mismatch.sh
+```
+
+脚本会在同目录下创建状态对应的文件夹，并把 `file_path` 指向的源 wav 复制进去。
+
+默认只导出 `.sh`。如果还需要 Windows `.bat` 或路径清单 `.txt`：
+
+```bash
+--source-script-formats sh bat txt
+```
+
+指定源文件导出的状态：
+
+```bash
+python sample_context_visualizer.py ^
+  --json audio.json ^
+  --output-dir my_report ^
+  --export sources ^
+  --status-filter has_mismatch
+```
+
+`--export all` 会为源文件一次性生成多个状态脚本。
+
+## 常用命令
+
+生成完整报告包：
+
+```bash
+python sample_context_visualizer.py ^
+  --json audio.json ^
+  --before 5 ^
+  --after 5 ^
+  --output sample_context_report.html ^
+  --output-dir my_report ^
+  --export all
+```
+
+只生成无不一致 JSON：
+
+```bash
+python sample_context_visualizer.py ^
+  --json audio.json ^
+  --output-dir my_report ^
+  --export json ^
+  --status-filter no_mismatch
+```
+
+只生成有不一致源文件复制脚本：
+
+```bash
+python sample_context_visualizer.py ^
+  --json audio.json ^
+  --output-dir my_report ^
+  --export sources ^
+  --status-filter has_mismatch
+```
+
+额外生成 bat 和 txt：
+
+```bash
+python sample_context_visualizer.py ^
+  --json audio.json ^
+  --output-dir my_report ^
+  --export sources ^
+  --status-filter has_mismatch ^
+  --source-script-formats sh bat txt
+```
+
+## 参数说明
+
+| 参数 | 说明 |
+|---|---|
+| `--json` | 输入 JSON 路径 |
+| `--before` | 检查目标 segment 前多少个片段 |
+| `--after` | 检查目标 segment 后多少个片段 |
+| `--output` | 主报告 HTML 文件名 |
+| `--bin-output` | bin 数据文件路径；默认与 HTML 同名 |
+| `--output-dir` | 把 HTML、bin、额外导出都放入指定目录 |
+| `--export` | 额外导出：`xlsx/json/html/sources/all` |
+| `--export-prefix` | 额外导出的目录或文件前缀 |
+| `--status-filter` | JSON 和 sources 导出的状态过滤 |
+| `--status-filter-label` | source 脚本里的自定义状态显示名 |
+| `--source-script-formats` | 源文件脚本格式，默认 `sh` |
+| `--open` | 生成后打开主 HTML |
+
+## 注意事项
+
+- 主 HTML 依赖同目录下的 `.bin` 文件，不要只移动 HTML。
+- 数据在服务器上时，推荐使用 `.sh` 源文件脚本。
+- `.bat` 只适合 Windows 能直接访问源 `file_path` 的情况。
+- `project` 字段用于汇总 HTML 的数据集筛选。
+- `file_path` 用于源文件复制脚本。
