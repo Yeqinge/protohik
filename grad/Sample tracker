@@ -7,6 +7,14 @@ import numpy as np
 import torch
 
 
+EXTRA_METRICS = (
+    "uncertainty", "dirichlet_strength", "total_evidence",
+    "target_evidence", "target_probability", "target_distance",
+    "distance_margin", "classification_loss", "focal_component",
+    "uncertainty_sample_weight", "sample_weight",
+)
+
+
 class SampleContributionTracker:
     def __init__(self, save_dir, egs_file=None):
         self.save_dir = save_dir
@@ -44,6 +52,7 @@ class SampleContributionTracker:
             "loss": 0.0, "loss_n": 0,
             "pred": -1, "target": -1, "correct": -1,
             "fw": 0.0, "fw_n": 0,
+            "extra": {},
         })
 
     def update_grad(self, ids, grad_norm, align):
@@ -96,6 +105,20 @@ class SampleContributionTracker:
             e["fw"] += float(weights[i])
             e["fw_n"] += 1
 
+    def update_metrics(self, ids, metrics):
+        """Accumulate optional per-sample scalars without changing legacy fields."""
+        arrays = {k: np.asarray(v).reshape(-1) for k, v in metrics.items()}
+        for name, values in arrays.items():
+            if len(values) != len(ids):
+                continue
+            for i, sid in enumerate(ids):
+                value = float(values[i])
+                if not np.isfinite(value):
+                    continue
+                slot = self._ent(sid)["extra"].setdefault(name, [0.0, 0])
+                slot[0] += value
+                slot[1] += 1
+
     @staticmethod
     def _target_value(targets, idx):
         tgt = targets[idx]
@@ -116,8 +139,7 @@ class SampleContributionTracker:
         pred_valid = np.array([1 if self._buf[i]["pred"] >= 0 else 0 for i in ids], dtype=np.int8)
         weight_valid = col(lambda e: 1.0 if e["fw_n"] else 0.0)
 
-        np.savez(
-            os.path.join(self.save_dir, f"contrib_epoch{self._epoch:03d}.npz"),
+        payload = dict(
             ids=np.array(ids),
             utt_ids=np.array([self._get_utt(i) for i in ids]),
             grad_norm=col(lambda e: e["gn"] / e["gn_n"] if e["gn_n"] else np.nan),
@@ -128,6 +150,12 @@ class SampleContributionTracker:
             correct=np.array([self._buf[i]["correct"] for i in ids], dtype=np.int8),
             focal_weight=col(lambda e: e["fw"] / e["fw_n"] if e["fw_n"] else np.nan),
         )
+        for name in EXTRA_METRICS:
+            payload[name] = col(lambda e, n=name: (
+                e["extra"][n][0] / e["extra"][n][1]
+                if n in e["extra"] and e["extra"][n][1] else np.nan
+            ))
+        np.savez(os.path.join(self.save_dir, f"contrib_epoch{self._epoch:03d}.npz"), **payload)
         print(
             f"[contrib] epoch {self._epoch} saved: samples={len(ids)}, "
             f"loss={int(loss_valid.sum())}, pred={int(pred_valid.sum())}, "
@@ -141,8 +169,8 @@ class SampleContributionTracker:
             raise FileNotFoundError(f"no contrib_epoch*.npz found in {save_dir}")
 
         print(f"[contrib] reading {len(files)} epochs ...")
-        d0 = np.load(files[0], allow_pickle=True)
-        all_ids = list(d0["ids"].astype(str))
+        with np.load(files[0], allow_pickle=True) as d0:
+            all_ids = list(d0["ids"].astype(str))
         id2idx = {sid: i for i, sid in enumerate(all_ids)}
 
         utt_id_map = {}
@@ -157,11 +185,11 @@ class SampleContributionTracker:
                         utt_id_map[str(i)] = parts[0]
 
         for fpath in files[1:]:
-            d = np.load(fpath, allow_pickle=True)
-            for sid in d["ids"].astype(str):
-                if sid not in id2idx:
-                    id2idx[sid] = len(all_ids)
-                    all_ids.append(sid)
+            with np.load(fpath, allow_pickle=True) as d:
+                for sid in d["ids"].astype(str):
+                    if sid not in id2idx:
+                        id2idx[sid] = len(all_ids)
+                        all_ids.append(sid)
 
         n_samples = len(all_ids)
         n_epochs = len(files)
@@ -170,18 +198,25 @@ class SampleContributionTracker:
         ls = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
         co = np.full((n_samples, n_epochs), -1, dtype=np.int8)
         fw = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
+        extras = {
+            name: np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
+            for name in EXTRA_METRICS
+        }
 
         for ei, fpath in enumerate(files):
-            d = np.load(fpath, allow_pickle=True)
-            ids_str = d["ids"].astype(str)
-            idxs = np.array([id2idx[s] for s in ids_str], dtype=np.int64)
-            gn[idxs, ei] = d["grad_norm"]
-            al[idxs, ei] = d["align"]
-            ls[idxs, ei] = d["loss"]
-            if "correct" in d:
-                co[idxs, ei] = d["correct"]
-            if "focal_weight" in d:
-                fw[idxs, ei] = d["focal_weight"]
+            with np.load(fpath, allow_pickle=True) as d:
+                ids_str = d["ids"].astype(str)
+                idxs = np.array([id2idx[s] for s in ids_str], dtype=np.int64)
+                gn[idxs, ei] = d["grad_norm"]
+                al[idxs, ei] = d["align"]
+                ls[idxs, ei] = d["loss"]
+                if "correct" in d:
+                    co[idxs, ei] = d["correct"]
+                if "focal_weight" in d:
+                    fw[idxs, ei] = d["focal_weight"]
+                for name in EXTRA_METRICS:
+                    if name in d:
+                        extras[name][idxs, ei] = d[name]
 
         with np.errstate(all="ignore"):
             mean_gn = np.nanmean(gn, axis=1)
@@ -205,11 +240,13 @@ class SampleContributionTracker:
             "mean_loss", "last_loss", "forget_events", "final_correct",
             "mean_focal_weight", "last_focal_weight",
         ]
+        for name in EXTRA_METRICS:
+            fields.extend((f"mean_{name}", f"last_{name}"))
         with open(out_csv, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(fields)
             for i, sid in enumerate(all_ids):
-                writer.writerow([
+                row = [
                     sid,
                     utt_id_map.get(sid, sid) if utt_id_map else sid,
                     int(np.sum(~np.isnan(gn[i]))),
@@ -224,7 +261,15 @@ class SampleContributionTracker:
                     int(final_co[i]),
                     f"{mean_fw[i]:.6f}",
                     f"{last_fw[i]:.6f}",
-                ])
+                ]
+                for name in EXTRA_METRICS:
+                    values = extras[name][i]
+                    valid = values[np.isfinite(values)]
+                    row.extend((
+                        f"{np.mean(valid):.6f}" if valid.size else "nan",
+                        f"{valid[-1]:.6f}" if valid.size else "nan",
+                    ))
+                writer.writerow(row)
 
         print(f"[contrib] wrote {n_samples} samples -> {out_csv}")
         return out_csv
