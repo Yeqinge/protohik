@@ -1,0 +1,90 @@
+class PrototypeLoss(TopVirtualLoss):
+    def init(
+        self,
+        input_dim,
+        num_targets,
+        temperature=0.1,
+        temporal_lambda=0.1,
+        temporal_loss_lambda=1.0,
+        temporal_prob_lambda=1.0,
+        eps=1e-8,
+    ):
+        self.prototypes = nn.Parameter(torch.randn(num_targets, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+
+        self.temperature = temperature
+        self.temporal_lambda = temporal_lambda
+        self.temporal_loss_lambda = temporal_loss_lambda
+        self.temporal_prob_lambda = temporal_prob_lambda
+        self.eps = eps
+
+        self.loss_function = nn.CrossEntropyLoss(reduction="none")
+
+    def forward(self, inputs, targets):
+        assert len(inputs.shape) == 3
+        assert inputs.shape[2] == 1
+
+        features = torch.squeeze(inputs, dim=2)
+        features_norm = F.normalize(features, dim=1)
+        prototypes_norm = F.normalize(self.prototypes, dim=1)
+
+        logits = torch.mm(features_norm, prototypes_norm.t()) / self.temperature
+
+        ce_loss = self.loss_function(logits, targets)
+        cls_loss = ce_loss.mean()
+
+        temporal_loss_reg = ce_loss.new_tensor(0.0)
+        temporal_prob_reg = ce_loss.new_tensor(0.0)
+        temporal_conflict = torch.zeros_like(ce_loss)
+
+        if ce_loss.numel() > 1:
+            loss_diff = ce_loss[1:] - ce_loss[:-1]
+            temporal_loss_reg = loss_diff.pow(2).mean()
+
+            prob = F.softmax(logits, dim=1).clamp_min(self.eps)
+            log_prob = prob.log()
+
+            p0 = prob[:-1]
+            p1 = prob[1:]
+            m = (0.5 * (p0 + p1)).clamp_min(self.eps)
+            log_m = m.log()
+
+            js = 0.5 * (
+                F.kl_div(log_m, p0, reduction="none").sum(dim=1)
+                + F.kl_div(log_m, p1, reduction="none").sum(dim=1)
+            )
+            temporal_prob_reg = js.mean()
+
+            pair_conflict = (
+                self.temporal_loss_lambda * loss_diff.detach().abs()
+                + self.temporal_prob_lambda * js.detach()
+            )
+
+            temporal_conflict[0] = pair_conflict[0]
+            temporal_conflict[-1] = pair_conflict[-1]
+            if temporal_conflict.numel() > 2:
+                temporal_conflict[1:-1] = 0.5 * (pair_conflict[:-1] + pair_conflict[1:])
+
+        temporal_reg = (
+            self.temporal_loss_lambda * temporal_loss_reg
+            + self.temporal_prob_lambda * temporal_prob_reg
+        )
+
+        total_loss = cls_loss + self.temporal_lambda * temporal_reg
+
+        # contrib_hook 会读取这些字段
+        self.logits = logits.detach()
+        self.posterior = logits.unsqueeze(2).detach()
+        self.per_sample_loss = ce_loss.detach()
+        self.ce_loss = ce_loss.detach()
+        self.temporal_reg_loss = temporal_reg.detach()
+        self.temporal_loss_reg = temporal_loss_reg.detach()
+        self.temporal_prob_reg = temporal_prob_reg.detach()
+
+        # 保存到 contrib 的 focal_weight：越低表示窗口内越不稳定/越可疑
+        self.weight = torch.exp(-temporal_conflict).detach()
+
+        return total_loss
+
+    def step(self, *args, **kwargs):
+        pass
