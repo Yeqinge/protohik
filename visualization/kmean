@@ -8,6 +8,7 @@ import argparse
 import csv
 import json
 import logging
+import shlex
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -21,7 +22,7 @@ from sklearn.preprocessing import StandardScaler
 
 LOG = logging.getLogger("kmeans-egs")
 FEATURE_NAMES = ("feat", "feature", "ark", "ark-path", "ark_path", "rxfile", "specifier", "wav-path")
-ID_NAMES = ("utt", "utt_id", "key", "id", "eg-id", "eg_id", "sample", "sample-id")
+ID_NAMES = ("utt", "utt-id", "utt_id", "key", "id", "eg-id", "eg_id", "sample", "sample-id")
 START_NAMES = ("start", "start-position", "start_position", "offset")
 END_NAMES = ("end", "end-position", "end_position")
 LABEL_NAMES = ("label", "class", "class-label", "target", "spk", "speaker")
@@ -51,17 +52,29 @@ def _find(fieldnames: Sequence[str], candidates: Sequence[str]) -> Optional[str]
 
 
 def read_egs(path: Path, max_samples: Optional[int]) -> List[Dict[str, str]]:
-    """读取带表头或 ASV-Subtools 常见无表头 egs CSV。"""
+    """读取逗号、Tab 或空格分隔的 egs 映射文件。"""
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         preview = stream.read(4096)
         stream.seek(0)
+        nonempty = [line for line in stream if line.strip() and not line.lstrip().startswith("#")]
+    if not nonempty:
+        raise ValueError(f"egs 文件为空: {path}")
+
+    # CSV 后缀并不保证使用逗号；ASV-Subtools 的映射也常使用空格。
+    first_line = nonempty[0]
+    if "," in first_line or "\t" in first_line:
         try:
             dialect = csv.Sniffer().sniff(preview, delimiters=",\t")
         except csv.Error:
-            dialect = csv.excel
-        rows = list(csv.reader(stream, dialect))
+            dialect = csv.excel_tab if "\t" in first_line else csv.excel
+        rows = list(csv.reader(nonempty, dialect))
+    else:
+        # shlex 可保留被引号包住且内部含空格的路径。
+        rows = [shlex.split(line, comments=False, posix=False) for line in nonempty]
     if not rows:
         raise ValueError(f"egs 文件为空: {path}")
+
+    rows = [[cell.strip().strip('"').strip("'") for cell in row] for row in rows]
 
     first_lower = {v.strip().lower() for v in rows[0]}
     known = set(FEATURE_NAMES + ID_NAMES + START_NAMES + END_NAMES + LABEL_NAMES)
