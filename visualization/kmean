@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""对 xmuspeech/ASV-Subtools 的 egs 映射文件进行 K-Means 聚类并可视化。"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
+
+
+LOG = logging.getLogger("kmeans-egs")
+FEATURE_NAMES = ("feat", "feature", "ark", "ark-path", "ark_path", "rxfile", "specifier", "wav-path")
+ID_NAMES = ("utt", "utt_id", "key", "id", "eg-id", "eg_id", "sample", "sample-id")
+START_NAMES = ("start", "start-position", "start_position", "offset")
+END_NAMES = ("end", "end-position", "end_position")
+LABEL_NAMES = ("label", "class", "class-label", "target", "spk", "speaker")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="读取 egs CSV 中的特征，用 K-Means 聚类并输出 PCA 可视化。",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("egs", type=Path, help="train.egs.csv、valid.egs.csv 或普通 CSV")
+    parser.add_argument("--n-clusters", "-k", type=int, default=4, help="聚类中心数")
+    parser.add_argument("--output-dir", "-o", type=Path, default=Path("kmeans_result"))
+    parser.add_argument("--max-samples", type=int, default=None, help="最多读取多少条，便于抽样分析")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-standardize", action="store_true", help="不对池化后的特征做标准化")
+    parser.add_argument(
+        "--pooling", choices=("mean", "mean_std", "flatten"), default="mean_std",
+        help="将变长二维声学特征转换为定长向量的方法",
+    )
+    return parser.parse_args()
+
+
+def _find(fieldnames: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
+    lookup = {name.strip().lower(): name for name in fieldnames}
+    return next((lookup[x] for x in candidates if x in lookup), None)
+
+
+def read_egs(path: Path, max_samples: Optional[int]) -> List[Dict[str, str]]:
+    """读取带表头或 ASV-Subtools 常见无表头 egs CSV。"""
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        preview = stream.read(4096)
+        stream.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(preview, delimiters=",\t")
+        except csv.Error:
+            dialect = csv.excel
+        rows = list(csv.reader(stream, dialect))
+    if not rows:
+        raise ValueError(f"egs 文件为空: {path}")
+
+    first_lower = {v.strip().lower() for v in rows[0]}
+    known = set(FEATURE_NAMES + ID_NAMES + START_NAMES + END_NAMES + LABEL_NAMES)
+    has_header = bool(first_lower & known)
+    if has_header:
+        names, data = [x.strip() for x in rows[0]], rows[1:]
+    else:
+        # ASV-Subtools ChunkSamples 常见顺序：样本ID, 特征rxfile, 起点, 终点, 类别。
+        width = len(rows[0])
+        names = ["utt", "feat", "start", "end", "label"][:width]
+        names += [f"extra_{i}" for i in range(len(names), width)]
+        data = rows
+    result = [dict(zip(names, row)) for row in data if row]
+    return result[:max_samples] if max_samples else result
+
+
+def load_feature(specifier: str, base_dir: Path) -> np.ndarray:
+    """加载 Kaldi rxfile，或 numpy/torch 文件。"""
+    raw = specifier.strip()
+    plain = raw[4:] if raw.startswith("ark:") else raw
+    path_part = plain.rsplit(":", 1)[0] if plain.rsplit(":", 1)[-1].isdigit() else plain
+    local = Path(path_part)
+    if not local.is_absolute():
+        local = base_dir / local
+
+    suffix = local.suffix.lower()
+    if suffix == ".npy":
+        return np.asarray(np.load(local), dtype=np.float32)
+    if suffix == ".npz":
+        archive = np.load(local)
+        return np.asarray(archive[archive.files[0]], dtype=np.float32)
+    if suffix in (".pt", ".pth"):
+        import torch
+        value = torch.load(local, map_location="cpu", weights_only=True)
+        if isinstance(value, dict):
+            value = next(iter(value.values()))
+        return np.asarray(value.detach().cpu(), dtype=np.float32)
+
+    try:
+        import kaldiio
+    except ImportError as exc:
+        raise RuntimeError(
+            "读取 ark/scp 需要 kaldiio，请执行: pip install kaldiio"
+        ) from exc
+    # 保留 ark 文件的字节偏移；只把相对文件路径转换成绝对路径。
+    kaldi_spec = raw
+    if not Path(path_part).is_absolute():
+        prefix = "ark:" if raw.startswith("ark:") else ""
+        offset = plain[len(path_part):]
+        kaldi_spec = f"{prefix}{local}{offset}"
+    return np.asarray(kaldiio.load_mat(kaldi_spec), dtype=np.float32)
+
+
+def pool_feature(feat: np.ndarray, method: str) -> np.ndarray:
+    feat = np.squeeze(feat)
+    if feat.ndim == 1:
+        return feat
+    if feat.ndim != 2:
+        raise ValueError(f"期望一维或二维特征，实际 shape={feat.shape}")
+    # 声学特征通常是 [frames, feat_dim]；若明显转置则修正。
+    if feat.shape[0] < feat.shape[1] and feat.shape[0] <= 256:
+        feat = feat.T
+    if method == "mean":
+        return feat.mean(axis=0)
+    if method == "mean_std":
+        return np.concatenate((feat.mean(axis=0), feat.std(axis=0)))
+    return feat.reshape(-1)
+
+
+def build_matrix(rows: List[Dict[str, str]], base_dir: Path, pooling: str):
+    fields = list(rows[0])
+    feat_col = _find(fields, FEATURE_NAMES)
+    if feat_col is None:
+        raise ValueError(f"找不到特征列。当前列: {fields}；可识别列名: {FEATURE_NAMES}")
+    id_col, start_col = _find(fields, ID_NAMES), _find(fields, START_NAMES)
+    end_col, label_col = _find(fields, END_NAMES), _find(fields, LABEL_NAMES)
+    vectors, metadata = [], []
+    for index, row in enumerate(rows):
+        try:
+            feat = load_feature(row[feat_col], base_dir)
+            if feat.ndim == 2 and start_col and row.get(start_col, "").strip():
+                start = max(0, int(float(row[start_col])))
+                end_text = row.get(end_col, "") if end_col else ""
+                end = int(float(end_text)) if end_text.strip() else feat.shape[0]
+                feat = feat[start:end]
+            vector = pool_feature(feat, pooling)
+            if not np.all(np.isfinite(vector)):
+                raise ValueError("包含 NaN/Inf")
+            vectors.append(vector)
+            metadata.append({
+                "sample_id": row.get(id_col, str(index)) if id_col else str(index),
+                "source_label": row.get(label_col, "") if label_col else "",
+                "feature": row[feat_col],
+            })
+        except Exception as exc:
+            LOG.warning("跳过第 %d 条记录: %s", index + 1, exc)
+    if not vectors:
+        raise RuntimeError("没有成功读取任何特征")
+    dimensions = {v.size for v in vectors}
+    if len(dimensions) != 1:
+        raise ValueError(f"池化后维度不一致: {sorted(dimensions)}；不要对变长特征使用 flatten")
+    return np.stack(vectors), metadata
+
+
+def save_plot(points: np.ndarray, labels: np.ndarray, centers: np.ndarray, out: Path) -> None:
+    plt.figure(figsize=(10, 8))
+    colors = plt.get_cmap("tab20", int(labels.max()) + 1)
+    scatter = plt.scatter(points[:, 0], points[:, 1], c=labels, cmap=colors, s=22, alpha=.75)
+    plt.scatter(centers[:, 0], centers[:, 1], marker="X", s=220, c="black", edgecolors="white", label="centroid")
+    plt.xlabel("PCA 1")
+    plt.ylabel("PCA 2")
+    plt.title("K-Means clusters (PCA projection)")
+    plt.legend(*scatter.legend_elements(), title="cluster", loc="best")
+    plt.grid(alpha=.2)
+    plt.tight_layout()
+    plt.savefig(out, dpi=180)
+    plt.close()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    if args.n_clusters < 2:
+        raise ValueError("--n-clusters 必须至少为 2")
+    rows = read_egs(args.egs, args.max_samples)
+    matrix, metadata = build_matrix(rows, args.egs.resolve().parent, args.pooling)
+    if matrix.shape[0] <= args.n_clusters:
+        raise ValueError(f"有效样本数 {matrix.shape[0]} 必须大于聚类数 {args.n_clusters}")
+
+    scaler = None if args.no_standardize else StandardScaler()
+    x = matrix if scaler is None else scaler.fit_transform(matrix)
+    model = KMeans(n_clusters=args.n_clusters, random_state=args.seed, n_init=10)
+    labels = model.fit_predict(x)
+    score = float(silhouette_score(x, labels)) if len(set(labels)) > 1 else None
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    pca = PCA(n_components=2, random_state=args.seed)
+    points = pca.fit_transform(x)
+    centers = pca.transform(model.cluster_centers_)
+    save_plot(points, labels, centers, args.output_dir / "clusters_pca.png")
+
+    with (args.output_dir / "clusters.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["sample_id", "source_label", "cluster", "pca_x", "pca_y", "feature"])
+        writer.writeheader()
+        for item, cluster, point in zip(metadata, labels, points):
+            writer.writerow({**item, "cluster": int(cluster), "pca_x": point[0], "pca_y": point[1]})
+    summary = {
+        "samples": int(len(labels)), "feature_dimension": int(x.shape[1]),
+        "n_clusters": args.n_clusters, "inertia": float(model.inertia_),
+        "silhouette_score": score,
+        "pca_explained_variance_ratio": pca.explained_variance_ratio_.tolist(),
+        "cluster_sizes": {str(i): int(np.sum(labels == i)) for i in range(args.n_clusters)},
+    }
+    (args.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    LOG.info("完成：%s", json.dumps(summary, ensure_ascii=False))
+    LOG.info("结果目录：%s", args.output_dir.resolve())
+
+
+if __name__ == "__main__":
+    main()
