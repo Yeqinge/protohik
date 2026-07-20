@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Merge sample_context_visualizer and classify_contrib_samples JSON exports.
+
+The report is sorted from the sample most likely to be wrong to the least likely.
+Only identical normalized IDs (surrounding whitespace removed) are joined.
+"""
+
+import argparse
+import datetime as dt
+import html
+import json
+import math
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Tuple
+
+
+CONTEXT_SEVERITY = {
+    "unparseable": 0.35,
+    "missing_mismatch": 1.0,
+    "present_mismatch": 0.9,
+    "missing_consistent": 0.35,
+    "present_consistent": 0.0,
+}
+CONTRIB_SEVERITY = {
+    "likely_wrong": 1.0,
+    "suspicious": 0.8,
+    "uncertain": 0.55,
+    "likely_clean": 0.1,
+}
+
+
+def finite(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def sample_id(item: Dict[str, Any]) -> str:
+    for key in ("ID", "id", "sample_name", "sample", "utt_id", "name"):
+        value = item.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    classification = item.get("contrib_classification", {})
+    if isinstance(classification, dict) and classification.get("sample_name") is not None:
+        return str(classification["sample_name"]).strip()
+    return ""
+
+
+def iter_group_items(payload: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(payload, list):
+        yield from (x for x in payload if isinstance(x, dict))
+        return
+    if not isinstance(payload, dict):
+        return
+    groups = payload.get("groups")
+    if isinstance(groups, dict):
+        for group in groups.values():
+            if isinstance(group, dict) and isinstance(group.get("datas"), list):
+                yield from (x for x in group["datas"] if isinstance(x, dict))
+        return
+    for key in ("datas", "data", "items"):
+        if isinstance(payload.get(key), list):
+            yield from (x for x in payload[key] if isinstance(x, dict))
+            return
+
+
+def load_index(path: Path, marker: str) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    with path.open("r", encoding="utf-8-sig") as stream:
+        payload = json.load(stream)
+    index: Dict[str, Dict[str, Any]] = {}
+    duplicates: List[str] = []
+    for item in iter_group_items(payload):
+        sid = sample_id(item)
+        if not sid:
+            continue
+        if sid in index:
+            duplicates.append(sid)
+            continue
+        if marker not in item or not isinstance(item[marker], dict):
+            continue
+        index[sid] = item
+    if not index:
+        raise ValueError(f"{path}: no records containing {marker!r} were found")
+    return index, sorted(set(duplicates))
+
+
+def context_score(status: Dict[str, Any]) -> float:
+    base = CONTEXT_SEVERITY.get(str(status.get("key", "")), 0.25)
+    weighted = max(0.0, min(1.0, finite(status.get("weighted_inconsistency"))))
+    missing_ratio = max(0.0, min(1.0, finite(status.get("missing_weight_ratio"))))
+    return max(0.0, min(1.0, 0.65 * base + 0.25 * weighted + 0.10 * missing_ratio))
+
+
+def contrib_score(cls: Dict[str, Any]) -> float:
+    raw = cls.get("mean_suspicious_score")
+    score = finite(raw, -1.0)
+    if score < 0:
+        score = CONTRIB_SEVERITY.get(str(cls.get("category", "")), 0.4)
+    wrong = max(0.0, min(1.0, finite(cls.get("wrong_rate"))))
+    high_loss = max(0.0, min(1.0, finite(cls.get("high_loss_rate"))))
+    return max(0.0, min(1.0, 0.70 * score + 0.20 * wrong + 0.10 * high_loss))
+
+
+def merge(context: Dict[str, Dict[str, Any]], contrib: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = []
+    for sid in context.keys() & contrib.keys():
+        context_item, contrib_item = context[sid], contrib[sid]
+        status = context_item["time_context_status"]
+        classification = contrib_item["contrib_classification"]
+        cs, ks = context_score(status), contrib_score(classification)
+        # Contribution evidence is primary; context inconsistency strengthens it.
+        risk = 1.0 - (1.0 - ks) * (1.0 - 0.65 * cs)
+        reasons = [str(classification.get("reason", "")).strip(), str(status.get("label", "")).strip()]
+        rows.append({
+            "id": sid,
+            "risk_score": round(risk, 6),
+            "risk_rank": 0,
+            "contrib_score": round(ks, 6),
+            "context_score": round(cs, 6),
+            "category": classification.get("category", ""),
+            "category_label": classification.get("category_label", classification.get("category", "")),
+            "context_status": status.get("key", ""),
+            "context_status_label": status.get("label", status.get("key", "")),
+            "reason": "；".join(x for x in reasons if x),
+            "sample": {k: v for k, v in context_item.items() if k != "time_context_status"},
+            "time_context_status": status,
+            "contrib_classification": classification,
+        })
+    rows.sort(key=lambda x: (-x["risk_score"], -x["contrib_score"], -x["context_score"], x["id"]))
+    for rank, row in enumerate(rows, 1):
+        row["risk_rank"] = rank
+    return rows
+
+
+def write_json(path: Path, rows: List[Dict[str, Any]], context_path: Path, contrib_path: Path,
+               only_context: List[str], only_contrib: List[str], duplicates: Dict[str, List[str]]) -> None:
+    category_counts: Dict[str, int] = {}
+    status_counts: Dict[str, int] = {}
+    for row in rows:
+        category_counts[row["category"]] = category_counts.get(row["category"], 0) + 1
+        status_counts[row["context_status"]] = status_counts.get(row["context_status"], 0) + 1
+    payload = {
+        "summary": {
+            "generated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "context_json": str(context_path), "contrib_json": str(contrib_path),
+            "matched_count": len(rows), "only_in_context_count": len(only_context),
+            "only_in_contrib_count": len(only_contrib), "category_counts": category_counts,
+            "context_status_counts": status_counts,
+            "risk_formula": "1-(1-contrib_score)*(1-0.65*context_score)",
+            "id_matching": "exact after trimming surrounding whitespace",
+            "duplicate_ids": duplicates,
+        },
+        "unmatched": {"only_in_context": only_context, "only_in_contrib": only_contrib},
+        "samples": rows,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2, allow_nan=False)
+
+
+def write_html(path: Path, rows: List[Dict[str, Any]], only_context: int, only_contrib: int) -> None:
+    compact = [{k: r[k] for k in ("risk_rank", "id", "risk_score", "contrib_score", "context_score",
+                                   "category_label", "context_status_label", "reason")} for r in rows]
+    data = json.dumps(compact, ensure_ascii=False).replace("</", "<\\/")
+    doc = """<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>疑似错误样本汇总</title><style>
+body{margin:0;background:#f3f6fa;color:#182033;font:14px system-ui,"Microsoft YaHei",sans-serif}.page{max-width:1400px;margin:auto;padding:24px}h1{margin:0 0 6px}.muted{color:#64748b}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0}.card,.panel{background:white;border:1px solid #dce3ed;border-radius:10px;padding:16px}.num{font-size:25px;font-weight:750;margin-top:4px}.filters{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}input,select{padding:9px 11px;border:1px solid #cbd5e1;border-radius:7px;min-width:210px}table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #e7ebf1;text-align:left}th{position:sticky;top:0;background:#eef2f7}.scroll{max-height:70vh;overflow:auto}.bar{width:120px;height:9px;background:#e5e7eb;border-radius:9px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,#f59e0b,#dc2626)}@media(max-width:800px){.cards{grid-template-columns:1fr 1fr}.page{padding:12px}}
+</style></head><body><main class=\"page\"><h1>疑似错误样本汇总</h1><div class=\"muted\">按综合风险从高到低排列；贡献度证据为主，时间上下文异常用于增强风险。</div><div class=\"cards\"><div class=\"card\">匹配样本<div class=\"num\" id=\"total\"></div></div><div class=\"card\">高风险 ≥ 0.75<div class=\"num\" id=\"high\"></div></div><div class=\"card\">仅上下文 JSON<div class=\"num\">__OC__</div></div><div class=\"card\">仅贡献度 JSON<div class=\"num\">__OK__</div></div></div><section class=\"panel\"><div class=\"filters\"><input id=\"q\" placeholder=\"搜索 ID / 原因\"><select id=\"cat\"><option value=\"\">全部贡献度分类</option></select><span class=\"muted\" id=\"shown\"></span></div><div class=\"scroll\"><table><thead><tr><th>排名</th><th>ID</th><th>综合风险</th><th>贡献度分</th><th>上下文分</th><th>贡献度分类</th><th>上下文状态</th><th>原因</th></tr></thead><tbody id=\"body\"></tbody></table></div></section></main><script>
+const DATA=__DATA__;const esc=x=>String(x??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));const cats=[...new Set(DATA.map(x=>x.category_label))].sort();cat.innerHTML+=cats.map(x=>`<option>${esc(x)}</option>`).join('');total.textContent=DATA.length.toLocaleString();high.textContent=DATA.filter(x=>x.risk_score>=.75).length.toLocaleString();function render(){const s=q.value.toLowerCase(),c=cat.value;const a=DATA.filter(x=>(!c||x.category_label===c)&&(!s||(x.id+' '+x.reason).toLowerCase().includes(s)));shown.textContent=`显示 ${a.length.toLocaleString()} 条`;body.innerHTML=a.slice(0,10000).map(x=>`<tr><td>${x.risk_rank}</td><td>${esc(x.id)}</td><td><b>${x.risk_score.toFixed(4)}</b><div class=\"bar\"><i style=\"width:${x.risk_score*100}%\"></i></div></td><td>${x.contrib_score.toFixed(4)}</td><td>${x.context_score.toFixed(4)}</td><td>${esc(x.category_label)}</td><td>${esc(x.context_status_label)}</td><td>${esc(x.reason)}</td></tr>`).join('')}q.oninput=render;cat.onchange=render;render();</script></body></html>"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(doc.replace("__DATA__", data).replace("__OC__", str(only_context)).replace("__OK__", str(only_contrib)), encoding="utf-8")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="按 ID 合并上下文状态与贡献度分类 JSON，并输出疑似错误样本排序。")
+    parser.add_argument("--context-json", required=True, type=Path, help="sample_context_visualizer --export json 的输出")
+    parser.add_argument("--contrib-json", required=True, type=Path, help="classify_contrib_samples --export json 的输出")
+    parser.add_argument("--output-json", type=Path, default=Path("merged_sample_risk.json"))
+    parser.add_argument("--output-html", type=Path, default=Path("merged_sample_risk.html"))
+    args = parser.parse_args()
+    context, context_dup = load_index(args.context_json, "time_context_status")
+    contrib, contrib_dup = load_index(args.contrib_json, "contrib_classification")
+    rows = merge(context, contrib)
+    only_context = sorted(context.keys() - contrib.keys())
+    only_contrib = sorted(contrib.keys() - context.keys())
+    duplicates = {"context": context_dup, "contrib": contrib_dup}
+    write_json(args.output_json, rows, args.context_json.resolve(), args.contrib_json.resolve(), only_context, only_contrib, duplicates)
+    write_html(args.output_html, rows, len(only_context), len(only_contrib))
+    print(f"Matched: {len(rows)}; only context: {len(only_context)}; only contrib: {len(only_contrib)}")
+    print(f"JSON: {args.output_json.resolve()}")
+    print(f"HTML: {args.output_html.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
