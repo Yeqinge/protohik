@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Reorganize a labeling JSON into long-sample groups and cut complete time windows.
+
+The grouping rule follows sample_context_visualizer.py: after removing a common
+audio extension, the final underscore-separated numeric suffix is treated as the
+segment number, and the prefix ending with "_" is treated as the long-sample ID.
+
+Input JSON can be either:
+    {"datas": [ ... ]}
+or:
+    [ ... ]
+
+Examples:
+    python window_json_by_long_sample.py ^
+        --json data.json ^
+        --output data_windows.json ^
+        --window-size 10 ^
+        --mode chunk
+
+    python window_json_by_long_sample.py ^
+        --json data.json ^
+        --output data_sliding_windows.json ^
+        --window-size 10 ^
+        --mode sliding ^
+        --stride 1
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+Record = Dict[str, Any]
+
+KNOWN_AUDIO_EXTENSIONS_RE = re.compile(r"\.(wav|mp3|flac|m4a|ogg|aac)$", re.IGNORECASE)
+SEGMENT_SUFFIX_RE = re.compile(r"^(?P<long_id>.+_)(?P<segment>\d+)$")
+
+
+def load_records(json_path: Path) -> Tuple[List[Record], str]:
+    with json_path.open("r", encoding="utf-8-sig") as f:
+        payload = json.load(f)
+
+    if isinstance(payload, dict):
+        records = payload.get("datas")
+        input_shape = "object"
+        if records is None:
+            raise ValueError("JSON top-level object does not contain a `datas` field.")
+    else:
+        records = payload
+        input_shape = "list"
+
+    if not isinstance(records, list):
+        raise ValueError("JSON data must be a list or an object with a list field named `datas`.")
+
+    normalized: List[Record] = []
+    for index, item in enumerate(records):
+        if not isinstance(item, dict):
+            raise ValueError(f"Record #{index} is not an object.")
+        normalized.append(item)
+    return normalized, input_shape
+
+
+def strip_audio_extension(value: str) -> str:
+    return KNOWN_AUDIO_EXTENSIONS_RE.sub("", value)
+
+
+def get_record_id(record: Record) -> str:
+    value = record.get("ID") or record.get("id") or record.get("file_name") or record.get("filename")
+    if value:
+        return str(value)
+
+    file_path = record.get("file_path")
+    if file_path:
+        return os.path.basename(str(file_path))
+
+    raise ValueError(f"Record is missing ID/file_path: {record!r}")
+
+
+def parse_id(record_id: str) -> Tuple[str, int, int]:
+    basename = os.path.basename(record_id)
+    stem = strip_audio_extension(basename)
+    match = SEGMENT_SUFFIX_RE.match(stem)
+    if not match:
+        raise ValueError(f"Cannot parse trailing segment number from ID: {record_id}")
+    segment_text = match.group("segment")
+    return match.group("long_id"), int(segment_text), len(segment_text)
+
+
+def parse_segment_id(raw_value: Any, fallback: int) -> int:
+    if raw_value is None or raw_value == "":
+        return fallback
+    try:
+        return int(str(raw_value))
+    except ValueError:
+        return fallback
+
+
+def safe_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): safe_value(child) for key, child in value.items()}
+    return str(value)
+
+
+def normalize_records(records: List[Record], use_segment_field: bool) -> Tuple[List[Record], List[str]]:
+    normalized: List[Record] = []
+    parse_errors: List[str] = []
+
+    for index, record in enumerate(records):
+        try:
+            record_id = get_record_id(record)
+            group_key, parsed_segment, segment_width = parse_id(record_id)
+            segment = parse_segment_id(record.get("segment_id"), parsed_segment) if use_segment_field else parsed_segment
+            normalized.append(
+                {
+                    "index": index,
+                    "id": record_id,
+                    "group_key": group_key,
+                    "segment": segment,
+                    "parsed_segment": parsed_segment,
+                    "segment_width": segment_width,
+                    "record": record,
+                }
+            )
+        except Exception as exc:
+            parse_errors.append(f"#{index}: {exc}")
+
+    return normalized, parse_errors
+
+
+def build_groups(items: List[Record], duplicate_policy: str) -> Tuple[Dict[str, Dict[int, Record]], int]:
+    groups: Dict[str, Dict[int, Record]] = defaultdict(dict)
+    duplicate_count = 0
+
+    for item in sorted(items, key=lambda x: (str(x["group_key"]), int(x["segment"]), int(x["index"]))):
+        group_key = str(item["group_key"])
+        segment = int(item["segment"])
+        if segment in groups[group_key]:
+            duplicate_count += 1
+            if duplicate_policy == "first":
+                continue
+            if duplicate_policy == "error":
+                raise ValueError(f"Duplicate segment in group {group_key}: {segment}")
+        groups[group_key][segment] = item
+
+    return groups, duplicate_count
+
+
+def iter_window_starts(segments: List[int], window_size: int, mode: str, stride: int) -> List[int]:
+    if not segments:
+        return []
+
+    min_segment = segments[0]
+    max_segment = segments[-1]
+    last_start = max_segment - window_size + 1
+    if last_start < min_segment:
+        return []
+
+    if mode == "sliding":
+        return list(range(min_segment, last_start + 1, stride))
+
+    starts: List[int] = []
+    start = min_segment
+    while start <= last_start:
+        starts.append(start)
+        start += window_size
+    return starts
+
+
+def cut_windows(groups: Dict[str, Dict[int, Record]], window_size: int, mode: str, stride: int) -> Tuple[List[Record], Dict[str, Any]]:
+    windows: List[Record] = []
+    group_summaries: Dict[str, Any] = {}
+    skipped_incomplete = 0
+
+    for group_key in sorted(groups):
+        by_segment = groups[group_key]
+        segments = sorted(by_segment)
+        kept_count = 0
+        candidate_count = 0
+        starts = iter_window_starts(segments, window_size, mode, stride)
+
+        for start_segment in starts:
+            candidate_count += 1
+            expected_segments = list(range(start_segment, start_segment + window_size))
+            rows = [by_segment.get(segment) for segment in expected_segments]
+            if any(row is None for row in rows):
+                skipped_incomplete += 1
+                continue
+
+            kept_count += 1
+            records = [safe_value(row["record"]) for row in rows if row is not None]
+            windows.append(
+                {
+                    "window_id": f"{group_key}{start_segment}-{start_segment + window_size - 1}",
+                    "group_key": group_key,
+                    "start_segment": start_segment,
+                    "end_segment": start_segment + window_size - 1,
+                    "segments": expected_segments,
+                    "datas": records,
+                }
+            )
+
+        group_summaries[group_key] = {
+            "record_count": len(segments),
+            "min_segment": segments[0] if segments else None,
+            "max_segment": segments[-1] if segments else None,
+            "candidate_window_count": candidate_count,
+            "kept_window_count": kept_count,
+        }
+
+    stats = {
+        "skipped_incomplete_window_count": skipped_incomplete,
+        "group_summaries": group_summaries,
+    }
+    return windows, stats
+
+
+def build_output(
+    source_json: Path,
+    input_shape: str,
+    records: List[Record],
+    parse_errors: List[str],
+    duplicate_count: int,
+    windows: List[Record],
+    stats: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    group_counts = Counter(str(window["group_key"]) for window in windows)
+    window_record_count = sum(len(window["datas"]) for window in windows)
+    return {
+        "summary": {
+            "source_json": str(source_json),
+            "generated_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "format": "long_sample_windows",
+            "input_shape": input_shape,
+            "mode": args.mode,
+            "window_size": args.window_size,
+            "stride": args.stride if args.mode == "sliding" else args.window_size,
+            "source_record_count": len(records),
+            "parse_error_count": len(parse_errors),
+            "duplicate_segment_count": duplicate_count,
+            "long_sample_count": len(stats["group_summaries"]),
+            "window_count": len(windows),
+            "window_record_count": window_record_count,
+            "skipped_incomplete_window_count": stats["skipped_incomplete_window_count"],
+            "group_window_counts": dict(sorted(group_counts.items())),
+            "parse_errors": parse_errors[:200],
+        },
+        "windows": windows,
+    }
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Group raw JSON by long sample and cut complete time-ordered windows."
+    )
+    parser.add_argument("--json", required=True, type=Path, help="Path to JSON file. Supports {'datas': [...]} or [...].")
+    parser.add_argument("--output", required=True, type=Path, help="Output JSON path.")
+    parser.add_argument("--window-size", required=True, type=int, help="Number of consecutive segments in each window.")
+    parser.add_argument(
+        "--mode",
+        choices=["chunk", "sliding"],
+        default="chunk",
+        help="chunk = direct non-overlapping split; sliding = sliding window. Default: chunk.",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help="Sliding stride. Used only when --mode sliding. Default: 1.",
+    )
+    parser.add_argument(
+        "--duplicate-policy",
+        choices=["last", "first", "error"],
+        default="last",
+        help="How to handle duplicate group+segment records. Default: last.",
+    )
+    parser.add_argument(
+        "--use-segment-field",
+        action="store_true",
+        help="Use record['segment_id'] for ordering when present; otherwise use the numeric suffix parsed from ID.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    if args.window_size <= 0:
+        raise ValueError("--window-size must be greater than 0.")
+    if args.stride <= 0:
+        raise ValueError("--stride must be greater than 0.")
+
+    json_path = args.json.expanduser().resolve()
+    output_path = args.output.expanduser().resolve()
+
+    print(f"[1/4] Reading JSON: {json_path}")
+    records, input_shape = load_records(json_path)
+    print(f"      Source records: {len(records)}")
+
+    print("[2/4] Grouping by long sample and sorting by time segment...")
+    normalized, parse_errors = normalize_records(records, args.use_segment_field)
+    groups, duplicate_count = build_groups(normalized, args.duplicate_policy)
+    print(f"      Long-sample groups: {len(groups)}")
+    print(f"      Parse errors skipped: {len(parse_errors)}")
+    print(f"      Duplicate group+segment records: {duplicate_count}")
+
+    print("[3/4] Cutting complete windows...")
+    windows, stats = cut_windows(groups, args.window_size, args.mode, args.stride)
+    print(f"      Kept windows: {len(windows)}")
+    print(f"      Incomplete windows skipped: {stats['skipped_incomplete_window_count']}")
+
+    print(f"[4/4] Writing JSON: {output_path}")
+    output = build_output(json_path, input_shape, records, parse_errors, duplicate_count, windows, stats, args)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    print("Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
