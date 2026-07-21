@@ -134,7 +134,30 @@ def _find_vector(source, batch_size, names=()):
     return None
 
 
-def _find_extra_metrics(module, batch_size):
+def _metric_sources(module):
+    sources = [module]
+    try:
+        sources.extend(m for m in module.modules() if m is not module)
+    except Exception:
+        pass
+    return sources
+
+
+def _find_attr_tensor(sources, names, batch_size, matrix=False):
+    for source in sources:
+        for name in names:
+            value = getattr(source, name, None)
+            if not torch.is_tensor(value) or value.dim() < 1 or value.shape[0] != batch_size:
+                continue
+            if matrix:
+                if value.dim() >= 2:
+                    return _to_2d(value)
+            elif _is_batch_vector(value, batch_size):
+                return value.reshape(batch_size, -1).mean(dim=1)
+    return None
+
+
+def _find_extra_metrics(module, batch_size, targets=None, num_targets=None):
     """Read opt-in diagnostic vectors exposed by evidence/prototype losses."""
     aliases = {
         "uncertainty": ("uncertainty", "_last_uncertainty"),
@@ -149,12 +172,48 @@ def _find_extra_metrics(module, batch_size):
         "uncertainty_sample_weight": ("uncertainty_sample_weight",),
         "sample_weight": ("sample_weight",),
     }
-    found = {}
+    sources = _metric_sources(module)
+    tensors = {}
     for key, names in aliases.items():
-        value = _find_vector(module, batch_size, names=names)
+        value = _find_attr_tensor(sources, names, batch_size)
         if value is not None:
-            found[key] = _detach_numpy(value)
-    return found
+            tensors[key] = value
+
+    target_vec = _as_1d_long(targets)
+    valid_targets = target_vec is not None and target_vec.numel() == batch_size
+    evidence = _find_attr_tensor(sources, ("evidence", "_last_evidence"), batch_size, matrix=True)
+    alpha = _find_attr_tensor(sources, ("alpha", "dirichlet_alpha"), batch_size, matrix=True)
+    distance = _find_attr_tensor(sources, ("distance", "distances", "prototype_distance"), batch_size, matrix=True)
+    posterior = _find_attr_tensor(sources, ("posterior", "probability", "probabilities"), batch_size, matrix=True)
+
+    if alpha is None and evidence is not None:
+        alpha = evidence + 1.0
+    if evidence is not None:
+        tensors.setdefault("total_evidence", evidence.sum(dim=1))
+    if alpha is not None:
+        strength = alpha.sum(dim=1)
+        tensors.setdefault("dirichlet_strength", strength)
+        classes = num_targets or alpha.shape[1]
+        tensors.setdefault("uncertainty", float(classes) / strength.clamp_min(1e-12))
+        if posterior is None:
+            posterior = alpha / strength.unsqueeze(1)
+
+    if valid_targets:
+        idx = target_vec.to((evidence if evidence is not None else distance if distance is not None else posterior).device).view(-1, 1) \
+            if any(x is not None for x in (evidence, distance, posterior)) else None
+        if idx is not None and evidence is not None:
+            tensors.setdefault("target_evidence", evidence.gather(1, idx.to(evidence.device)).squeeze(1))
+        if idx is not None and posterior is not None:
+            tensors.setdefault("target_probability", posterior.gather(1, idx.to(posterior.device)).squeeze(1))
+        if idx is not None and distance is not None:
+            didx = idx.to(distance.device)
+            target_distance = distance.gather(1, didx).squeeze(1)
+            tensors.setdefault("target_distance", target_distance)
+            mask = torch.zeros_like(distance, dtype=torch.bool).scatter_(1, didx, True)
+            nearest_negative = distance.masked_fill(mask, float("inf")).min(dim=1).values
+            tensors.setdefault("distance_margin", nearest_negative - target_distance)
+
+    return {key: _detach_numpy(value) for key, value in tensors.items()}
 
 
 def _find_logits(module, args, output, batch_size, num_targets):
@@ -288,6 +347,9 @@ class _Instrumenter:
         self._pred_batches = 0
         self._weight_batches = 0
         self._grad_batches = 0
+        self._metric_batches = 0
+        self._metric_names = set()
+        self._warned_missing_metrics = False
         self._heartbeat_interval = int(os.environ.get("CONTRIB_PRINT_EVERY", "200"))
 
     def resolve_ids(self, idxs):
@@ -397,9 +459,20 @@ class _Instrumenter:
             )
             self._weight_batches += 1
 
-        metrics = _find_extra_metrics(module, batch_size)
+        metrics = _find_extra_metrics(module, batch_size, targets, self.num_targets)
         if metrics:
-            _safe_call(self.tracker, ("update_metrics",), ids, metrics)
+            if _safe_call(self.tracker, ("update_metrics",), ids, metrics):
+                self._metric_batches += 1
+                new_names = set(metrics) - self._metric_names
+                self._metric_names.update(metrics)
+                if new_names:
+                    print(f"[contrib] extra metrics found: {', '.join(sorted(new_names))}")
+        elif not self._warned_missing_metrics:
+            attrs = sorted(name for name in dir(module) if any(
+                token in name.lower() for token in ("uncert", "evidence", "distance", "weight", "alpha")
+            ))
+            print(f"[contrib] warning: no extra metrics found on {type(module).__name__}; candidate attrs={attrs}")
+            self._warned_missing_metrics = True
 
         if self._should_print_progress():
             print(
@@ -407,6 +480,7 @@ class _Instrumenter:
                 f"batches={self._batches_seen}, "
                 f"loss={self._loss_batches}, pred={self._pred_batches}, "
                 f"grad={self._grad_batches}, weight={self._weight_batches}, "
+                f"metrics={self._metric_batches}, "
                 f"batch_size={batch_size}"
             )
 
@@ -501,6 +575,8 @@ def instrument(
 
     inst = _Instrumenter(model, num_targets, save_dir, id_source, egs_file=egs_file)
     _ACTIVE = inst
+    print(f"[contrib] hook source: {os.path.abspath(__file__)}")
+    print(f"[contrib] tracker source: {os.path.abspath(inspect.getfile(SampleContributionTracker))}")
     inst.attach_model()
 
     loader = None
