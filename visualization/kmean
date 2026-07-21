@@ -38,6 +38,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", "-o", type=Path, default=Path("kmeans_result"))
     parser.add_argument("--max-samples", type=int, default=None, help="最多读取多少条，便于抽样分析")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--balance-labels", dest="balance_labels", action="store_true", default=True,
+        help="按 class-label 随机选取相同数量的样本（默认启用）",
+    )
+    parser.add_argument(
+        "--no-balance-labels", dest="balance_labels", action="store_false",
+        help="关闭真实标签均衡抽样",
+    )
     parser.add_argument("--no-standardize", action="store_true", help="不对池化后的特征做标准化")
     parser.add_argument(
         "--pooling", choices=("mean", "mean_std", "flatten"), default="mean_std",
@@ -89,6 +97,51 @@ def read_egs(path: Path, max_samples: Optional[int]) -> List[Dict[str, str]]:
         data = rows
     result = [dict(zip(names, row)) for row in data if row]
     return result[:max_samples] if max_samples else result
+
+
+def select_balanced_rows(
+    rows: List[Dict[str, str]], max_samples: Optional[int], seed: int
+) -> List[Dict[str, str]]:
+    """按 class-label 等量随机抽样；max_samples 表示抽样后的总数上限。"""
+    if not rows:
+        return rows
+    label_col = _find(list(rows[0]), LABEL_NAMES)
+    if label_col is None:
+        raise ValueError(
+            f"启用了标签均衡抽样，但找不到 class-label 列。当前列: {list(rows[0])}"
+        )
+
+    groups: Dict[str, List[Dict[str, str]]] = {}
+    for row in rows:
+        label = row.get(label_col, "").strip()
+        if not label:
+            LOG.warning("跳过 class-label 为空的样本: %s", row)
+            continue
+        groups.setdefault(label, []).append(row)
+    if len(groups) < 2:
+        raise ValueError(f"均衡抽样至少需要两个 class-label，实际为: {list(groups)}")
+
+    smallest_group = min(len(group) for group in groups.values())
+    per_label = smallest_group
+    if max_samples is not None:
+        if max_samples < len(groups):
+            raise ValueError(
+                f"--max-samples={max_samples} 小于类别数 {len(groups)}，无法均衡抽样"
+            )
+        per_label = min(per_label, max_samples // len(groups))
+
+    rng = np.random.default_rng(seed)
+    selected: List[Dict[str, str]] = []
+    for label in sorted(groups, key=str):
+        indices = rng.choice(len(groups[label]), size=per_label, replace=False)
+        selected.extend(groups[label][int(i)] for i in indices)
+    rng.shuffle(selected)
+    LOG.info(
+        "均衡抽样：%d 个类别，每类 %d 条，共 %d 条；原始类别数=%s",
+        len(groups), per_label, len(selected),
+        {label: len(group) for label, group in groups.items()},
+    )
+    return selected
 
 
 def load_feature(specifier: str, base_dir: Path) -> np.ndarray:
@@ -245,7 +298,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     if args.n_clusters < 2:
         raise ValueError("--n-clusters 必须至少为 2")
-    rows = read_egs(args.egs, args.max_samples)
+    # 均衡模式必须先读取全部记录，再对每个真实类别等量抽样。
+    rows = read_egs(args.egs, None if args.balance_labels else args.max_samples)
+    if args.balance_labels:
+        rows = select_balanced_rows(rows, args.max_samples, args.seed)
     matrix, metadata = build_matrix(rows, args.egs.resolve().parent, args.pooling)
     if matrix.shape[0] <= args.n_clusters:
         raise ValueError(f"有效样本数 {matrix.shape[0]} 必须大于聚类数 {args.n_clusters}")
@@ -274,6 +330,10 @@ def main() -> None:
         "silhouette_score": score,
         "pca_explained_variance_ratio": pca.explained_variance_ratio_.tolist(),
         "cluster_sizes": {str(i): int(np.sum(labels == i)) for i in range(args.n_clusters)},
+        "selected_class_label_sizes": {
+            str(label): int(sum(str(x) == str(label) for x in true_labels))
+            for label in sorted(set(true_labels), key=str)
+        },
         "cluster_vs_class_label": build_cluster_label_table(labels, true_labels),
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
