@@ -134,6 +134,29 @@ def _find_vector(source, batch_size, names=()):
     return None
 
 
+def _find_extra_metrics(module, batch_size):
+    """Read opt-in diagnostic vectors exposed by evidence/prototype losses."""
+    aliases = {
+        "uncertainty": ("uncertainty", "_last_uncertainty"),
+        "dirichlet_strength": ("dirichlet_strength", "strength"),
+        "total_evidence": ("total_evidence",),
+        "target_evidence": ("target_evidence",),
+        "target_probability": ("target_probability", "target_prob"),
+        "target_distance": ("target_distance",),
+        "distance_margin": ("distance_margin",),
+        "classification_loss": ("classification_loss",),
+        "focal_component": ("focal_component",),
+        "uncertainty_sample_weight": ("uncertainty_sample_weight",),
+        "sample_weight": ("sample_weight",),
+    }
+    found = {}
+    for key, names in aliases.items():
+        value = _find_vector(module, batch_size, names=names)
+        if value is not None:
+            found[key] = _detach_numpy(value)
+    return found
+
+
 def _find_logits(module, args, output, batch_size, num_targets):
     attr_names = (
         "logits", "score", "scores", "output", "outputs", "pred", "preds",
@@ -177,6 +200,7 @@ def _find_per_sample_loss(module, args, output, batch_size, targets, logits):
             "loss_per_sample",
             "losses", "_last_loss", "_last_losses",
             "ce_loss", "ce_losses", "_last_ce_loss", "nll", "nll_loss",
+            "classification_loss",
         ),
     )
     if loss is not None:
@@ -373,6 +397,10 @@ class _Instrumenter:
                 _detach_numpy(weight),
             )
             self._weight_batches += 1
+
+        metrics = _find_extra_metrics(module, batch_size)
+        if metrics:
+            _safe_call(self.tracker, ("update_metrics",), ids, metrics)
 
         if self._should_print_progress():
             print(
