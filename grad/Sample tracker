@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
-"""
-sample_tracker.py
-逐样本贡献存储 + 聚合（修复 focal_weight 缺失问题）
-"""
-import os
-import glob
 import csv
+import glob
+import os
+
 import numpy as np
+import torch
+
+
+EXTRA_METRICS = (
+    "uncertainty", "dirichlet_strength", "total_evidence",
+    "target_evidence", "target_probability", "target_distance",
+    "distance_margin", "classification_loss", "focal_component",
+    "uncertainty_sample_weight", "sample_weight",
+)
 
 
 class SampleContributionTracker:
@@ -21,17 +27,17 @@ class SampleContributionTracker:
 
     def _load_egs(self, path):
         if not os.path.exists(path):
-            print(f"[contrib] 警告: egs 文件不存在: {path}")
+            print(f"[contrib] warning: egs file does not exist: {path}")
             return
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             first = f.readline()
             delim = "\t" if "\t" in first else " "
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             for i, line in enumerate(f):
                 parts = line.strip().split(delim)
                 if parts:
                     self._id2utt[str(i)] = parts[0]
-        print(f"[contrib] egs 已加载: {len(self._id2utt)} 条 utt-id")
+        print(f"[contrib] loaded {len(self._id2utt)} utt ids from egs")
 
     def _get_utt(self, sid):
         return self._id2utt.get(str(sid), str(sid))
@@ -41,112 +47,177 @@ class SampleContributionTracker:
         self._buf = {}
 
     def _ent(self, sid):
-        return self._buf.setdefault(sid, {
+        return self._buf.setdefault(str(sid), {
             "gn": 0.0, "gn_n": 0, "al": 0.0, "al_n": 0,
-            "loss": 0.0, "loss_n": 0, "correct": -1,
+            "loss": 0.0, "loss_n": 0,
+            "pred": -1, "target": -1, "correct": -1,
             "fw": 0.0, "fw_n": 0,
+            "extra": {},
         })
 
     def update_grad(self, ids, grad_norm, align):
         for i, sid in enumerate(ids):
-            e = self._ent(str(sid))
+            e = self._ent(sid)
             e["gn"] += float(grad_norm[i])
             e["gn_n"] += 1
             e["al"] += float(align[i])
             e["al_n"] += 1
 
-    def update_pred(self, ids, loss, targets):
+    def update_loss(self, ids, losses, targets=None):
+        losses = np.asarray(losses).reshape(-1)
         for i, sid in enumerate(ids):
-            e = self._ent(str(sid))
-            e["loss"] += float(loss[i])
+            e = self._ent(sid)
+            e["loss"] += float(losses[i])
             e["loss_n"] += 1
             if targets is not None:
-                tgt = targets[i]
-                e["correct"] = int(tgt.item() if torch.is_tensor(tgt) else tgt)
+                e["target"] = self._target_value(targets, i)
+
+    def update_logits(self, ids, logits, targets=None):
+        logits = np.asarray(logits)
+        if logits.ndim == 1:
+            preds = logits.astype(np.int64)
+        else:
+            preds = np.argmax(logits, axis=1).astype(np.int64)
+
+        for i, sid in enumerate(ids):
+            e = self._ent(sid)
+            pred = int(preds[i])
+            e["pred"] = pred
+            if targets is not None:
+                target = self._target_value(targets, i)
+                e["target"] = target
+                e["correct"] = int(pred == target)
+
+    update_prediction = update_logits
+    update_predictions = update_logits
+    update_preds = update_logits
+
+    def update_pred(self, ids, payload, targets=None):
+        arr = np.asarray(payload)
+        if arr.ndim >= 2:
+            return self.update_logits(ids, arr, targets)
+        return self.update_loss(ids, arr, targets)
 
     def update_weight(self, ids, weights):
+        weights = np.asarray(weights).reshape(-1)
         for i, sid in enumerate(ids):
-            e = self._ent(str(sid))
+            e = self._ent(sid)
             e["fw"] += float(weights[i])
             e["fw_n"] += 1
+
+    def update_metrics(self, ids, metrics):
+        """Accumulate optional per-sample scalars without changing legacy fields."""
+        arrays = {k: np.asarray(v).reshape(-1) for k, v in metrics.items()}
+        for name, values in arrays.items():
+            if len(values) != len(ids):
+                continue
+            for i, sid in enumerate(ids):
+                value = float(values[i])
+                if not np.isfinite(value):
+                    continue
+                slot = self._ent(sid)["extra"].setdefault(name, [0.0, 0])
+                slot[0] += value
+                slot[1] += 1
+
+    @staticmethod
+    def _target_value(targets, idx):
+        tgt = targets[idx]
+        if torch.is_tensor(tgt):
+            return int(tgt.detach().cpu().item())
+        return int(tgt)
 
     def save_epoch(self):
         if not self._buf:
             return
         ids = list(self._buf.keys())
+
         def col(f):
             return np.array([f(self._buf[i]) for i in ids], dtype=np.float32)
 
-        np.savez(
-            os.path.join(self.save_dir, f"contrib_epoch{self._epoch:03d}.npz"),
+        grad_valid = col(lambda e: 1.0 if e["gn_n"] else 0.0)
+        loss_valid = col(lambda e: 1.0 if e["loss_n"] else 0.0)
+        pred_valid = np.array([1 if self._buf[i]["pred"] >= 0 else 0 for i in ids], dtype=np.int8)
+        weight_valid = col(lambda e: 1.0 if e["fw_n"] else 0.0)
+
+        payload = dict(
             ids=np.array(ids),
             utt_ids=np.array([self._get_utt(i) for i in ids]),
             grad_norm=col(lambda e: e["gn"] / e["gn_n"] if e["gn_n"] else np.nan),
             align=col(lambda e: e["al"] / e["al_n"] if e["al_n"] else np.nan),
             loss=col(lambda e: e["loss"] / e["loss_n"] if e["loss_n"] else np.nan),
+            pred=np.array([self._buf[i]["pred"] for i in ids], dtype=np.int64),
+            target=np.array([self._buf[i]["target"] for i in ids], dtype=np.int64),
             correct=np.array([self._buf[i]["correct"] for i in ids], dtype=np.int8),
             focal_weight=col(lambda e: e["fw"] / e["fw_n"] if e["fw_n"] else np.nan),
         )
-        print(f"[contrib] epoch {self._epoch} 已保存 ({len(ids)} 样本)")
+        for name in EXTRA_METRICS:
+            payload[name] = col(lambda e, n=name: (
+                e["extra"][n][0] / e["extra"][n][1]
+                if n in e["extra"] and e["extra"][n][1] else np.nan
+            ))
+        np.savez(os.path.join(self.save_dir, f"contrib_epoch{self._epoch:03d}.npz"), **payload)
+        print(
+            f"[contrib] epoch {self._epoch} saved: samples={len(ids)}, "
+            f"loss={int(loss_valid.sum())}, pred={int(pred_valid.sum())}, "
+            f"grad={int(grad_valid.sum())}, weight={int(weight_valid.sum())}"
+        )
 
     @staticmethod
     def summarize(save_dir, out_csv, egs_file=None):
         files = sorted(glob.glob(os.path.join(save_dir, "contrib_epoch*.npz")))
         if not files:
-            raise FileNotFoundError(f"在 {save_dir} 没找到 contrib_epoch*.npz")
+            raise FileNotFoundError(f"no contrib_epoch*.npz found in {save_dir}")
 
-        print(f"[contrib] 读取 {len(files)} 个 epoch ...")
-        d0 = np.load(files[0], allow_pickle=True)
-        all_ids = list(d0["ids"].astype(str))
+        print(f"[contrib] reading {len(files)} epochs ...")
+        with np.load(files[0], allow_pickle=True) as d0:
+            all_ids = list(d0["ids"].astype(str))
         id2idx = {sid: i for i, sid in enumerate(all_ids)}
 
         utt_id_map = {}
         if egs_file and os.path.exists(egs_file):
-            with open(egs_file) as f:
+            with open(egs_file, encoding="utf-8") as f:
                 first = f.readline()
                 delim = "\t" if "\t" in first else " "
-            with open(egs_file) as f:
+            with open(egs_file, encoding="utf-8") as f:
                 for i, line in enumerate(f):
                     parts = line.strip().split(delim)
                     if parts:
                         utt_id_map[str(i)] = parts[0]
 
-        # 收集所有id
-        for f in files[1:]:
-            d = np.load(f, allow_pickle=True)
-            for sid in d["ids"].astype(str):
-                if sid not in id2idx:
-                    id2idx[sid] = len(all_ids)
-                    all_ids.append(sid)
+        for fpath in files[1:]:
+            with np.load(fpath, allow_pickle=True) as d:
+                for sid in d["ids"].astype(str):
+                    if sid not in id2idx:
+                        id2idx[sid] = len(all_ids)
+                        all_ids.append(sid)
 
         n_samples = len(all_ids)
         n_epochs = len(files)
-        print(f"[contrib] 共 {n_samples} 个样本，开始聚合...")
-
-        # 初始化矩阵
         gn = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
         al = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
         ls = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
         co = np.full((n_samples, n_epochs), -1, dtype=np.int8)
         fw = np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
+        extras = {
+            name: np.full((n_samples, n_epochs), np.nan, dtype=np.float32)
+            for name in EXTRA_METRICS
+        }
 
         for ei, fpath in enumerate(files):
-            d = np.load(fpath, allow_pickle=True)
-            ids_str = d["ids"].astype(str)
-            idxs = np.array([id2idx[s] for s in ids_str], dtype=np.int64)
+            with np.load(fpath, allow_pickle=True) as d:
+                ids_str = d["ids"].astype(str)
+                idxs = np.array([id2idx[s] for s in ids_str], dtype=np.int64)
+                gn[idxs, ei] = d["grad_norm"]
+                al[idxs, ei] = d["align"]
+                ls[idxs, ei] = d["loss"]
+                if "correct" in d:
+                    co[idxs, ei] = d["correct"]
+                if "focal_weight" in d:
+                    fw[idxs, ei] = d["focal_weight"]
+                for name in EXTRA_METRICS:
+                    if name in d:
+                        extras[name][idxs, ei] = d[name]
 
-            gn[idxs, ei] = d["grad_norm"]
-            al[idxs, ei] = d["align"]
-            ls[idxs, ei] = d["loss"]
-            co[idxs, ei] = d["correct"]
-            
-            # 安全读取 focal_weight
-            if "focal_weight" in d:
-                fw[idxs, ei] = d["focal_weight"]
-            else:
-                print(f"  epoch {ei}: 无 focal_weight 字段，跳过")
-
-        # 计算统计量（增加安全检查）
         with np.errstate(all="ignore"):
             mean_gn = np.nanmean(gn, axis=1)
             early_gn = gn[:, 0] if n_epochs > 0 else np.full(n_samples, np.nan)
@@ -154,37 +225,30 @@ class SampleContributionTracker:
             mean_al = np.nanmean(al, axis=1)
             mean_ls = np.nanmean(ls, axis=1)
             last_ls = ls[:, -1] if n_epochs > 0 else np.full(n_samples, np.nan)
-            
             mean_fw = np.nanmean(fw, axis=1)
             last_fw = fw[:, -1] if n_epochs > 0 else np.full(n_samples, np.nan)
-
-            # forget events
-            forget = np.zeros(n_samples, dtype=np.int32)
-            if n_epochs > 1:
-                forget = ((co[:, :-1] == 1) & (co[:, 1:] == 0)).sum(axis=1)
+            forget = ((co[:, :-1] == 1) & (co[:, 1:] == 0)).sum(axis=1) if n_epochs > 1 else np.zeros(n_samples, dtype=np.int32)
             final_co = co[:, -1] if n_epochs > 0 else co[:, 0]
-
             valid_al = ~np.isnan(al)
             neg_al = (al < 0) & valid_al
             n_val_al = valid_al.sum(axis=1).astype(np.float32)
             frac_neg = np.where(n_val_al > 0, neg_al.sum(axis=1) / n_val_al, np.nan)
 
-        # 写 CSV（按原始顺序）
-        print("[contrib] 写 CSV ...")
-        has_utt = bool(utt_id_map)
-        fields = ["id", "utt_id", "n_epochs", "mean_grad_norm", "early_grad_norm",
-                  "self_influence", "mean_align", "frac_neg_align",
-                  "mean_loss", "last_loss", "forget_events", "final_correct",
-                  "mean_focal_weight", "last_focal_weight"]
-
-        with open(out_csv, "w", newline="") as fh:
-            w = csv.writer(fh)
-            w.writerow(fields)
-            for i in range(n_samples):
-                sid = all_ids[i]
-                w.writerow([
+        fields = [
+            "id", "utt_id", "n_epochs", "mean_grad_norm", "early_grad_norm",
+            "self_influence", "mean_align", "frac_neg_align",
+            "mean_loss", "last_loss", "forget_events", "final_correct",
+            "mean_focal_weight", "last_focal_weight",
+        ]
+        for name in EXTRA_METRICS:
+            fields.extend((f"mean_{name}", f"last_{name}"))
+        with open(out_csv, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(fields)
+            for i, sid in enumerate(all_ids):
+                row = [
                     sid,
-                    utt_id_map.get(sid, sid) if has_utt else sid,
+                    utt_id_map.get(sid, sid) if utt_id_map else sid,
                     int(np.sum(~np.isnan(gn[i]))),
                     f"{mean_gn[i]:.6f}",
                     f"{early_gn[i]:.6f}",
@@ -197,7 +261,15 @@ class SampleContributionTracker:
                     int(final_co[i]),
                     f"{mean_fw[i]:.6f}",
                     f"{last_fw[i]:.6f}",
-                ])
+                ]
+                for name in EXTRA_METRICS:
+                    values = extras[name][i]
+                    valid = values[np.isfinite(values)]
+                    row.extend((
+                        f"{np.mean(valid):.6f}" if valid.size else "nan",
+                        f"{valid[-1]:.6f}" if valid.size else "nan",
+                    ))
+                writer.writerow(row)
 
-        print(f"[contrib] 已写出 {n_samples} 个样本 -> {out_csv}")
+        print(f"[contrib] wrote {n_samples} samples -> {out_csv}")
         return out_csv
