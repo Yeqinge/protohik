@@ -179,19 +179,65 @@ def build_matrix(rows: List[Dict[str, str]], base_dir: Path, pooling: str):
     return np.stack(vectors), metadata
 
 
-def save_plot(points: np.ndarray, labels: np.ndarray, centers: np.ndarray, out: Path) -> None:
-    plt.figure(figsize=(10, 8))
-    colors = plt.get_cmap("tab20", int(labels.max()) + 1)
-    scatter = plt.scatter(points[:, 0], points[:, 1], c=labels, cmap=colors, s=22, alpha=.75)
-    plt.scatter(centers[:, 0], centers[:, 1], marker="X", s=220, c="black", edgecolors="white", label="centroid")
-    plt.xlabel("PCA 1")
-    plt.ylabel("PCA 2")
-    plt.title("K-Means clusters (PCA projection)")
-    plt.legend(*scatter.legend_elements(), title="cluster", loc="best")
-    plt.grid(alpha=.2)
-    plt.tight_layout()
-    plt.savefig(out, dpi=180)
-    plt.close()
+def save_plot(
+    points: np.ndarray,
+    cluster_labels: np.ndarray,
+    true_labels: Sequence[str],
+    centers: np.ndarray,
+    out: Path,
+) -> None:
+    """在相同 PCA 坐标中并排展示聚类结果和 egs 真实标签。"""
+    fig, axes = plt.subplots(1, 2, figsize=(17, 7), sharex=True, sharey=True)
+
+    cluster_values = sorted(set(int(x) for x in cluster_labels))
+    cluster_cmap = plt.get_cmap("tab20", max(len(cluster_values), 2))
+    for color_index, cluster in enumerate(cluster_values):
+        mask = cluster_labels == cluster
+        axes[0].scatter(
+            points[mask, 0], points[mask, 1], s=22, alpha=.75,
+            color=cluster_cmap(color_index), label=f"cluster {cluster}",
+        )
+    axes[0].scatter(
+        centers[:, 0], centers[:, 1], marker="X", s=220,
+        c="black", edgecolors="white", label="centroid",
+    )
+    axes[0].set_title("K-Means cluster labels")
+    axes[0].legend(title="K-Means", loc="best")
+
+    display_true_labels = [label if str(label).strip() else "(missing)" for label in true_labels]
+    true_values = sorted(set(display_true_labels), key=str)
+    true_cmap = plt.get_cmap("tab20", max(len(true_values), 2))
+    true_array = np.asarray(display_true_labels, dtype=object)
+    for color_index, label in enumerate(true_values):
+        mask = true_array == label
+        axes[1].scatter(
+            points[mask, 0], points[mask, 1], s=22, alpha=.75,
+            color=true_cmap(color_index), label=str(label),
+        )
+    axes[1].set_title("True class-label from egs")
+    axes[1].legend(title="class-label", loc="best")
+
+    for axis in axes:
+        axis.set_xlabel("PCA 1")
+        axis.set_ylabel("PCA 2")
+        axis.grid(alpha=.2)
+    fig.suptitle("K-Means clustering vs. true labels (PCA projection)")
+    fig.tight_layout()
+    fig.savefig(out, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def build_cluster_label_table(
+    cluster_labels: np.ndarray, true_labels: Sequence[str]
+) -> Dict[str, Dict[str, int]]:
+    """统计每个 K-Means 簇中各真实标签的数量。"""
+    table: Dict[str, Dict[str, int]] = {}
+    for cluster, true_label in zip(cluster_labels, true_labels):
+        cluster_key = str(int(cluster))
+        label_key = str(true_label).strip() or "(missing)"
+        table.setdefault(cluster_key, {})
+        table[cluster_key][label_key] = table[cluster_key].get(label_key, 0) + 1
+    return table
 
 
 def main() -> None:
@@ -214,7 +260,8 @@ def main() -> None:
     pca = PCA(n_components=2, random_state=args.seed)
     points = pca.fit_transform(x)
     centers = pca.transform(model.cluster_centers_)
-    save_plot(points, labels, centers, args.output_dir / "clusters_pca.png")
+    true_labels = [item["source_label"] for item in metadata]
+    save_plot(points, labels, true_labels, centers, args.output_dir / "clusters_pca.png")
 
     with (args.output_dir / "clusters.csv").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=["sample_id", "source_label", "cluster", "pca_x", "pca_y", "feature"])
@@ -227,6 +274,7 @@ def main() -> None:
         "silhouette_score": score,
         "pca_explained_variance_ratio": pca.explained_variance_ratio_.tolist(),
         "cluster_sizes": {str(i): int(np.sum(labels == i)) for i in range(args.n_clusters)},
+        "cluster_vs_class_label": build_cluster_label_table(labels, true_labels),
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     LOG.info("完成：%s", json.dumps(summary, ensure_ascii=False))
