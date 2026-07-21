@@ -1,13 +1,58 @@
 class UncertaintyFocalPrototypeLoss(TopVirtualLoss):
-    def init(self,input_dim,num_targets,temperature=0.1,gamma=2.0,uncertainty_weight=1.0,evidence_scale=10.0,eps=1e-8):
+    def init(self,input_dim,num_targets,temperature=0.5,gamma=1.0,
+             uncertainty_weight=0.25,evidence_scale=None,eps=1e-8,
+             kl_weight=0.001,kl_warmup_epochs=10,
+             margin_temperature=0.3,min_separation=0.05):
+
         self.prototypes=nn.Parameter(torch.empty(num_targets,input_dim))
         nn.init.xavier_uniform_(self.prototypes)
+
         self.num_targets=int(num_targets)
         self.temperature=float(temperature)
         self.gamma=float(gamma)
         self.uncertainty_weight=float(uncertainty_weight)
-        self.evidence_scale=float(evidence_scale)
+        self.evidence_scale=float(
+            max(10.0,2.0*num_targets)
+            if evidence_scale is None else evidence_scale
+        )
         self.eps=float(eps)
+
+        self.kl_weight=float(kl_weight)
+        self.kl_warmup_epochs=int(kl_warmup_epochs)
+        self.margin_temperature=float(margin_temperature)
+        self.min_separation=float(min_separation)
+        self.current_epoch=0
+
+    def _dirichlet_kl(self,alpha):
+        alpha_sum=alpha.sum(dim=1,keepdim=True)
+        num_classes=alpha.shape[1]
+
+        log_beta_alpha=(
+            torch.lgamma(alpha_sum)
+            -torch.lgamma(alpha).sum(dim=1,keepdim=True)
+        )
+
+        log_beta_uniform=(
+            torch.lgamma(
+                alpha.new_full((alpha.shape[0],1),float(num_classes))
+            )
+            -num_classes*torch.lgamma(alpha.new_tensor(1.0))
+        )
+
+        digamma_difference=(
+            torch.digamma(alpha)
+            -torch.digamma(alpha_sum)
+        )
+
+        kl=(
+            log_beta_alpha
+            -log_beta_uniform
+            +((alpha-1.0)*digamma_difference).sum(
+                dim=1,keepdim=True
+            )
+        )
+
+        return kl.squeeze(1).clamp_min(0.0)
 
     def forward(self,inputs,targets):
         assert inputs.dim()==3
@@ -17,31 +62,163 @@ class UncertaintyFocalPrototypeLoss(TopVirtualLoss):
         features=F.normalize(inputs.squeeze(2),dim=1)
         prototypes=F.normalize(self.prototypes,dim=1)
 
-        distance=torch.cdist(features,prototypes,p=2).square()
-        evidence=self.evidence_scale*torch.exp(-distance/self.temperature)
+        distance=torch.cdist(
+            features,prototypes,p=2
+        ).square()
+
+        prototype_logits=-distance/self.temperature
+        class_distribution=F.softmax(
+            prototype_logits,dim=1
+        )
+
+        sorted_distance=torch.sort(
+            distance,dim=1
+        ).values
+
+        nearest_distance=sorted_distance[:,0]
+
+        if self.num_targets>1:
+            second_nearest_distance=sorted_distance[:,1]
+            prediction_margin=(
+                second_nearest_distance-nearest_distance
+            )
+        else:
+            prediction_margin=torch.zeros_like(
+                nearest_distance
+            )
+
+        absolute_closeness=torch.exp(
+            -nearest_distance/self.temperature
+        )
+
+        separation_confidence=(
+            1.0
+            -torch.exp(
+                -prediction_margin/self.margin_temperature
+            )
+        ).clamp(
+            min=self.min_separation,
+            max=1.0
+        )
+
+        total_evidence_strength=(
+            self.evidence_scale
+            *absolute_closeness
+            *separation_confidence
+        )
+
+        evidence=(
+            class_distribution
+            *total_evidence_strength.unsqueeze(1)
+        )
+
         alpha=evidence+1.0
         strength=alpha.sum(dim=1)
         probability=alpha/strength.unsqueeze(1)
-        uncertainty=self.num_targets/(strength+self.eps)
+        uncertainty=(
+            self.num_targets
+            /(strength+self.eps)
+        )
 
         target_index=targets.unsqueeze(1)
-        target_probability=probability.gather(1,target_index).squeeze(1)
-        target_evidence=evidence.gather(1,target_index).squeeze(1)
-        target_distance=distance.gather(1,target_index).squeeze(1)
 
-        target_mask=F.one_hot(targets,self.num_targets).bool()
-        negative_distance=distance.masked_fill(target_mask,float("inf"))
-        nearest_negative_distance=negative_distance.min(dim=1).values
-        distance_margin=nearest_negative_distance-target_distance
+        target_alpha=alpha.gather(
+            1,target_index
+        ).squeeze(1)
 
-        classification_loss=-torch.log(target_probability.clamp_min(self.eps))
-        focal_component=(1.0-target_probability).pow(self.gamma)
-        uncertainty_sample_weight=1.0+self.uncertainty_weight*uncertainty
-        sample_weight=focal_component*uncertainty_sample_weight
-        per_sample_loss=sample_weight*classification_loss
+        target_probability=probability.gather(
+            1,target_index
+        ).squeeze(1)
+
+        target_evidence=evidence.gather(
+            1,target_index
+        ).squeeze(1)
+
+        target_distance=distance.gather(
+            1,target_index
+        ).squeeze(1)
+
+        target_mask=F.one_hot(
+            targets,self.num_targets
+        ).bool()
+
+        negative_distance=distance.masked_fill(
+            target_mask,float("inf")
+        )
+
+        if self.num_targets>1:
+            nearest_negative_distance=negative_distance.min(
+                dim=1
+            ).values
+            distance_margin=(
+                nearest_negative_distance-target_distance
+            )
+        else:
+            distance_margin=torch.zeros_like(
+                target_distance
+            )
+
+        classification_loss=(
+            torch.digamma(strength)
+            -torch.digamma(target_alpha)
+        )
+
+        target_one_hot=F.one_hot(
+            targets,self.num_targets
+        ).to(alpha.dtype)
+
+        adjusted_alpha=(
+            target_one_hot
+            +(1.0-target_one_hot)*alpha
+        )
+
+        kl_loss=self._dirichlet_kl(
+            adjusted_alpha
+        )
+
+        if self.kl_warmup_epochs>0:
+            kl_annealing=min(
+                1.0,
+                float(self.current_epoch+1)
+                /float(self.kl_warmup_epochs)
+            )
+        else:
+            kl_annealing=1.0
+
+        evidential_loss=(
+            classification_loss
+            +self.kl_weight
+            *kl_annealing
+            *kl_loss
+        )
+
+        focal_component=(
+            1.0-target_probability
+        ).clamp(
+            min=0.0,
+            max=1.0
+        ).pow(self.gamma)
+
+        uncertainty_sample_weight=(
+            1.0
+            +self.uncertainty_weight
+            *uncertainty
+            *target_probability.detach()
+        )
+
+        sample_weight=(
+            focal_component
+            *uncertainty_sample_weight
+        )
+
+        per_sample_loss=(
+            sample_weight
+            *evidential_loss
+        )
 
         self.posterior=probability.unsqueeze(2).detach()
         self.weighted_per_sample_loss=per_sample_loss.detach()
+        self.per_sample_loss=per_sample_loss.detach()
         self.focal_weight=sample_weight.detach()
 
         self.uncertainty=uncertainty.detach()
@@ -53,10 +230,25 @@ class UncertaintyFocalPrototypeLoss(TopVirtualLoss):
         self.distance_margin=distance_margin.detach()
         self.classification_loss=classification_loss.detach()
         self.focal_component=focal_component.detach()
-        self.uncertainty_sample_weight=uncertainty_sample_weight.detach()
+        self.uncertainty_sample_weight=(
+            uncertainty_sample_weight.detach()
+        )
         self.sample_weight=sample_weight.detach()
+
+        self.kl_loss=kl_loss.detach()
+        self.absolute_closeness=absolute_closeness.detach()
+        self.prediction_margin=prediction_margin.detach()
+        self.separation_confidence=(
+            separation_confidence.detach()
+        )
 
         return per_sample_loss.mean()
 
+    def set_epoch(self,epoch):
+        self.current_epoch=int(epoch)
+
     def step(self,*args,**kwargs):
-        pass
+        if "epoch" in kwargs:
+            self.current_epoch=int(kwargs["epoch"])
+        elif len(args)>0 and isinstance(args[0],int):
+            self.current_epoch=int(args[0])
