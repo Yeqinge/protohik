@@ -91,6 +91,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-o", "--output", type=Path, default=Path("prototype_egs.png"))
     parser.add_argument("--prototype-key", help="明确指定 state_dict 中的 prototype 参数名")
     parser.add_argument("--list-keys", action="store_true", help="列出 checkpoint 张量后退出")
+    parser.add_argument(
+        "--class-labels", nargs="+",
+        help="按 prototype 类别索引给出显示标签，例如 --class-labels normal abnormal",
+    )
     parser.add_argument("--method", choices=("pca", "tsne"), default="pca")
     parser.add_argument(
         "--no-l2-normalize", action="store_true",
@@ -139,7 +143,7 @@ def load_checkpoint(path: Path) -> Dict[str, Any]:
     return tensors
 
 
-def choose_prototypes(tensors: Dict[str, Any], explicit_key: Optional[str]) -> Tuple[str, np.ndarray]:
+def choose_prototypes(tensors: Dict[str, Any], explicit_key: Optional[str]):
     if explicit_key:
         if explicit_key not in tensors:
             matches = [k for k in tensors if k.endswith(explicit_key)]
@@ -167,8 +171,13 @@ def choose_prototypes(tensors: Dict[str, Any], explicit_key: Optional[str]) -> T
     array = tensor.detach().float().cpu().numpy()
     if array.ndim < 2:
         raise ValueError(f"prototype 张量至少应为二维，实际 {key}: {array.shape}")
-    # Handles [classes, dim] and [classes, prototypes_per_class, dim].
-    return key, array.reshape(-1, array.shape[-1])
+    # Handles [classes, dim] and [classes, prototypes_per_class, dim] while
+    # retaining the class/within-class identity of every flattened prototype.
+    num_classes = int(array.shape[0])
+    per_class = int(np.prod(array.shape[1:-1])) if array.ndim > 2 else 1
+    class_ids = np.repeat(np.arange(num_classes, dtype=np.int64), per_class)
+    within_class_ids = np.tile(np.arange(per_class, dtype=np.int64), num_classes)
+    return key, array.reshape(-1, array.shape[-1]), class_ids, within_class_ids
 
 
 def load_model(
@@ -289,6 +298,35 @@ def l2_normalize(vectors: np.ndarray) -> np.ndarray:
     return vectors / np.maximum(norms, 1e-12)
 
 
+def prototype_predictions(
+    data: np.ndarray,
+    prototypes: np.ndarray,
+    prototype_class_ids: np.ndarray,
+    class_labels: list[str],
+):
+    """Return cosine similarities and max-prototype scores for each class."""
+    data_n = l2_normalize(data)
+    proto_n = l2_normalize(prototypes)
+    similarities = np.matmul(data_n, proto_n.T)
+    class_ids = sorted(set(int(x) for x in prototype_class_ids))
+    class_scores = np.stack(
+        [similarities[:, prototype_class_ids == class_id].max(axis=1) for class_id in class_ids],
+        axis=1,
+    )
+    order = np.argsort(class_scores, axis=1)
+    best_columns = order[:, -1]
+    best_scores = class_scores[np.arange(len(data)), best_columns]
+    second_scores = class_scores[np.arange(len(data)), order[:, -2]] if len(class_ids) > 1 else np.zeros(len(data))
+    margins = best_scores - second_scores
+    predicted_class_ids = np.asarray([class_ids[int(x)] for x in best_columns])
+    predicted_labels = np.asarray([
+        class_labels[x] if 0 <= x < len(class_labels) else str(x)
+        for x in predicted_class_ids
+    ], dtype=object)
+    nearest_proto = similarities.argmax(axis=1)
+    return similarities, predicted_labels, nearest_proto, best_scores, margins
+
+
 def select_equal_binary_rows(rows: list[dict[str, str]], total: int, seed: int) -> list[dict[str, str]]:
     """Randomly select exactly total/2 rows from each of two egs labels."""
     if total <= 0 or total % 2:
@@ -328,20 +366,36 @@ def select_equal_binary_rows(rows: list[dict[str, str]], total: int, seed: int) 
     return selected
 
 
-def save_plot(points: np.ndarray, labels: Iterable[str], n_data: int, prototype_key: str, output: Path, annotate: bool) -> None:
+def save_plot(
+    points: np.ndarray,
+    labels: Iterable[str],
+    predicted_labels: np.ndarray,
+    margins: np.ndarray,
+    prototype_labels: list[str],
+    n_data: int,
+    prototype_key: str,
+    output: Path,
+    annotate: bool,
+) -> None:
     labels = np.asarray([str(x).strip() or "(missing)" for x in labels], dtype=object)
+    correct = predicted_labels == labels
+    scale = float(np.percentile(margins, 95)) if len(margins) else 0.0
+    sizes = 18.0 + 52.0 * np.clip(margins / max(scale, 1e-12), 0.0, 1.0)
     fig, ax = plt.subplots(figsize=(11, 8))
     values = sorted(set(labels), key=str)
     cmap = plt.get_cmap("tab20", max(2, len(values)))
     for index, label in enumerate(values):
         mask = labels == label
-        ax.scatter(points[:n_data][mask, 0], points[:n_data][mask, 1], s=18, alpha=.55, color=cmap(index), label=label)
+        ax.scatter(points[:n_data][mask, 0], points[:n_data][mask, 1], s=sizes[mask], alpha=.55, color=cmap(index), label=f"true={label}")
+    wrong = ~correct
+    if np.any(wrong):
+        ax.scatter(points[:n_data][wrong, 0], points[:n_data][wrong, 1], s=sizes[wrong] + 28, marker="x", c="red", linewidths=1.4, label="wrong prediction", zorder=4)
     proto_points = points[n_data:]
     ax.scatter(proto_points[:, 0], proto_points[:, 1], marker="X", s=190, c="black", edgecolors="white", linewidths=1.2, label="prototype", zorder=5)
-    if annotate:
-        for i, point in enumerate(proto_points):
-            ax.annotate(f"P{i}", point, xytext=(4, 4), textcoords="offset points", fontsize=8)
-    ax.set_title(f"egs samples and prototypes\n{prototype_key}")
+    for i, point in enumerate(proto_points):
+        ax.annotate(prototype_labels[i], point, xytext=(5, 5), textcoords="offset points", fontsize=9, fontweight="bold")
+    accuracy = float(np.mean(correct)) if len(correct) else float("nan")
+    ax.set_title(f"egs samples and prototypes\n{prototype_key} | cosine prototype accuracy={accuracy:.2%}\npoint size = classification margin")
     ax.set_xlabel("component 1")
     ax.set_ylabel("component 2")
     ax.grid(alpha=.2)
@@ -387,7 +441,7 @@ def main() -> None:
             print(f"{key}\t{tuple(value.shape)}\t{value.dtype}")
         return
 
-    prototype_key, prototypes = choose_prototypes(tensors, args.prototype_key)
+    prototype_key, prototypes, prototype_class_ids, prototype_within_ids = choose_prototypes(tensors, args.prototype_key)
     # 必须先读取全部行，才能在两个类别中分别无放回抽取相同数量。
     rows = select_equal_binary_rows(read_egs(egs_path, None), args.num_samples, args.seed)
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -410,21 +464,78 @@ def main() -> None:
             "请先用该模型将 egs 提取为 embedding，再把 embedding 文件写入 egs 的 feat 列。"
         )
 
+    true_labels = np.asarray([str(x["source_label"]).strip() or "(missing)" for x in metadata], dtype=object)
+    def label_sort_key(value):
+        try:
+            return (0, float(value))
+        except (TypeError, ValueError):
+            return (1, str(value))
+    class_labels = list(args.class_labels) if args.class_labels else sorted(set(true_labels.tolist()), key=label_sort_key)
+    required_classes = int(np.max(prototype_class_ids)) + 1
+    if len(class_labels) < required_classes:
+        raise ValueError(
+            "prototype 有 {0} 个类别，但只得到 {1} 个类别标签；"
+            "请使用 --class-labels 按类别索引指定".format(required_classes, len(class_labels))
+        )
+    prototype_labels = [
+        "class={0} / P{1}".format(
+            class_labels[int(class_id)] if int(class_id) < len(class_labels) else int(class_id),
+            int(within_id),
+        )
+        for class_id, within_id in zip(prototype_class_ids, prototype_within_ids)
+    ]
+    similarities, predicted_labels, nearest_proto, best_scores, margins = prototype_predictions(
+        data, prototypes, prototype_class_ids, class_labels,
+    )
+    correct = predicted_labels == true_labels
+    LOG.info(
+        "余弦 prototype 分类: accuracy=%.2f%%, mean_margin=%.6f",
+        100.0 * float(np.mean(correct)), float(np.mean(margins)),
+    )
+
     all_vectors = np.concatenate((data, prototypes), axis=0)
     if not args.no_l2_normalize:
         all_vectors = l2_normalize(all_vectors)
         LOG.info("降维前已对 embedding 和 prototype 做 L2 归一化")
     points = reduce_points(all_vectors, args.method, args.seed)
-    save_plot(points, (x["source_label"] for x in metadata), len(data), prototype_key, args.output, args.annotate_prototypes)
+    save_plot(
+        points, true_labels, predicted_labels, margins, prototype_labels,
+        len(data), prototype_key, args.output, args.annotate_prototypes,
+    )
 
     csv_path = args.output.with_suffix(".csv")
     with csv_path.open("w", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.writer(stream)
-        writer.writerow(("type", "id", "label", "x", "y"))
-        for item, point in zip(metadata, points[:len(data)]):
-            writer.writerow(("egs", item["sample_id"], item["source_label"], *point))
+        similarity_columns = [
+            "cosine_class_{0}_prototype_{1}".format(int(class_id), int(within_id))
+            for class_id, within_id in zip(prototype_class_ids, prototype_within_ids)
+        ]
+        columns = [
+            "type", "id", "label", "predicted_label", "correct",
+            "nearest_prototype", "max_cosine", "margin", "x", "y",
+            "prototype_class_id", "prototype_within_class_id",
+        ] + similarity_columns
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        for i, (item, point) in enumerate(zip(metadata, points[:len(data)])):
+            row = {
+                "type": "egs", "id": item["sample_id"], "label": true_labels[i],
+                "predicted_label": predicted_labels[i], "correct": bool(correct[i]),
+                "nearest_prototype": prototype_labels[int(nearest_proto[i])],
+                "max_cosine": float(best_scores[i]), "margin": float(margins[i]),
+                "x": float(point[0]), "y": float(point[1]),
+                "prototype_class_id": "", "prototype_within_class_id": "",
+            }
+            row.update({name: float(similarities[i, j]) for j, name in enumerate(similarity_columns)})
+            writer.writerow(row)
         for i, point in enumerate(points[len(data):]):
-            writer.writerow(("prototype", i, "", *point))
+            class_id = int(prototype_class_ids[i])
+            writer.writerow({
+                "type": "prototype", "id": prototype_labels[i],
+                "label": class_labels[class_id] if class_id < len(class_labels) else str(class_id),
+                "x": float(point[0]), "y": float(point[1]),
+                "prototype_class_id": class_id,
+                "prototype_within_class_id": int(prototype_within_ids[i]),
+            })
     LOG.info("prototype: %s %s; egs: %s", prototype_key, prototypes.shape, data.shape)
     LOG.info("已生成 %s 和 %s", args.output.resolve(), csv_path.resolve())
 
