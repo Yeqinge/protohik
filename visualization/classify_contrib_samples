@@ -172,8 +172,8 @@ def choose_egs_name_column(header_parts):
     return 0
 
 
-def sample_group_key(raw):
-    """Return exactly the same long-sample key as sample_context_visualizer."""
+def json_sample_name(raw):
+    """Normalize one JSON record name without aggregating real samples."""
     if raw is None:
         return ""
     name = str(raw).strip().strip('"').strip("'")
@@ -181,14 +181,23 @@ def sample_group_key(raw):
         return ""
     name = name.replace("\\", "/")
     name = os.path.basename(name)
-    name = re.sub(r"\.(wav|mp3|flac|m4a|ogg|aac)$", "", name, flags=re.IGNORECASE)
-    match = re.match(r"^(?P<long_id>.+_)(?P<segment>\d+)$", name)
-    if match:
-        return match.group("long_id")
-    if "_" not in name:
-        return name + "_"
-    prefix, _ = name.rsplit("_", 1)
-    return prefix + "_"
+    return re.sub(r"\.(wav|mp3|flac|m4a|ogg|aac)$", "", name, flags=re.IGNORECASE)
+
+
+def egs_chunk_candidates(stem):
+    """Yield an exact egs name followed by progressively de-chunked names."""
+    candidates = [stem]
+    current = stem
+    for _ in range(4):
+        stripped = re.sub(
+            r"(?:[_-](?:chunk|seg)?\d{1,6})$", "", current,
+            flags=re.IGNORECASE,
+        )
+        if stripped == current or not stripped:
+            break
+        candidates.append(stripped)
+        current = stripped
+    return candidates
 
 
 def normalize_sample_name(raw, json_names=None):
@@ -204,17 +213,15 @@ def normalize_sample_name(raw, json_names=None):
         flags=re.IGNORECASE,
     )
 
-    # An already-normalized group key may be supplied by an egs file or NPZ.
-    if json_name_set and stem in json_name_set:
+    candidates = egs_chunk_candidates(stem)
+    if json_name_set:
+        # Exact JSON names always win. Only egs names that are not exact are
+        # allowed to lose one or more explicit chunk suffixes.
+        for candidate in candidates:
+            if candidate in json_name_set:
+                return candidate
         return stem
-
-    # Egs/NPZ identifiers may use a feature extension rather than the audio
-    # extension used by JSON. Strip that compatibility extension before
-    # applying the otherwise identical sample grouping rule.
-    grouped = sample_group_key(stem)
-    if json_name_set and grouped in json_name_set:
-        return grouped
-    return grouped
+    return candidates[1] if len(candidates) > 1 else stem
 
 
 def sample_name_candidates(raw):
@@ -230,8 +237,7 @@ def sample_name_candidates(raw):
             r"\.(wav|mp3|flac|m4a|ogg|aac|ark|npy|npz)$", "", value,
             flags=re.IGNORECASE,
         )
-        grouped = sample_group_key(value)
-        for candidate in (value, stem, grouped):
+        for candidate in (value, stem, *egs_chunk_candidates(stem)):
             candidate = str(candidate).strip().strip('"').strip("'")
             if candidate and candidate not in candidates:
                 candidates.append(candidate)
@@ -244,7 +250,7 @@ def find_meta_entry(meta, sample):
     for candidate in sample_name_candidates(sample):
         if candidate in meta:
             return meta[candidate]
-    normalized = sample_group_key(sample)
+    normalized = json_sample_name(sample)
     return meta.get(normalized, {})
 
 
@@ -290,15 +296,20 @@ def load_json_name_map(path):
         }
     meta = {}
     names = set()
+    valid_record_count = 0
+    duplicate_names = []
     for item in items:
         if not isinstance(item, dict):
             continue
         # Keep exactly the same id precedence as sample_context_visualizer so
         # the two scripts produce the same group universe and keys.
         raw = get_json_record_id(item)
-        name = sample_group_key(raw)
+        name = json_sample_name(raw)
         if not name:
             continue
+        valid_record_count += 1
+        if name in names and len(duplicate_names) < 10:
+            duplicate_names.append(name)
         names.add(name)
         entry = meta.setdefault(name, {})
         next_meta = {
@@ -323,9 +334,16 @@ def load_json_name_map(path):
                     parts.append(text)
                     entry[key] = " | ".join(parts)
         entry.setdefault("_original_records", []).append(item)
-    print(f"[json] loaded {len(items)} records, {len(names)} normalized names ({time.time() - t0:.1f}s)", flush=True)
+    print(
+        f"[json] loaded {len(items)} records, {valid_record_count} valid sample ids, "
+        f"{len(names)} unique real samples ({time.time() - t0:.1f}s)",
+        flush=True,
+    )
     json_layout["record_count"] = len(items)
-    json_layout["group_count"] = len(names)
+    json_layout["valid_record_count"] = valid_record_count
+    json_layout["sample_count"] = len(names)
+    json_layout["duplicate_name_count"] = valid_record_count - len(names)
+    json_layout["duplicate_name_examples"] = duplicate_names
     return meta, names, json_layout
 
 
@@ -647,8 +665,8 @@ def classify_samples(models, min_model_coverage=0.5, sample_universe=None):
         add_model_percentiles(model)
 
     model_names = {s for m in models for s in m["sample_data"].keys()}
-    # When JSON is supplied, use its complete sample-script-compatible group
-    # universe.  Samples absent from every contrib model remain visible as
+    # When JSON is supplied, use its complete real-sample universe without
+    # grouping JSON names. Samples absent from every contrib model remain
     # ``unknown`` instead of disappearing from the final count.
     universe = set(sample_universe or ())
     names = sorted(universe if universe else model_names)
@@ -656,8 +674,8 @@ def classify_samples(models, min_model_coverage=0.5, sample_universe=None):
     if model_only:
         examples = ", ".join(sorted(model_only)[:5])
         print(
-            f"[align] warning: {len(model_only)} contrib group(s) do not match JSON "
-            f"and are excluded to keep sample-script parity; examples: {examples}",
+            f"[align] warning: {len(model_only)} contrib sample(s) do not match JSON "
+            f"and are excluded; examples: {examples}",
             flush=True,
         )
     n_models = len(models)
@@ -1550,8 +1568,20 @@ def main():
     meta, json_names, json_layout = load_json_name_map(args.json)
     if args.json and not json_names:
         raise SystemExit(
-            "JSON contains no sample-script-compatible IDs. Expected ID/id/"
+            "JSON contains no valid sample IDs. Expected ID/id/"
             "file_name/filename or file_path."
+        )
+    if args.json and json_layout.get("valid_record_count") != json_layout.get("record_count"):
+        raise SystemExit(
+            f"JSON has {json_layout.get('record_count', 0)} records but only "
+            f"{json_layout.get('valid_record_count', 0)} valid sample IDs; refusing "
+            "to silently drop real samples."
+        )
+    if args.json and json_layout.get("duplicate_name_count", 0):
+        raise SystemExit(
+            f"JSON has {json_layout['duplicate_name_count']} duplicate normalized real "
+            f"sample name(s), examples={json_layout.get('duplicate_name_examples', [])}. "
+            "Real sample names must be unique."
         )
     common_egs_map = load_egs_map(args.egs, json_names=json_names)
 
@@ -1578,9 +1608,9 @@ def main():
     if json_names:
         model_groups = {sample for model in models for sample in model["sample_data"]}
         print(
-            f"[align] sample-script parity: JSON records={json_layout.get('record_count', 0)}, "
-            f"long-sample groups={len(json_names)}, classify rows={len(rows)}, "
-            f"match={'yes' if len(rows) == len(json_names) else 'NO'}",
+            f"[align] JSON parity: JSON real samples={json_layout.get('record_count', 0)}, "
+            f"unique names={len(json_names)}, classify rows={len(rows)}, "
+            f"match={'yes' if len(rows) == json_layout.get('record_count', 0) else 'NO'}",
             flush=True,
         )
         print(
