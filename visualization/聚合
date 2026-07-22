@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Diagnose and verify NPZ -> egs -> JSON real-sample aggregation.
+
+This script does not classify samples and does not generate HTML.  It tries
+several NPZ-id addressing modes, selects the mode with the most JSON matches,
+and writes transparent CSV reports that can be inspected before running the
+full classifier.
+
+python check_npz_egs_json_alignment.py \
+  --npz /path/to/contrib \
+  --egs /path/to/train.egs.csv \
+  --json /path/to/samples.json \
+  --output-prefix /path/to/alignment_check
+"""
+
+import argparse
+import csv
+import glob
+import json
+import os
+from collections import Counter, defaultdict
+
+import numpy as np
+
+from classify_contrib_samples import (
+    choose_egs_name_column,
+    egs_chunk_candidates,
+    get_json_record_id,
+    json_sample_name,
+    looks_like_header,
+    sniff_delimiter,
+    split_egs_line,
+)
+
+
+ID_HEADERS = {"id", "index", "idx", "sample_id", "egs_id", "utt_id"}
+
+
+def load_json_samples(path):
+    with open(path, encoding="utf-8-sig") as stream:
+        payload = json.load(stream)
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = None
+        for key in ("datas", "data", "items"):
+            if isinstance(payload.get(key), list):
+                records = payload[key]
+                break
+        if records is None:
+            raise ValueError("JSON object must contain a datas/data/items list")
+    else:
+        raise ValueError("JSON must be a list or an object containing a record list")
+
+    names = []
+    invalid = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            invalid.append((index, "not an object"))
+            continue
+        raw = get_json_record_id(record)
+        name = json_sample_name(raw)
+        if not name:
+            invalid.append((index, "missing ID/id/file_name/filename/file_path"))
+            continue
+        names.append(name)
+    counts = Counter(names)
+    duplicates = {name: count for name, count in counts.items() if count > 1}
+    return records, set(names), invalid, duplicates
+
+
+def choose_id_column(header):
+    normalized = [str(value).strip().strip('"').strip("'").lower() for value in header]
+    for index, name in enumerate(normalized):
+        if name in ID_HEADERS:
+            return index
+    return None
+
+
+def load_egs_rows(path, json_names):
+    with open(path, encoding="utf-8-sig") as stream:
+        first = stream.readline()
+    delimiter = sniff_delimiter(first)
+    first_parts = split_egs_line(first, delimiter)
+    has_header = looks_like_header(first_parts)
+    name_column = choose_egs_name_column(first_parts) if has_header else 0
+    id_column = choose_id_column(first_parts) if has_header else None
+
+    rows = []
+    with open(path, encoding="utf-8-sig") as stream:
+        for physical_line, line in enumerate(stream, 1):
+            if physical_line == 1 and has_header:
+                continue
+            parts = split_egs_line(line, delimiter)
+            if not parts:
+                continue
+            raw_name = parts[name_column] if name_column < len(parts) else parts[0]
+            if not has_header:
+                for part in parts:
+                    if match_json_name(part, json_names)[0]:
+                        raw_name = part
+                        break
+            explicit_id = (
+                str(parts[id_column]).strip()
+                if id_column is not None and id_column < len(parts)
+                else ""
+            )
+            rows.append({
+                "data_index": len(rows),
+                "physical_line": physical_line,
+                "explicit_id": explicit_id,
+                "raw_name": str(raw_name).strip(),
+            })
+    return rows, {
+        "has_header": has_header,
+        "delimiter": delimiter or "whitespace",
+        "name_column": name_column,
+        "name_header": first_parts[name_column] if has_header and name_column < len(first_parts) else "",
+        "id_column": id_column,
+        "id_header": first_parts[id_column] if has_header and id_column is not None else "",
+    }
+
+
+def load_npz_ids(path):
+    files = []
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "contrib_epoch*.npz")))
+    elif os.path.isfile(path):
+        files = [path]
+    if not files:
+        raise FileNotFoundError(f"no NPZ file found: {path}")
+
+    ids = []
+    seen = set()
+    utt_by_id = {}
+    for file_path in files:
+        with np.load(file_path, allow_pickle=True) as data:
+            file_ids = data["ids"].astype(str)
+            file_utts = data["utt_ids"].astype(str) if "utt_ids" in data else None
+            for index, sid in enumerate(file_ids):
+                if sid not in seen:
+                    seen.add(sid)
+                    ids.append(sid)
+                if file_utts is not None and sid not in utt_by_id:
+                    utt_by_id[sid] = file_utts[index]
+    return files, ids, utt_by_id
+
+
+def match_json_name(raw_name, json_names):
+    text = str(raw_name or "").strip().strip('"').strip("'")
+    if not text:
+        return "", []
+    basename = os.path.basename(text.replace("\\", "/"))
+    # egs_chunk_candidates repeatedly handles outer feature/audio extensions
+    # and chunk suffixes in either order.
+    candidates = egs_chunk_candidates(basename)
+    for candidate in candidates:
+        if candidate in json_names:
+            return candidate, candidates
+    return "", candidates
+
+
+def build_sources(rows, utt_by_id):
+    zero = {str(row["data_index"]): row for row in rows}
+    physical = {str(row["physical_line"]): row for row in rows}
+    explicit = {row["explicit_id"]: row for row in rows if row["explicit_id"]}
+    sources = {
+        "zero_based": zero,
+        "physical_line": physical,
+    }
+    if explicit:
+        sources["explicit_id"] = explicit
+    if utt_by_id:
+        sources["npz_utt_ids"] = {
+            sid: {"raw_name": utt, "data_index": "", "physical_line": "", "explicit_id": ""}
+            for sid, utt in utt_by_id.items()
+        }
+    return sources
+
+
+def evaluate_source(name, source, npz_ids, json_names):
+    resolved = 0
+    matched = 0
+    details = []
+    for sid in npz_ids:
+        row = source.get(sid)
+        if row is None:
+            details.append({
+                "npz_id": sid, "egs_raw_name": "", "json_name": "",
+                "status": "npz_id_not_found_in_egs", "candidates": "",
+            })
+            continue
+        resolved += 1
+        json_name, candidates = match_json_name(row.get("raw_name", ""), json_names)
+        if json_name:
+            matched += 1
+            status = "matched"
+        else:
+            status = "egs_name_not_found_in_json"
+        details.append({
+            "npz_id": sid,
+            "egs_raw_name": row.get("raw_name", ""),
+            "json_name": json_name,
+            "status": status,
+            "candidates": " | ".join(candidates),
+        })
+    return {
+        "mode": name,
+        "resolved": resolved,
+        "matched": matched,
+        "npz_count": len(npz_ids),
+        "details": details,
+    }
+
+
+def write_reports(output_prefix, result, json_names):
+    detail_path = output_prefix + "_mapping.csv"
+    unmatched_path = output_prefix + "_unmatched.csv"
+    aggregate_path = output_prefix + "_aggregated.csv"
+    os.makedirs(os.path.dirname(os.path.abspath(output_prefix)), exist_ok=True)
+
+    detail_fields = ["npz_id", "egs_raw_name", "json_name", "status", "candidates"]
+    with open(detail_path, "w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=detail_fields)
+        writer.writeheader()
+        writer.writerows(result["details"])
+    with open(unmatched_path, "w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=detail_fields)
+        writer.writeheader()
+        writer.writerows(row for row in result["details"] if row["status"] != "matched")
+
+    grouped = defaultdict(list)
+    for row in result["details"]:
+        if row["json_name"]:
+            grouped[row["json_name"]].append(row)
+    with open(aggregate_path, "w", encoding="utf-8-sig", newline="") as stream:
+        fields = ["json_sample_name", "n_egs", "status", "example_npz_id", "example_egs_name"]
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for sample_name in sorted(json_names):
+            items = grouped.get(sample_name, [])
+            writer.writerow({
+                "json_sample_name": sample_name,
+                "n_egs": len(items),
+                "status": "matched" if items else "missing_from_npz_egs",
+                "example_npz_id": items[0]["npz_id"] if items else "",
+                "example_egs_name": items[0]["egs_raw_name"] if items else "",
+            })
+    return detail_path, unmatched_path, aggregate_path, grouped
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Verify NPZ -> egs -> JSON sample aggregation.")
+    parser.add_argument("--npz", required=True, help="One contrib_epoch*.npz file or a contrib directory")
+    parser.add_argument("--egs", required=True, help="egs CSV/TSV/space-delimited file")
+    parser.add_argument("--json", required=True, help="JSON containing real sample IDs")
+    parser.add_argument("--output-prefix", default="alignment_check", help="CSV output prefix")
+    parser.add_argument(
+        "--id-mode", default="auto",
+        choices=["auto", "zero_based", "physical_line", "explicit_id", "npz_utt_ids"],
+        help="NPZ id addressing mode; auto selects the mode with most JSON matches",
+    )
+    parser.add_argument("--examples", type=int, default=20, help="Number of unmatched examples to print")
+    args = parser.parse_args()
+
+    records, json_names, invalid, duplicates = load_json_samples(args.json)
+    rows, egs_info = load_egs_rows(args.egs, json_names)
+    npz_files, npz_ids, utt_by_id = load_npz_ids(args.npz)
+    sources = build_sources(rows, utt_by_id)
+
+    print("=" * 72)
+    print(f"[json] records={len(records)}, unique_real_samples={len(json_names)}, invalid={len(invalid)}, duplicates={len(duplicates)}")
+    print(
+        f"[egs] rows={len(rows)}, header={egs_info['has_header']}, "
+        f"name_column={egs_info['name_column']}:{egs_info['name_header'] or '(first)'}, "
+        f"id_column={egs_info['id_column']}:{egs_info['id_header'] or '(none)'}"
+    )
+    print(f"[npz] files={len(npz_files)}, unique_ids={len(npz_ids)}, utt_ids={len(utt_by_id)}")
+
+    results = []
+    for mode, source in sources.items():
+        result = evaluate_source(mode, source, npz_ids, json_names)
+        results.append(result)
+        print(
+            f"[mode] {mode:13s} resolved={result['resolved']}/{result['npz_count']} "
+            f"json_matched={result['matched']}/{result['npz_count']}"
+        )
+    if args.id_mode != "auto":
+        selected = next((result for result in results if result["mode"] == args.id_mode), None)
+        if selected is None:
+            raise SystemExit(f"requested mode is unavailable: {args.id_mode}")
+    else:
+        selected = max(results, key=lambda result: (result["matched"], result["resolved"]))
+    print(f"[selected] {selected['mode']}")
+
+    detail_path, unmatched_path, aggregate_path, grouped = write_reports(
+        args.output_prefix, selected, json_names
+    )
+    matched_json = len(grouped)
+    missing_json = len(json_names) - matched_json
+    unmatched_details = [row for row in selected["details"] if row["status"] != "matched"]
+    print(
+        f"[aggregate] JSON samples with >=1 egs={matched_json}/{len(json_names)}, "
+        f"missing JSON samples={missing_json}, unmatched NPZ ids={len(unmatched_details)}"
+    )
+    for row in unmatched_details[:max(0, args.examples)]:
+        print(
+            f"[unmatched] npz_id={row['npz_id']!r} egs={row['egs_raw_name']!r} "
+            f"candidates={row['candidates']!r} status={row['status']}"
+        )
+    print(f"[output] mapping   : {os.path.abspath(detail_path)}")
+    print(f"[output] unmatched : {os.path.abspath(unmatched_path)}")
+    print(f"[output] aggregated: {os.path.abspath(aggregate_path)}")
+
+    if invalid or duplicates:
+        print(f"[warning] JSON invalid rows={invalid[:10]}, duplicate names={list(duplicates.items())[:10]}")
+    if selected["matched"] == 0:
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()
