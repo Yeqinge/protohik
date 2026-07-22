@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
 """,
     )
     parser.add_argument(
-        "params", type=Path, nargs="?",
+        "--legacy-params", dest="legacy_params", type=Path,
         help="PyTorch checkpoint 的位置参数写法；也可以改用 --params-path",
     )
     parser.add_argument("egs", type=Path, help="train.egs.csv / valid.egs.csv")
@@ -341,17 +341,17 @@ def save_plot(points: np.ndarray, labels: Iterable[str], n_data: int, prototype_
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    egs_path = args.egs.expanduser().resolve()
+    if not egs_path.is_file():
+        raise FileNotFoundError(f"egs 文件不存在: {egs_path}")
+    LOG.info("egs 文件: %s", egs_path)
     model_dir = args.model_dir.expanduser().resolve() if args.model_dir else None
     if model_dir is not None and not model_dir.is_dir():
         raise NotADirectoryError(f"模型文件夹不存在: {model_dir}")
     inferred_params = model_dir / f"{model_dir.name}.params" if model_dir else None
     inferred_config = model_dir / "config" / "total_params.json" if model_dir else None
-    # --model-dir is the primary interface; stale positional values must not
-    # override the checkpoint inferred from that directory.
-    params_path = args.params_path or inferred_params or args.params
+    params_path = args.params_path or inferred_params
     config_path = args.config or inferred_config
-    if model_dir is not None and args.params is not None:
-        LOG.warning("已设置 --model-dir，忽略旧的位置参数: %s", args.params)
     if params_path is None:
         raise ValueError("请通过位置参数或 --params-path 指定模型 .params 文件")
     params_path = params_path.expanduser().resolve()
@@ -372,12 +372,12 @@ def main() -> None:
 
     prototype_key, prototypes = choose_prototypes(tensors, args.prototype_key)
     # 必须先读取全部行，才能在两个类别中分别无放回抽取相同数量。
-    rows = select_equal_binary_rows(read_egs(args.egs, None), args.num_samples, args.seed)
+    rows = select_equal_binary_rows(read_egs(egs_path, None), args.num_samples, args.seed)
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    feat_dim = args.feat_dim or infer_feat_dim(rows[0], args.egs.resolve().parent, config)
+    feat_dim = args.feat_dim or infer_feat_dim(rows[0], egs_path.parent, config)
     num_targets = args.num_targets or int(tensors[prototype_key].shape[0])
     model = load_model(config_path, args.blueprint, tensors, feat_dim, num_targets, args.device)
-    data, rows = extract_embeddings(model, rows, args.egs.resolve().parent, feat_dim, args.device)
+    data, rows = extract_embeddings(model, rows, egs_path.parent, feat_dim, args.device)
     fields = list(rows[0])
     id_col = _find(fields, ("utt", "utt-id", "utt_id", "key", "id", "eg-id", "eg_id", "sample", "sample-id"))
     label_col = _find(fields, LABEL_NAMES)
