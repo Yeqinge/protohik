@@ -185,18 +185,41 @@ def json_sample_name(raw):
 
 
 def egs_chunk_candidates(stem):
-    """Yield an exact egs name followed by progressively de-chunked names."""
-    candidates = [stem]
-    current = stem
-    for _ in range(4):
-        stripped = re.sub(
-            r"(?:[_-](?:chunk|seg)?\d{1,6})$", "", current,
+    """Yield exact and cleaned egs names regardless of suffix order.
+
+    Handles forms such as ``sample.wav-chunk001``, ``sample-chunk001.wav``,
+    ``sample.wav-chunk001.ark`` and egs-only ``normal-``/``abnormal-``
+    label prefixes.
+    """
+    # Generate branches instead of destructively applying one fixed order.
+    # For example, ``normal-motor_001`` must offer ``motor_001`` before the
+    # optional numeric-chunk rule also offers ``normal-motor``.
+    candidates = []
+    queued = {stem}
+    queue = [stem]
+    transforms = (
+        lambda value: re.sub(
+            r"\.(wav|mp3|flac|m4a|ogg|aac|ark|npy|npz)$", "", value,
             flags=re.IGNORECASE,
-        )
-        if stripped == current or not stripped:
-            break
-        candidates.append(stripped)
-        current = stripped
+        ),
+        lambda value: re.sub(
+            r"[_-](?:chunk|seg)(?:[_-]?\d{1,9})?$", "", value,
+            flags=re.IGNORECASE,
+        ),
+        lambda value: re.sub(
+            r"^(?:abnormal|normal)-", "", value,
+            flags=re.IGNORECASE,
+        ),
+        lambda value: re.sub(r"[_-]\d{1,9}$", "", value),
+    )
+    while queue and len(candidates) < 64:
+        current = queue.pop(0)
+        candidates.append(current)
+        for transform in transforms:
+            transformed = transform(current)
+            if transformed and transformed != current and transformed not in queued:
+                queued.add(transformed)
+                queue.append(transformed)
     return candidates
 
 
@@ -221,7 +244,7 @@ def normalize_sample_name(raw, json_names=None):
             if candidate in json_name_set:
                 return candidate
         return stem
-    return candidates[1] if len(candidates) > 1 else stem
+    return candidates[-1]
 
 
 def sample_name_candidates(raw):
