@@ -63,13 +63,6 @@ CATEGORY_LABELS = {
     "unknown": "采集不足",
 }
 
-LABEL_PREFIXES = re.compile(
-    r"^(?:abnormal|normal|hard|unknown|noise|fault|"
-    r"harmful_suspect|high_influence|easy_redundant)[-_]",
-    re.IGNORECASE,
-)
-
-
 def finite_mean(values):
     arr = np.asarray(values, dtype=np.float64)
     arr = arr[np.isfinite(arr)]
@@ -137,14 +130,25 @@ def split_egs_line(line, delim):
     line = line.strip()
     if not line:
         return []
-    return line.split(delim) if delim else line.split()
+    if delim:
+        return next(csv.reader([line], delimiter=delim))
+    return line.split()
 
 
 def looks_like_header(parts):
     if not parts:
         return False
-    joined = " ".join(p.lower() for p in parts[:4])
-    return any(k in joined for k in ("utt", "id", "ark", "path", "label", "feat"))
+    # Only accept actual column names.  The old substring test treated a first
+    # data row containing e.g. "/path/a.ark" as a header and silently shifted
+    # every following egs id by one.
+    header_names = {
+        "sample_name", "sample", "utt_id", "utt", "utterance_id",
+        "wav_id", "audio_id", "file_name", "filename", "wav_path",
+        "file_path", "path", "ark", "feat", "feature", "feature_path",
+        "id", "label", "class_label", "class-label", "target",
+    }
+    normalized = [str(part).strip().strip('"').strip("'").lower() for part in parts]
+    return any(part in header_names for part in normalized)
 
 
 def choose_egs_name_column(header_parts):
@@ -168,7 +172,8 @@ def choose_egs_name_column(header_parts):
     return 0
 
 
-def normalize_sample_name(raw, json_names=None):
+def sample_group_key(raw):
+    """Return exactly the same long-sample key as sample_context_visualizer."""
     if raw is None:
         return ""
     name = str(raw).strip().strip('"').strip("'")
@@ -176,18 +181,40 @@ def normalize_sample_name(raw, json_names=None):
         return ""
     name = name.replace("\\", "/")
     name = os.path.basename(name)
-    name = re.sub(r"\.(wav|flac|mp3|ogg|ark|npy|npz)$", "", name, flags=re.IGNORECASE)
-    name = LABEL_PREFIXES.sub("", name)
+    name = re.sub(r"\.(wav|mp3|flac|m4a|ogg|aac)$", "", name, flags=re.IGNORECASE)
+    match = re.match(r"^(?P<long_id>.+_)(?P<segment>\d+)$", name)
+    if match:
+        return match.group("long_id")
+    if "_" not in name:
+        return name + "_"
+    prefix, _ = name.rsplit("_", 1)
+    return prefix + "_"
 
+
+def normalize_sample_name(raw, json_names=None):
+    if raw is None:
+        return ""
+    text = str(raw).strip().strip('"').strip("'")
+    if not text:
+        return ""
     json_name_set = json_names if isinstance(json_names, set) else set(json_names or [])
-    if json_name_set and name in json_name_set:
-        return name
+    basename = os.path.basename(text.replace("\\", "/"))
+    stem = re.sub(
+        r"\.(wav|mp3|flac|m4a|ogg|aac|ark|npy|npz)$", "", basename,
+        flags=re.IGNORECASE,
+    )
 
-    # Common egs/chunk suffixes: sample_001, sample-001, sample_chunk001.
-    chunk_stripped = re.sub(r"([_-])(?:chunk|seg)?\d{1,6}$", "", name, flags=re.IGNORECASE)
-    if json_name_set and chunk_stripped in json_name_set:
-        return chunk_stripped
-    return chunk_stripped
+    # An already-normalized group key may be supplied by an egs file or NPZ.
+    if json_name_set and stem in json_name_set:
+        return stem
+
+    # Egs/NPZ identifiers may use a feature extension rather than the audio
+    # extension used by JSON. Strip that compatibility extension before
+    # applying the otherwise identical sample grouping rule.
+    grouped = sample_group_key(stem)
+    if json_name_set and grouped in json_name_set:
+        return grouped
+    return grouped
 
 
 def sample_name_candidates(raw):
@@ -199,10 +226,12 @@ def sample_name_candidates(raw):
     candidates = []
     values = [text, text.replace("\\", "/"), os.path.basename(text.replace("\\", "/"))]
     for value in values:
-        stem = re.sub(r"\.(wav|flac|mp3|ogg|ark|npy|npz)$", "", value, flags=re.IGNORECASE)
-        stem = LABEL_PREFIXES.sub("", stem)
-        chunk_stripped = re.sub(r"([_-])(?:chunk|seg)?\d{1,6}$", "", stem, flags=re.IGNORECASE)
-        for candidate in (value, stem, chunk_stripped):
+        stem = re.sub(
+            r"\.(wav|mp3|flac|m4a|ogg|aac|ark|npy|npz)$", "", value,
+            flags=re.IGNORECASE,
+        )
+        grouped = sample_group_key(value)
+        for candidate in (value, stem, grouped):
             candidate = str(candidate).strip().strip('"').strip("'")
             if candidate and candidate not in candidates:
                 candidates.append(candidate)
@@ -215,8 +244,19 @@ def find_meta_entry(meta, sample):
     for candidate in sample_name_candidates(sample):
         if candidate in meta:
             return meta[candidate]
-    normalized = normalize_sample_name(sample)
+    normalized = sample_group_key(sample)
     return meta.get(normalized, {})
+
+
+def get_json_record_id(item):
+    """Mirror sample_context_visualizer.get_record_id without raising."""
+    value = item.get("ID") or item.get("id") or item.get("file_name") or item.get("filename")
+    if value:
+        return str(value)
+    file_path = item.get("file_path")
+    if file_path:
+        return os.path.basename(str(file_path))
+    return ""
 
 
 def load_json_name_map(path):
@@ -253,12 +293,10 @@ def load_json_name_map(path):
     for item in items:
         if not isinstance(item, dict):
             continue
-        raw = (
-            item.get("sample_name") or item.get("name") or item.get("utt_id")
-            or item.get("id") or item.get("ID") or item.get("file_path")
-            or item.get("wav_path") or item.get("path") or ""
-        )
-        name = normalize_sample_name(raw)
+        # Keep exactly the same id precedence as sample_context_visualizer so
+        # the two scripts produce the same group universe and keys.
+        raw = get_json_record_id(item)
+        name = sample_group_key(raw)
         if not name:
             continue
         names.add(name)
@@ -286,15 +324,17 @@ def load_json_name_map(path):
                     entry[key] = " | ".join(parts)
         entry.setdefault("_original_records", []).append(item)
     print(f"[json] loaded {len(items)} records, {len(names)} normalized names ({time.time() - t0:.1f}s)", flush=True)
+    json_layout["record_count"] = len(items)
+    json_layout["group_count"] = len(names)
     return meta, names, json_layout
 
 
 def load_egs_map(path, json_names=None):
     if not path:
-        return {}
+        return {"zero_based": {}, "physical_line": {}, "row_count": 0, "has_header": False}
     if not os.path.exists(path):
         print(f"[warn] egs file not found, ignored: {path}")
-        return {}
+        return {"zero_based": {}, "physical_line": {}, "row_count": 0, "has_header": False}
 
     t0 = time.time()
     print(f"[egs] reading {path} ...", flush=True)
@@ -308,9 +348,9 @@ def load_egs_map(path, json_names=None):
         header_name = first_parts[name_col] if name_col < len(first_parts) else ""
         print(f"[egs] header detected, sample column #{name_col}: {header_name}", flush=True)
 
-    mapping = {}
+    zero_based = {}
+    physical_line = {}
     data_idx = 0
-    file_idx = 0
     json_name_set = json_names if isinstance(json_names, set) else set(json_names or [])
 
     def pick_raw_name(parts):
@@ -323,7 +363,7 @@ def load_egs_map(path, json_names=None):
                     return part
         return parts[0]
 
-    def add_line(idx, line):
+    def add_line(line_number, line):
         nonlocal data_idx
         parts = split_egs_line(line, delim)
         if not parts:
@@ -332,26 +372,27 @@ def load_egs_map(path, json_names=None):
         sample = normalize_sample_name(raw_name, json_names=json_names)
         if not sample:
             return
-        # contrib ids are commonly either zero-based data row ids or physical
-        # egs file line numbers. With a header, the first data row is line 2.
-        physical_line = idx + 1 if has_header else idx + 1
-        mapping.setdefault(str(data_idx), sample)
-        mapping[str(physical_line)] = sample
+        # Keep the two id spaces separate.  Putting them in one dict causes
+        # unavoidable collisions (e.g. key "2" means two different rows).
+        zero_based[str(data_idx)] = sample
+        physical_line[str(line_number)] = sample
         data_idx += 1
         if data_idx % 500000 == 0:
             print(f"[egs] processed {data_idx} rows ({time.time() - t0:.1f}s)", flush=True)
 
-    if first and not has_header:
-        add_line(file_idx, first)
-
     with open(path, encoding="utf-8") as f:
-        if first:
-            f.readline()
-        for file_idx, line in enumerate(f, start=1):
-            add_line(file_idx, line)
+        for line_number, line in enumerate(f, start=1):
+            if line_number == 1 and has_header:
+                continue
+            add_line(line_number, line)
 
     print(f"[egs] loaded {data_idx} data rows from {path} (header={has_header}, {time.time() - t0:.1f}s)", flush=True)
-    return mapping
+    return {
+        "zero_based": zero_based,
+        "physical_line": physical_line,
+        "row_count": data_idx,
+        "has_header": has_header,
+    }
 
 
 def model_specific_egs(common_map, model_egs_specs, model_name, json_names):
@@ -370,7 +411,50 @@ def parse_model_egs_specs(values):
     return out
 
 
-def load_contrib_model(name, contrib_dir, id_to_sample):
+def choose_egs_id_map(egs_maps, all_ids, id_to_utt, mode="auto"):
+    """Choose one non-overlapping egs id space for a contrib model."""
+    zero = egs_maps.get("zero_based", {}) if isinstance(egs_maps, dict) else {}
+    physical = egs_maps.get("physical_line", {}) if isinstance(egs_maps, dict) else {}
+    if mode == "zero_based":
+        return zero, mode
+    if mode == "physical_line":
+        return physical, mode
+
+    def quality(mapping):
+        coverage = sum(1 for sid in all_ids if sid in mapping)
+        utt_matches = 0
+        utt_compared = 0
+        for sid in all_ids:
+            utt = id_to_utt.get(sid)
+            if sid not in mapping or not utt or str(utt) == str(sid):
+                continue
+            utt_compared += 1
+            if normalize_sample_name(utt) == mapping[sid]:
+                utt_matches += 1
+        return utt_matches, utt_compared, coverage
+
+    zero_q = quality(zero)
+    physical_q = quality(physical)
+    if zero_q[1] or physical_q[1]:
+        def utt_score(q):
+            return (q[0] / q[1] if q[1] else -1.0, q[0], q[2])
+        selected = "physical_line" if utt_score(physical_q) > utt_score(zero_q) else "zero_based"
+    elif "0" in all_ids and "0" in zero:
+        selected = "zero_based"
+    elif physical_q[2] > zero_q[2]:
+        selected = "physical_line"
+    else:
+        # Dataset/sample ids used by the tracker are normally zero-based.
+        selected = "zero_based"
+    print(
+        f"[egs] id mode auto: selected={selected}; "
+        f"zero(matches/checked/coverage)={zero_q}, physical={physical_q}",
+        flush=True,
+    )
+    return (physical if selected == "physical_line" else zero), selected
+
+
+def load_contrib_model(name, contrib_dir, egs_maps, egs_id_mode="auto"):
     t0 = time.time()
     files = sorted(glob.glob(os.path.join(contrib_dir, "contrib_epoch*.npz")))
     if not files:
@@ -441,6 +525,9 @@ def load_contrib_model(name, contrib_dir, id_to_sample):
             )
 
     sample_to_rows = defaultdict(list)
+    id_to_sample, selected_id_mode = choose_egs_id_map(
+        egs_maps, all_ids, id_to_utt_from_npz, mode=egs_id_mode
+    )
     print(f"[model] {name}: grouping egs ids to real samples", flush=True)
     for i, sid in enumerate(all_ids):
         raw = id_to_sample.get(sid)
@@ -510,6 +597,7 @@ def load_contrib_model(name, contrib_dir, id_to_sample):
         "path": contrib_dir,
         "epochs": epochs,
         "has_weight": has_weight,
+        "egs_id_mode": selected_id_mode,
         "sample_data": sample_data,
     }
 
@@ -554,11 +642,24 @@ def add_model_percentiles(model):
         )
 
 
-def classify_samples(models, min_model_coverage=0.5):
+def classify_samples(models, min_model_coverage=0.5, sample_universe=None):
     for model in models:
         add_model_percentiles(model)
 
-    names = sorted({s for m in models for s in m["sample_data"].keys()})
+    model_names = {s for m in models for s in m["sample_data"].keys()}
+    # When JSON is supplied, use its complete sample-script-compatible group
+    # universe.  Samples absent from every contrib model remain visible as
+    # ``unknown`` instead of disappearing from the final count.
+    universe = set(sample_universe or ())
+    names = sorted(universe if universe else model_names)
+    model_only = model_names - universe if universe else set()
+    if model_only:
+        examples = ", ".join(sorted(model_only)[:5])
+        print(
+            f"[align] warning: {len(model_only)} contrib group(s) do not match JSON "
+            f"and are excluded to keep sample-script parity; examples: {examples}",
+            flush=True,
+        )
     n_models = len(models)
     rows = []
     for sample in names:
@@ -747,54 +848,49 @@ def safe_filename(value):
     return re.sub(r"_+", "_", cleaned).strip("_") or "all"
 
 
-def build_export_records(rows, models, meta):
-    records = []
+def build_export_record(row, models, meta):
+    """Build one export row; callers can stream it without retaining all rows."""
+    sample = row["sample_name"]
+    out = dict(row)
+    sample_meta = find_meta_entry(meta, sample)
+    out.update({k: v for k, v in sample_meta.items() if not k.startswith("_")})
+    if not str(out.get("project", "")).strip():
+        out["project"] = first_original_value(sample_meta, "project")
+    if not str(out.get("file_path", "")).strip():
+        out["file_path"] = first_original_value(sample_meta, "file_path", "wav_path", "path")
+    for model in models:
+        name = model["name"]
+        d = model["sample_data"].get(sample, {})
+        for key in (
+            "n_egs", "mean_loss", "loss_pct", "last_loss", "final_correct",
+            "forget_events", "frac_neg_align", "mean_align", "self_influence",
+            "influence_pct", "mean_weight", "weight_low_pct",
+        ):
+            out[f"{name}_{key}"] = d.get(key, "")
+        out[f"{name}_score"] = d.get("model_suspicious_score", "")
+    return json_safe(out)
+
+
+def iter_export_records(rows, models, meta, category=None):
     for row in rows:
-        sample = row["sample_name"]
-        out = dict(row)
-        sample_meta = find_meta_entry(meta, sample)
-        out.update({k: v for k, v in sample_meta.items() if not k.startswith("_")})
-        if not str(out.get("project", "")).strip():
-            out["project"] = first_original_value(sample_meta, "project")
-        if not str(out.get("file_path", "")).strip():
-            out["file_path"] = first_original_value(sample_meta, "file_path", "wav_path", "path")
-        for model in models:
-            name = model["name"]
-            d = model["sample_data"].get(sample, {})
-            for key in (
-                "n_egs", "mean_loss", "loss_pct", "last_loss", "final_correct",
-                "forget_events", "frac_neg_align", "mean_align", "self_influence",
-                "influence_pct", "mean_weight", "weight_low_pct",
-            ):
-                out[f"{name}_{key}"] = d.get(key, "")
-            out[f"{name}_score"] = d.get("model_suspicious_score", "")
-        records.append(json_safe(out))
-    return records
+        if category is None or row.get("category") == category:
+            yield build_export_record(row, models, meta)
 
 
-def export_original_json(path, records, meta, json_layout, selected_categories=None):
+def export_original_json(path, rows, models, meta, json_layout, selected_categories=None):
     selected = list(selected_categories or CATEGORIES)
-    filtered_records = [r for r in records if r.get("category") in selected]
+    selected_set = set(selected)
+    filtered_rows = [r for r in rows if r.get("category") in selected_set]
     metadata_fields = {
         "json_label", "file_path", "detector_id", "channel_id", "project",
         "duration", "time_point",
     }
-    grouped = {cat: [] for cat in CATEGORIES}
-    for record in filtered_records:
-        sample = record["sample_name"]
-        classification = {
-            k: v for k, v in record.items()
-            if k not in metadata_fields and not str(k).startswith("_")
-        }
-        originals = find_meta_entry(meta, sample).get("_original_records") or [{"ID": sample}]
-        for original in originals:
-            item = dict(json_safe(original)) if isinstance(original, dict) else {"value": json_safe(original)}
-            item["contrib_classification"] = classification
-            grouped.setdefault(record.get("category", "unknown"), []).append(item)
-
-    counts = {cat: len(grouped.get(cat, [])) for cat in CATEGORIES}
+    counts = {cat: 0 for cat in CATEGORIES}
+    for row in filtered_rows:
+        originals = find_meta_entry(meta, row["sample_name"]).get("_original_records") or [None]
+        counts[row.get("category", "unknown")] += len(originals)
     sample_counts = {
-        cat: sum(1 for r in filtered_records if r.get("category") == cat)
+        cat: sum(1 for r in filtered_rows if r.get("category") == cat)
         for cat in CATEGORIES
     }
     layout = json_layout or {"kind": "none"}
@@ -806,21 +902,43 @@ def export_original_json(path, records, meta, json_layout, selected_categories=N
             "record_count": sum(counts.values()),
             "category_counts": counts,
             "category_labels": CATEGORY_LABELS,
-            "sample_count": len(filtered_records),
+            "sample_count": len(filtered_rows),
             "category_sample_counts": sample_counts,
             "note": "Each item in groups[*].datas keeps the original JSON fields and adds contrib_classification.",
         },
-        "groups": {
-            cat: {
-                "label": CATEGORY_LABELS.get(cat, cat),
-                "count": counts.get(cat, 0),
-                "datas": grouped.get(cat, []),
-            }
-            for cat in CATEGORIES
-        },
     }
+    # Stream category data directly to disk.  The previous implementation held
+    # the complete enriched record list and another grouped copy at once.
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, allow_nan=False)
+        f.write('{"summary":')
+        json.dump(payload["summary"], f, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        f.write(',"groups":{')
+        for cat_index, cat in enumerate(CATEGORIES):
+            if cat_index:
+                f.write(",")
+            json.dump(cat, f, ensure_ascii=False)
+            f.write(':{"label":')
+            json.dump(CATEGORY_LABELS.get(cat, cat), f, ensure_ascii=False)
+            f.write(',"count":%d,"datas":[' % counts.get(cat, 0))
+            first_item = True
+            for row in filtered_rows:
+                if row.get("category") != cat:
+                    continue
+                record = build_export_record(row, models, meta)
+                classification = {
+                    k: v for k, v in record.items()
+                    if k not in metadata_fields and not str(k).startswith("_")
+                }
+                originals = find_meta_entry(meta, row["sample_name"]).get("_original_records") or [{"ID": row["sample_name"]}]
+                for original in originals:
+                    item = dict(json_safe(original)) if isinstance(original, dict) else {"value": json_safe(original)}
+                    item["contrib_classification"] = classification
+                    if not first_item:
+                        f.write(",")
+                    json.dump(item, f, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                    first_item = False
+            f.write("]}")
+        f.write("}}")
 
 
 def _xlsx_col(index):
@@ -832,22 +950,27 @@ def _xlsx_col(index):
     return name
 
 
-def _xlsx_sheet_xml(rows):
-    body = []
-    for ri, row in enumerate(rows, 1):
-        cells = []
-        for ci, value in enumerate(row):
-            ref = f"{_xlsx_col(ci)}{ri}"
-            text_value = "" if value is None else str(value)
-            cells.append(
-                f'<c r="{ref}" t="inlineStr"><is><t>{html.escape(text_value, quote=True)}</t></is></c>'
-            )
-        body.append(f'<row r="{ri}">{"".join(cells)}</row>')
-    return (
+def _xlsx_text(value):
+    text_value = "" if value is None else str(value)
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text_value)
+
+
+def _write_xlsx_sheet(zf, member, rows):
+    prefix = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        f'<sheetData>{"".join(body)}</sheetData></worksheet>'
-    )
+        '<sheetData>'
+    ).encode("utf-8")
+    with zf.open(member, "w", force_zip64=True) as stream:
+        stream.write(prefix)
+        for ri, row in enumerate(rows, 1):
+            cells = []
+            for ci, value in enumerate(row):
+                ref = f"{_xlsx_col(ci)}{ri}"
+                escaped = html.escape(_xlsx_text(value), quote=True)
+                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{escaped}</t></is></c>')
+            stream.write(f'<row r="{ri}">{"".join(cells)}</row>'.encode("utf-8"))
+        stream.write(b"</sheetData></worksheet>")
 
 
 def _xlsx_sheet_name(value, fallback):
@@ -855,8 +978,23 @@ def _xlsx_sheet_name(value, fallback):
     return cleaned[:31]
 
 
-def export_classification_xlsx(path, records):
-    all_fields = sorted({key for record in records for key in record.keys()})
+def export_classification_xlsx(path, rows, models, meta):
+    all_fields_set = set()
+    for row in rows:
+        all_fields_set.update(row.keys())
+    all_fields_set.update({
+        "json_label", "file_path", "detector_id", "channel_id", "project",
+        "duration", "time_point",
+    })
+    for model in models:
+        name = model["name"]
+        for key in (
+            "n_egs", "mean_loss", "loss_pct", "last_loss", "final_correct",
+            "forget_events", "frac_neg_align", "mean_align", "self_influence",
+            "influence_pct", "mean_weight", "weight_low_pct", "score",
+        ):
+            all_fields_set.add(f"{name}_{key}")
+    all_fields = sorted(all_fields_set)
     preferred = [
         "sample_name", "category", "category_label", "reason", "models_present",
         "model_coverage", "wrong_rate", "high_loss_rate", "unstable_rate",
@@ -864,81 +1002,78 @@ def export_classification_xlsx(path, records):
         "json_label", "file_path",
     ]
     fields = [k for k in preferred if k in all_fields] + [k for k in all_fields if k not in preferred]
-    counts = {cat: sum(1 for r in records if r.get("category") == cat) for cat in CATEGORIES}
-    sheets = [(
-        "汇总",
-        [["generated_at", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-         ["record_count", len(records)], [], ["category", "label", "count"]] +
-        [[cat, CATEGORY_LABELS[cat], counts[cat]] for cat in CATEGORIES],
-    )]
-    for cat in CATEGORIES:
-        category_rows = [fields]
-        category_rows.extend([[record.get(k, "") for k in fields] for record in records if record.get("category") == cat])
-        sheets.append((_xlsx_sheet_name(CATEGORY_LABELS[cat], cat), category_rows))
+    counts = {cat: sum(1 for r in rows if r.get("category") == cat) for cat in CATEGORIES}
+    sheet_names = ["汇总"] + [_xlsx_sheet_name(CATEGORY_LABELS[cat], cat) for cat in CATEGORIES]
 
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         overrides = "".join(
             f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-            for i in range(1, len(sheets) + 1)
+            for i in range(1, len(sheet_names) + 1)
         )
         zf.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' + overrides + '</Types>')
         zf.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
-        workbook_sheets = "".join(f'<sheet name="{html.escape(name, quote=True)}" sheetId="{i}" r:id="rId{i}"/>' for i, (name, _) in enumerate(sheets, 1))
+        workbook_sheets = "".join(f'<sheet name="{html.escape(name, quote=True)}" sheetId="{i}" r:id="rId{i}"/>' for i, name in enumerate(sheet_names, 1))
         zf.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' + workbook_sheets + '</sheets></workbook>')
-        rels = "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(sheets) + 1))
+        rels = "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(sheet_names) + 1))
         zf.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + rels + '</Relationships>')
-        for i, (_, sheet_rows) in enumerate(sheets, 1):
-            zf.writestr(f"xl/worksheets/sheet{i}.xml", _xlsx_sheet_xml(sheet_rows))
+        summary_rows = (
+            [["generated_at", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
+             ["record_count", len(rows)], [], ["category", "label", "count"]] +
+            [[cat, CATEGORY_LABELS[cat], counts[cat]] for cat in CATEGORIES]
+        )
+        _write_xlsx_sheet(zf, "xl/worksheets/sheet1.xml", summary_rows)
+        for sheet_index, cat in enumerate(CATEGORIES, 2):
+            def category_rows(category=cat):
+                yield fields
+                for record in iter_export_records(rows, models, meta, category=category):
+                    yield [record.get(k, "") for k in fields]
+            _write_xlsx_sheet(zf, f"xl/worksheets/sheet{sheet_index}.xml", category_rows())
 
 
 def export_category_csvs(directory, rows, models, meta):
     for cat in CATEGORIES:
-        category_rows = [row for row in rows if row["category"] == cat]
+        category_rows = (row for row in rows if row["category"] == cat)
         export_csv(os.path.join(directory, f"{cat}.csv"), category_rows, models, meta)
 
 
-def export_source_lists(directory, records, formats):
+def export_source_lists(directory, rows, models, meta, formats):
     formats = set(formats)
     for cat in CATEGORIES:
-        paths = []
         seen = set()
-        for record in records:
-            if record.get("category") != cat:
-                continue
-            source = str(record.get("file_path", "")).strip()
-            if source and source not in seen:
-                seen.add(source)
-                paths.append(source)
         prefix = os.path.join(directory, f"copy_{cat}")
-        if "txt" in formats:
-            with open(prefix + ".txt", "w", encoding="utf-8") as f:
-                f.write("\n".join(paths) + ("\n" if paths else ""))
-        if "sh" in formats:
-            with open(prefix + ".sh", "w", encoding="utf-8", newline="\n") as f:
-                f.write("#!/usr/bin/env bash\nset -euo pipefail\nOUT_DIR=\"$(dirname \"$0\")/sources_%s\"\nmkdir -p \"$OUT_DIR\"\n" % cat)
-                for source in paths:
-                    f.write("cp -f -- '%s' \"$OUT_DIR\"/\n" % source.replace("'", "'\"'\"'"))
-        if "bat" in formats:
-            with open(prefix + ".bat", "w", encoding="utf-8", newline="\r\n") as f:
-                f.write(f'@echo off\nsetlocal\nset "OUT_DIR=%~dp0sources_{cat}"\nmkdir "%OUT_DIR%" 2>nul\n')
-                for source in paths:
-                    f.write('copy /Y "%s" "%%OUT_DIR%%\\"\n' % source.replace('"', '""'))
+        handles = {}
+        try:
+            if "txt" in formats:
+                handles["txt"] = open(prefix + ".txt", "w", encoding="utf-8")
+            if "sh" in formats:
+                handles["sh"] = open(prefix + ".sh", "w", encoding="utf-8", newline="\n")
+                handles["sh"].write("#!/usr/bin/env bash\nset -euo pipefail\nOUT_DIR=\"$(dirname \"$0\")/sources_%s\"\nmkdir -p \"$OUT_DIR\"\n" % cat)
+            if "bat" in formats:
+                handles["bat"] = open(prefix + ".bat", "w", encoding="utf-8", newline="\r\n")
+                handles["bat"].write(f'@echo off\nsetlocal\nset "OUT_DIR=%~dp0sources_{cat}"\nmkdir "%OUT_DIR%" 2>nul\n')
+            for row in rows:
+                if row.get("category") != cat:
+                    continue
+                sample_meta = find_meta_entry(meta, row["sample_name"])
+                source = str(
+                    sample_meta.get("file_path", "")
+                    or first_original_value(sample_meta, "file_path", "wav_path", "path")
+                ).strip()
+                if not source or source in seen:
+                    continue
+                seen.add(source)
+                if "txt" in handles:
+                    handles["txt"].write(source + "\n")
+                if "sh" in handles:
+                    handles["sh"].write("cp -f -- '%s' \"$OUT_DIR\"/\n" % source.replace("'", "'\"'\"'"))
+                if "bat" in handles:
+                    handles["bat"].write('copy /Y "%s" "%%OUT_DIR%%\\"\n' % source.replace('"', '""'))
+        finally:
+            for handle in handles.values():
+                handle.close()
 
 
-def export_summary_html(path, records):
-    compact = [
-        {
-            "sample": r.get("sample_name", ""),
-            "project": str(r.get("project", "") or ""),
-            "category": r.get("category", "unknown"),
-            "category_label": r.get("category_label", ""),
-            "score": r.get("mean_suspicious_score"),
-            "wrong": r.get("wrong_rate"),
-            "reason": r.get("reason", ""),
-        }
-        for r in records
-    ]
-    data_json = json.dumps(json_safe(compact), ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+def export_summary_html(path, rows, models, meta):
     labels_json = json.dumps(CATEGORY_LABELS, ensure_ascii=False, separators=(",", ":"))
     doc = r'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -975,9 +1110,32 @@ function render(){
 projectFilter.addEventListener('change',render);categoryFilter.addEventListener('change',render);render();
 </script></body></html>'''
     doc = doc.replace("__GENERATED__", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    doc = doc.replace("__DATA__", data_json).replace("__CATEGORY_LABELS__", labels_json)
+    doc = doc.replace("__CATEGORY_LABELS__", labels_json)
+    before_data, after_data = doc.split("__DATA__", 1)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(doc)
+        f.write(before_data)
+        f.write("[")
+        first = True
+        for row in rows:
+            sample_meta = find_meta_entry(meta, row["sample_name"])
+            compact = {
+                "sample": row.get("sample_name", ""),
+                "project": str(
+                    sample_meta.get("project", "")
+                    or first_original_value(sample_meta, "project") or ""
+                ),
+                "category": row.get("category", "unknown"),
+                "category_label": row.get("category_label", ""),
+                "score": json_safe(row.get("mean_suspicious_score")),
+                "wrong": json_safe(row.get("wrong_rate")),
+                "reason": row.get("reason", ""),
+            }
+            if not first:
+                f.write(",")
+            f.write(json.dumps(compact, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/"))
+            first = False
+        f.write("]")
+        f.write(after_data)
 
 
 def run_extra_exports(args, rows, models, meta, out_html, json_layout=None):
@@ -989,23 +1147,22 @@ def run_extra_exports(args, rows, models, meta, out_html, json_layout=None):
     export_dir = args.export_dir or os.path.splitext(out_html)[0] + "_exports"
     os.makedirs(export_dir, exist_ok=True)
     stem = os.path.basename(os.path.splitext(out_html)[0])
-    records = build_export_records(rows, models, meta)
     outputs = []
     if "json" in requested:
         selected = getattr(args, "export_category", ["all"]) or ["all"]
         selected = CATEGORIES if "all" in selected else list(dict.fromkeys(selected))
         suffix = "" if selected == CATEGORIES else "_" + safe_filename("+".join(selected))
         path = os.path.join(export_dir, stem + f"_classification{suffix}.json")
-        export_original_json(path, records, meta, json_layout, selected)
+        export_original_json(path, rows, models, meta, json_layout, selected)
         outputs.append(path)
     if "xlsx" in requested:
-        path = os.path.join(export_dir, stem + "_classification.xlsx"); export_classification_xlsx(path, records); outputs.append(path)
+        path = os.path.join(export_dir, stem + "_classification.xlsx"); export_classification_xlsx(path, rows, models, meta); outputs.append(path)
     if "html" in requested:
-        path = os.path.join(export_dir, stem + "_summary.html"); export_summary_html(path, records); outputs.append(path)
+        path = os.path.join(export_dir, stem + "_summary.html"); export_summary_html(path, rows, models, meta); outputs.append(path)
     if "category_csv" in requested:
         directory = os.path.join(export_dir, "category_csv"); os.makedirs(directory, exist_ok=True); export_category_csvs(directory, rows, models, meta); outputs.append(directory)
     if "sources" in requested:
-        directory = os.path.join(export_dir, "sources"); os.makedirs(directory, exist_ok=True); export_source_lists(directory, records, args.source_script_formats); outputs.append(directory)
+        directory = os.path.join(export_dir, "sources"); os.makedirs(directory, exist_ok=True); export_source_lists(directory, rows, models, meta, args.source_script_formats); outputs.append(directory)
     return outputs
 
 
@@ -1341,9 +1498,18 @@ def main():
     ap.add_argument("--contribs", nargs="*", default=[], metavar="CONTRIB_DIR")
     ap.add_argument("--egs", default="", help="Shared egs/train csv file. First row may be a header.")
     ap.add_argument("--model-egs", nargs="*", default=[], metavar="NAME:EGS_PATH", help="Per-model egs file override.")
+    ap.add_argument(
+        "--egs-id-mode", default="auto",
+        choices=["auto", "zero_based", "physical_line"],
+        help="How numeric contrib ids address egs rows. Auto prefers NPZ utt-id matches, then zero-based ids.",
+    )
     ap.add_argument("--json", default="", help="Optional JSON metadata with real sample names.")
     ap.add_argument("--output", default="contrib_sample_classification.html")
     ap.add_argument("--csv", default="", help="Output CSV path. Defaults to OUTPUT basename + .csv.")
+    ap.add_argument(
+        "--export-only", action="store_true",
+        help="Skip the main CSV/HTML/BIN products and generate only --export products.",
+    )
     ap.add_argument(
         "--export", nargs="+", default=[],
         choices=["xlsx", "json", "html", "sources", "category_csv", "all"],
@@ -1366,6 +1532,8 @@ def main():
     ap.add_argument("--min-model-coverage", type=float, default=0.5)
     ap.add_argument("--shard-size", type=int, default=1000, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.export_only and not args.export:
+        ap.error("--export-only requires --export")
 
     print("=" * 72, flush=True)
     print("[start] contrib sample classification", flush=True)
@@ -1380,6 +1548,11 @@ def main():
 
     print("[stage 1/7] loading JSON metadata and egs map", flush=True)
     meta, json_names, json_layout = load_json_name_map(args.json)
+    if args.json and not json_names:
+        raise SystemExit(
+            "JSON contains no sample-script-compatible IDs. Expected ID/id/"
+            "file_name/filename or file_path."
+        )
     common_egs_map = load_egs_map(args.egs, json_names=json_names)
 
     print("[stage 2/7] loading contrib npz files", flush=True)
@@ -1387,7 +1560,7 @@ def main():
     for idx, (name, path) in enumerate(specs, start=1):
         print(f"[model {idx}/{len(specs)}] begin {name}", flush=True)
         egs_map = model_specific_egs(common_egs_map, model_egs_specs, name, json_names)
-        model = load_contrib_model(name, path, egs_map)
+        model = load_contrib_model(name, path, egs_map, egs_id_mode=args.egs_id_mode)
         if model:
             models.append(model)
         print(f"[model {idx}/{len(specs)}] done {name}", flush=True)
@@ -1396,20 +1569,42 @@ def main():
 
     print("[stage 3/7] classifying aligned real samples", flush=True)
     t0 = time.time()
-    rows = classify_samples(models, min_model_coverage=args.min_model_coverage)
+    rows = classify_samples(
+        models,
+        min_model_coverage=args.min_model_coverage,
+        sample_universe=json_names,
+    )
     print(f"[classify] {len(rows)} samples, {time.time() - t0:.1f}s")
+    if json_names:
+        model_groups = {sample for model in models for sample in model["sample_data"]}
+        print(
+            f"[align] sample-script parity: JSON records={json_layout.get('record_count', 0)}, "
+            f"long-sample groups={len(json_names)}, classify rows={len(rows)}, "
+            f"match={'yes' if len(rows) == len(json_names) else 'NO'}",
+            flush=True,
+        )
+        print(
+            f"[align] contrib coverage: matched_groups={len(json_names & model_groups)}, "
+            f"missing_from_all_models={len(json_names - model_groups)}, "
+            f"excluded_non_json_groups={len(model_groups - json_names)}",
+            flush=True,
+        )
     out_html = args.output
     out_csv = args.csv or os.path.splitext(out_html)[0] + ".csv"
 
-    print("[stage 4/7] writing CSV summary", flush=True)
-    t0 = time.time()
-    export_csv(out_csv, rows, models, meta)
-    print(f"[csv] wrote {out_csv}, {time.time() - t0:.1f}s")
+    if args.export_only:
+        print("[stage 4/7] skipped main CSV (--export-only)", flush=True)
+        print("[stage 5/7] skipped main HTML/BIN (--export-only)", flush=True)
+    else:
+        print("[stage 4/7] writing CSV summary", flush=True)
+        t0 = time.time()
+        export_csv(out_csv, rows, models, meta)
+        print(f"[csv] wrote {out_csv}, {time.time() - t0:.1f}s")
 
-    print("[stage 5/7] writing HTML and one combined BIN file", flush=True)
-    t0 = time.time()
-    export_html_data(out_html, rows, models, meta, shard_size=args.shard_size)
-    print(f"[html] wrote HTML + BIN for {out_html}, {time.time() - t0:.1f}s")
+        print("[stage 5/7] writing HTML and one combined BIN file", flush=True)
+        t0 = time.time()
+        export_html_data(out_html, rows, models, meta, shard_size=args.shard_size)
+        print(f"[html] wrote HTML + BIN for {out_html}, {time.time() - t0:.1f}s")
 
     print("[stage 6/7] writing optional extra products", flush=True)
     t0 = time.time()
@@ -1425,8 +1620,11 @@ def main():
     print("[done] samples:", len(rows))
     for cat in CATEGORIES:
         print(f"  {cat}: {sum(1 for r in rows if r['category'] == cat)}")
-    print("[done] csv :", os.path.abspath(out_csv))
-    print("[done] html:", os.path.abspath(out_html))
+    if not args.export_only:
+        print("[done] csv :", os.path.abspath(out_csv))
+        print("[done] html:", os.path.abspath(out_html))
+    else:
+        print("[done] main CSV/HTML/BIN: skipped (--export-only)")
     print(f"[done] total: {time.time() - t_all:.1f}s")
 
 
