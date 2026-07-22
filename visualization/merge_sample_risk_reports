@@ -22,10 +22,13 @@ CONTEXT_SEVERITY = {
     "present_consistent": 0.0,
 }
 CONTRIB_SEVERITY = {
-    "likely_wrong": 1.0,
-    "suspicious": 0.8,
-    "uncertain": 0.55,
-    "likely_clean": 0.1,
+    # These are the actual category keys emitted by classify_contrib_samples.py.
+    "suspicious_noisy": 1.0,
+    "boundary_ambiguous": 0.65,
+    "hard_learnable": 0.30,
+    "clean_easy": 0.05,
+    "influential": 0.20,
+    "unknown": 0.25,
 }
 
 
@@ -94,24 +97,34 @@ def context_score(status: Dict[str, Any]) -> float:
 
 
 def contrib_score(cls: Dict[str, Any]) -> float:
-    raw = cls.get("mean_suspicious_score")
-    score = finite(raw, -1.0)
-    if score < 0:
-        score = CONTRIB_SEVERITY.get(str(cls.get("category", "")), 0.4)
+    category = str(cls.get("category", ""))
+    category_score = CONTRIB_SEVERITY.get(category, 0.25)
+    raw_score = max(0.0, min(1.0, finite(cls.get("mean_suspicious_score"), category_score)))
     wrong = max(0.0, min(1.0, finite(cls.get("wrong_rate"))))
     high_loss = max(0.0, min(1.0, finite(cls.get("high_loss_rate"))))
-    return max(0.0, min(1.0, 0.70 * score + 0.20 * wrong + 0.10 * high_loss))
+    # The category is the classifier's final decision and must remain primary.
+    # Raw metrics only fine-tune samples inside that decision instead of
+    # silently changing clean_easy into an erroneous sample.
+    score = 0.90 * category_score + 0.05 * raw_score + 0.035 * wrong + 0.015 * high_loss
+    if category == "clean_easy":
+        score = min(score, 0.15)
+    return max(0.0, min(1.0, score))
 
 
-def merge(context: Dict[str, Dict[str, Any]], contrib: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+def merge(context: Dict[str, Dict[str, Any]], contrib: Dict[str, Dict[str, Any]],
+          contrib_weight: float = 0.9, time_weight: float = 0.1) -> List[Dict[str, Any]]:
     rows = []
     for sid in context.keys() & contrib.keys():
         context_item, contrib_item = context[sid], contrib[sid]
         status = context_item["time_context_status"]
         classification = contrib_item["contrib_classification"]
         cs, ks = context_score(status), contrib_score(classification)
-        # Contribution evidence is primary; context inconsistency strengthens it.
-        risk = 1.0 - (1.0 - ks) * (1.0 - 0.65 * cs)
+        # The contrib classifier's final category is primary. Context evidence
+        # reorders samples within/near categories but cannot turn clean_easy
+        # into a high-confidence erroneous sample by itself.
+        risk = contrib_weight * ks + time_weight * cs
+        if classification.get("category") == "clean_easy":
+            risk = min(risk, 0.35)
         reasons = [str(classification.get("reason", "")).strip(), str(status.get("label", "")).strip()]
         rows.append({
             "id": sid,
@@ -135,7 +148,8 @@ def merge(context: Dict[str, Dict[str, Any]], contrib: Dict[str, Dict[str, Any]]
 
 
 def write_json(path: Path, rows: List[Dict[str, Any]], context_path: Path, contrib_path: Path,
-               only_context: List[str], only_contrib: List[str], duplicates: Dict[str, List[str]]) -> None:
+               only_context: List[str], only_contrib: List[str], duplicates: Dict[str, List[str]],
+               contrib_weight: float, time_weight: float) -> None:
     category_counts: Dict[str, int] = {}
     status_counts: Dict[str, int] = {}
     for row in rows:
@@ -148,7 +162,11 @@ def write_json(path: Path, rows: List[Dict[str, Any]], context_path: Path, contr
             "matched_count": len(rows), "only_in_context_count": len(only_context),
             "only_in_contrib_count": len(only_contrib), "category_counts": category_counts,
             "context_status_counts": status_counts,
-            "risk_formula": "1-(1-contrib_score)*(1-0.65*context_score)",
+            "risk_weights": {"contrib": contrib_weight, "time": time_weight},
+            "risk_formula": (
+                f"{contrib_weight:.6g}*contrib_score+{time_weight:.6g}*context_score; "
+                "clean_easy final risk capped at 0.35"
+            ),
             "id_matching": "exact after trimming surrounding whitespace",
             "duplicate_ids": duplicates,
         },
@@ -160,7 +178,8 @@ def write_json(path: Path, rows: List[Dict[str, Any]], context_path: Path, contr
         json.dump(payload, stream, ensure_ascii=False, indent=2, allow_nan=False)
 
 
-def write_html(path: Path, rows: List[Dict[str, Any]], only_context: int, only_contrib: int) -> None:
+def write_html(path: Path, rows: List[Dict[str, Any]], only_context: int, only_contrib: int,
+               contrib_weight: float, time_weight: float) -> None:
     compact = [{k: r[k] for k in ("risk_rank", "id", "risk_score", "contrib_score", "context_score",
                                    "category_label", "context_status_label", "reason")} for r in rows]
     data = json.dumps(compact, ensure_ascii=False).replace("</", "<\\/")
@@ -169,6 +188,8 @@ body{margin:0;background:#f3f6fa;color:#182033;font:14px system-ui,"Microsoft Ya
 </style></head><body><main class=\"page\"><h1>疑似错误样本汇总</h1><div class=\"muted\">按综合风险从高到低排列；贡献度证据为主，时间上下文异常用于增强风险。</div><div class=\"cards\"><div class=\"card\">匹配样本<div class=\"num\" id=\"total\"></div></div><div class=\"card\">高风险 ≥ 0.75<div class=\"num\" id=\"high\"></div></div><div class=\"card\">仅上下文 JSON<div class=\"num\">__OC__</div></div><div class=\"card\">仅贡献度 JSON<div class=\"num\">__OK__</div></div></div><section class=\"panel\"><div class=\"filters\"><input id=\"q\" placeholder=\"搜索 ID / 原因\"><select id=\"cat\"><option value=\"\">全部贡献度分类</option></select><span class=\"muted\" id=\"shown\"></span></div><div class=\"scroll\"><table><thead><tr><th>排名</th><th>ID</th><th>综合风险</th><th>贡献度分</th><th>上下文分</th><th>贡献度分类</th><th>上下文状态</th><th>原因</th></tr></thead><tbody id=\"body\"></tbody></table></div></section></main><script>
 const DATA=__DATA__;const esc=x=>String(x??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));const cats=[...new Set(DATA.map(x=>x.category_label))].sort();cat.innerHTML+=cats.map(x=>`<option>${esc(x)}</option>`).join('');total.textContent=DATA.length.toLocaleString();high.textContent=DATA.filter(x=>x.risk_score>=.75).length.toLocaleString();function render(){const s=q.value.toLowerCase(),c=cat.value;const a=DATA.filter(x=>(!c||x.category_label===c)&&(!s||(x.id+' '+x.reason).toLowerCase().includes(s)));shown.textContent=`显示 ${a.length.toLocaleString()} 条`;body.innerHTML=a.slice(0,10000).map(x=>`<tr><td>${x.risk_rank}</td><td>${esc(x.id)}</td><td><b>${x.risk_score.toFixed(4)}</b><div class=\"bar\"><i style=\"width:${x.risk_score*100}%\"></i></div></td><td>${x.contrib_score.toFixed(4)}</td><td>${x.context_score.toFixed(4)}</td><td>${esc(x.category_label)}</td><td>${esc(x.context_status_label)}</td><td>${esc(x.reason)}</td></tr>`).join('')}q.oninput=render;cat.onchange=render;render();</script></body></html>"""
     path.parent.mkdir(parents=True, exist_ok=True)
+    weight_note = f"贡献度 {contrib_weight:.1%}，时间上下文 {time_weight:.1%}"
+    doc = doc.replace("贡献度证据为主，时间上下文异常用于增强风险。", html.escape(weight_note))
     path.write_text(doc.replace("__DATA__", data).replace("__OC__", str(only_context)).replace("__OK__", str(only_contrib)), encoding="utf-8")
 
 
@@ -178,15 +199,28 @@ def main() -> None:
     parser.add_argument("--contrib-json", required=True, type=Path, help="classify_contrib_samples --export json 的输出")
     parser.add_argument("--output-json", type=Path, default=Path("merged_sample_risk.json"))
     parser.add_argument("--output-html", type=Path, default=Path("merged_sample_risk.html"))
+    parser.add_argument("--contrib-weight", type=float, default=0.9, help="贡献度在综合风险中的权重，默认 0.9")
+    parser.add_argument("--time-weight", type=float, default=0.1, help="时间上下文在综合风险中的权重，默认 0.1")
     args = parser.parse_args()
+    if not math.isfinite(args.contrib_weight) or not math.isfinite(args.time_weight):
+        parser.error("--contrib-weight 和 --time-weight 必须是有限数值")
+    if args.contrib_weight < 0 or args.time_weight < 0:
+        parser.error("--contrib-weight 和 --time-weight 不能为负数")
+    weight_sum = args.contrib_weight + args.time_weight
+    if weight_sum <= 0:
+        parser.error("--contrib-weight 和 --time-weight 不能同时为 0")
+    contrib_weight = args.contrib_weight / weight_sum
+    time_weight = args.time_weight / weight_sum
     context, context_dup = load_index(args.context_json, "time_context_status")
     contrib, contrib_dup = load_index(args.contrib_json, "contrib_classification")
-    rows = merge(context, contrib)
+    rows = merge(context, contrib, contrib_weight, time_weight)
     only_context = sorted(context.keys() - contrib.keys())
     only_contrib = sorted(contrib.keys() - context.keys())
     duplicates = {"context": context_dup, "contrib": contrib_dup}
-    write_json(args.output_json, rows, args.context_json.resolve(), args.contrib_json.resolve(), only_context, only_contrib, duplicates)
-    write_html(args.output_html, rows, len(only_context), len(only_contrib))
+    write_json(args.output_json, rows, args.context_json.resolve(), args.contrib_json.resolve(), only_context, only_contrib,
+               duplicates, contrib_weight, time_weight)
+    write_html(args.output_html, rows, len(only_context), len(only_contrib), contrib_weight, time_weight)
+    print(f"Risk weights: contrib={contrib_weight:.2%}; time={time_weight:.2%}")
     print(f"Matched: {len(rows)}; only context: {len(only_context)}; only contrib: {len(only_contrib)}")
     print(f"JSON: {args.output_json.resolve()}")
     print(f"HTML: {args.output_html.resolve()}")
