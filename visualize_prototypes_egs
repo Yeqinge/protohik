@@ -199,7 +199,10 @@ def load_model(
     model = module.ResNetXvector(feat_dim, num_targets, **model_params)
 
     # DDP checkpoints commonly prefix every key with "module.".
-    state = {k.removeprefix("module."): v for k, v in tensors.items()}
+    # str.removeprefix() requires Python 3.9; keep compatibility with the
+    # older Python versions commonly used by ASV-Subtools environments.
+    state = {(k[len("module."):] if k.startswith("module.") else k): v
+             for k, v in tensors.items()}
     result = model.load_state_dict(state, strict=False)
     if result.missing_keys:
         LOG.warning("加载模型时缺少参数: %s", result.missing_keys)
