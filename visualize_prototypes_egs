@@ -346,8 +346,12 @@ def main() -> None:
         raise NotADirectoryError(f"模型文件夹不存在: {model_dir}")
     inferred_params = model_dir / f"{model_dir.name}.params" if model_dir else None
     inferred_config = model_dir / "config" / "total_params.json" if model_dir else None
-    params_path = args.params_path or args.params or inferred_params
+    # --model-dir is the primary interface; stale positional values must not
+    # override the checkpoint inferred from that directory.
+    params_path = args.params_path or inferred_params or args.params
     config_path = args.config or inferred_config
+    if model_dir is not None and args.params is not None:
+        LOG.warning("已设置 --model-dir，忽略旧的位置参数: %s", args.params)
     if params_path is None:
         raise ValueError("请通过位置参数或 --params-path 指定模型 .params 文件")
     params_path = params_path.expanduser().resolve()
