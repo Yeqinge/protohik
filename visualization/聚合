@@ -5,13 +5,9 @@
 This script does not classify samples and does not generate HTML.  It tries
 several NPZ-id addressing modes, selects the mode with the most JSON matches,
 and writes transparent CSV reports that can be inspected before running the
-full classifier.
-
-python check_npz_egs_json_alignment.py \
-  --npz /path/to/contrib \
-  --egs /path/to/train.egs.csv \
-  --json /path/to/samples.json \
-  --output-prefix /path/to/alignment_check
+full classifier. Egs-only ``normal-``/``abnormal-`` prefixes, chunk suffixes,
+and audio/feature extensions are normalized by exactly the same shared
+function used by ``classify_contrib_samples.py``.
 """
 
 import argparse
@@ -152,8 +148,8 @@ def match_json_name(raw_name, json_names):
     if not text:
         return "", []
     basename = os.path.basename(text.replace("\\", "/"))
-    # egs_chunk_candidates repeatedly handles outer feature/audio extensions
-    # and chunk suffixes in either order.
+    # Shared with classify: exact JSON name first, then branch over extension,
+    # chunk/segment suffix, normal-/abnormal- prefix, and numeric egs suffix.
     candidates = egs_chunk_candidates(basename)
     for candidate in candidates:
         if candidate in json_names:
@@ -270,6 +266,11 @@ def main():
     sources = build_sources(rows, utt_by_id)
 
     print("=" * 72)
+    print(
+        "[rules] JSON: basename + remove audio extension only; "
+        "egs: exact match first, then remove extension/chunk/segment/"
+        "normal-/abnormal- and match JSON exactly"
+    )
     print(f"[json] records={len(records)}, unique_real_samples={len(json_names)}, invalid={len(invalid)}, duplicates={len(duplicates)}")
     print(
         f"[egs] rows={len(rows)}, header={egs_info['has_header']}, "
