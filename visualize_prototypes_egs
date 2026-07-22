@@ -93,6 +93,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-keys", action="store_true", help="列出 checkpoint 张量后退出")
     parser.add_argument("--method", choices=("pca", "tsne"), default="pca")
     parser.add_argument(
+        "--no-l2-normalize", action="store_true",
+        help="降维前不做 L2 归一化；余弦/prototype loss 通常应保持默认归一化",
+    )
+    parser.add_argument(
         "--num-samples", type=int, default=1000,
         help="最终输入的 egs 样本总数；必须为偶数，正常/异常各取一半",
     )
@@ -278,6 +282,13 @@ def reduce_points(all_vectors: np.ndarray, method: str, seed: int) -> np.ndarray
     return TSNE(n_components=2, perplexity=perplexity, init="pca", learning_rate="auto", random_state=seed).fit_transform(all_vectors)
 
 
+def l2_normalize(vectors: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    if np.any(norms <= 1e-12):
+        LOG.warning("发现 %d 个近零向量，L2 归一化时将保留为零", int(np.sum(norms <= 1e-12)))
+    return vectors / np.maximum(norms, 1e-12)
+
+
 def select_equal_binary_rows(rows: list[dict[str, str]], total: int, seed: int) -> list[dict[str, str]]:
     """Randomly select exactly total/2 rows from each of two egs labels."""
     if total <= 0 or total % 2:
@@ -334,7 +345,10 @@ def save_plot(points: np.ndarray, labels: Iterable[str], n_data: int, prototype_
     ax.set_xlabel("component 1")
     ax.set_ylabel("component 2")
     ax.grid(alpha=.2)
-    ax.legend(loc="best", fontsize=8, ncols=min(3, max(1, len(values))))
+    # Matplotlib < 3.6 uses the singular ``ncol`` keyword.  ``ncols`` was
+    # introduced later, so keep the plotting script compatible with the
+    # older version commonly installed in training containers.
+    ax.legend(loc="best", fontsize=8, ncol=min(3, max(1, len(values))))
     fig.tight_layout()
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=180, bbox_inches="tight")
@@ -397,6 +411,9 @@ def main() -> None:
         )
 
     all_vectors = np.concatenate((data, prototypes), axis=0)
+    if not args.no_l2_normalize:
+        all_vectors = l2_normalize(all_vectors)
+        LOG.info("降维前已对 embedding 和 prototype 做 L2 归一化")
     points = reduce_points(all_vectors, args.method, args.seed)
     save_plot(points, (x["source_label"] for x in metadata), len(data), prototype_key, args.output, args.annotate_prototypes)
 
